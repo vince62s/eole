@@ -254,12 +254,15 @@ class MultiHeadedAttention(torch.nn.Module):
             value = self.maybe_ckpt(self.linear_values, value)
             query = self.maybe_ckpt(self.linear_query, query)
 
-        # Gated-query attention (Qwen3.5): split query and gate from doubled projection
+        # Gated-query attention (Qwen3.5): split query and gate from doubled projection.
+        # HF q_proj stores query and gate interleaved per head:
+        #   flat layout: [h0_q(head_dim), h0_g(head_dim), h1_q(head_dim), h1_g(head_dim), ...]
+        # View as (B, S, num_heads, 2, head_dim) then split at dim=-2 to match HF chunk logic.
         if self.q_gating:
-            qdim = self.dim_per_head * self.heads // self.parallel_gpu
-            # query: (B, S, 2*qdim) → split into actual query and gate
-            self._attn_gate = torch.sigmoid(query[:, :, qdim:])  # (B, S, qdim)
-            query = query[:, :, :qdim]
+            num_heads_local = self.heads // self.parallel_gpu
+            q_g = query.view(query.shape[0], query.shape[1], num_heads_local, 2, self.dim_per_head)
+            query = q_g[:, :, :, 0, :].reshape(query.shape[0], query.shape[1], -1)
+            self._attn_gate = torch.sigmoid(q_g[:, :, :, 1, :].reshape(query.shape[0], query.shape[1], -1))
 
         key = bld_to_blhd(key, self.dim_per_head)
         value = bld_to_blhd(value, self.dim_per_head)
