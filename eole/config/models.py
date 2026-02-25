@@ -270,6 +270,11 @@ class TransformerConfig(Config):
     )
     num_experts: int = Field(default=0, description="Number of experts for MoE models.")
     num_shared_experts: int = Field(default=0, description="Number of shared experts for MoE models (DeepSeekv2).")
+    shared_expert_gate: bool = Field(
+        default=False,
+        description="Apply sigmoid-gated shared expert output (Qwen3.5 MoE style). "
+        "When True, a linear gate is applied: output += sigmoid(gate(x)) * shared_expert(x).",
+    )
     first_k_dense_replace: int = Field(default=0, description="Number of layers using Dense instead of MoE")
     num_experts_per_tok: int = Field(default=2, description="Number of experts per token.")
     moe_softmax_after: bool = Field(default=False, description="Usually softmax is before topk, Mixtral does it after.")

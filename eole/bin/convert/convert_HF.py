@@ -309,7 +309,7 @@ def build_config_dict(hf):
         ),
         "sliding_window": config.get("sliding_window", 0) or 4096,
         "num_experts": config.get("num_local_experts", config.get("n_routed_experts", config.get("num_experts", 0))),
-        "num_shared_experts": config.get("n_shared_experts", 0),
+        "num_shared_experts": config.get("n_shared_experts", 1 if config.get("shared_expert_intermediate_size") else 0),
         "first_k_dense_replace": config.get("first_k_dense_replace", 0),
         "num_experts_per_tok": config.get("num_experts_per_tok", 0),
         "moe_transformer_ff": config.get("moe_intermediate_size", None),
@@ -328,6 +328,20 @@ def build_config_dict(hf):
     }
     if model_config["num_experts"] == 1:
         model_config["num_experts"] = 0
+
+    # For Qwen3.5 MoE: use shared_expert_intermediate_size as shared expert FF size
+    # (overrides the default moe_transformer_ff * num_shared_experts calculation in MoE.__init__)
+    if config.get("shared_expert_intermediate_size") and arch in [
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ]:
+        # num_shared_experts=1, shared_expert_intermediate_size is the actual ff size
+        # Since MoE uses moe_transformer_ff * num_shared_experts, set moe_transformer_ff
+        # to shared_expert_intermediate_size so product = shared_expert_intermediate_size
+        model_config["moe_transformer_ff"] = config["moe_intermediate_size"]
+        # The shared expert uses shared_expert_intermediate_size directly
+        # Store it separately so the decoder config can reference it
+        model_config.setdefault("decoder", {})["moe_transformer_ff"] = config["moe_intermediate_size"]
 
     # Vision encoder
     if vision_config is not None:
@@ -399,7 +413,11 @@ def build_config_dict(hf):
         model_config["encoder"].update({})
         model_config["spatial_merge_size"] = vision_config.get("spatial_merge_size", None)
 
-    if arch in ["Qwen3VLForConditionalGeneration", "Qwen3_5ForConditionalGeneration"]:
+    if arch in [
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    ]:
         # Vision config uses different key names from standard vision models
         num_pos_embed = vision_config.get("num_position_embeddings", 0)
         patch_size = vision_config.get("patch_size", 16)
@@ -538,7 +556,12 @@ def build_config_dict(hf):
             model_config = recursive_update_dict(model_config, arch_config, {})
 
     # Qwen3.5-specific: extract hybrid layer types and linear attention parameters
-    if arch in ["Qwen3_5TextForCausalLM", "Qwen3_5ForConditionalGeneration"]:
+    if arch in [
+        "Qwen3_5TextForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ]:
         layer_types = config.get("layer_types", None)
         if layer_types is not None:
             model_config.setdefault("decoder", {})["layer_types"] = layer_types
