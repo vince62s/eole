@@ -12,6 +12,7 @@ DATASET_MEAN = {
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.48145466, 0.4578275, 0.40821073),
     "qwen3_5vl": (0.48145466, 0.4578275, 0.40821073),
+    "qwen3vl": (0.48145466, 0.4578275, 0.40821073),
 }
 DATASET_STD = {
     "llava": (0.26862954, 0.26130258, 0.27577711),
@@ -19,6 +20,7 @@ DATASET_STD = {
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.26862954, 0.26130258, 0.27577711),
     "qwen3_5vl": (0.26862954, 0.26130258, 0.27577711),
+    "qwen3vl": (0.26862954, 0.26130258, 0.27577711),
 }
 RESAMPLE = {
     "llava": Image.BICUBIC,
@@ -26,8 +28,16 @@ RESAMPLE = {
     "deepseekocr": Image.BILINEAR,
     "hunyuanocr": Image.BILINEAR,
     "qwen3_5vl": Image.BICUBIC,
+    "qwen3vl": Image.BICUBIC,
 }
-SQUARE = {"llava": False, "gemma3": True, "deepseekocr": True, "hunyuanocr": False, "qwen3_5vl": False}
+SQUARE = {
+    "llava": False,
+    "gemma3": True,
+    "deepseekocr": True,
+    "hunyuanocr": False,
+    "qwen3_5vl": False,
+    "qwen3vl": False,
+}
 
 
 def _convert_to_rgb(image: Image.Image) -> Image.Image:
@@ -316,6 +326,9 @@ def process_image(image_path, adapter="llava", image_patch_size=16, image_size=1
             + "<｜hy_place▁holder▁no▁102｜>" * ((w + 1) * h + 2)
             + "<｜hy_place▁holder▁no▁101｜>"
         )
+    elif adapter in ["qwen3_5vl", "qwen3vl"]:
+        # image_patch_size = patch_size * spatial_merge_size so w*h is already post-merge count
+        image_tokens = "<|vision_start|>" + "<|image_pad|>" * (w * h) + "<|vision_end|>"
     else:
         raise ValueError("Unsupported Adapter type: {}".format(adapter))
     return {"image": NPimage, "tokens": image_tokens}
