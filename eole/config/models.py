@@ -405,11 +405,15 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
         #         )
         #     )
 
-        assert (
-            self.hidden_size % self.heads == 0
-        ), "Transformer Model dimension {} must be divisible by the number of heads {}".format(
-            self.hidden_size, self.heads
-        )
+        # When head_dim is explicitly set (e.g. Qwen3.5 MoE: head_dim=256,
+        # heads=24, hidden_size=5120), the projection size is heads*head_dim
+        # which may differ from hidden_size, so skip the divisibility check.
+        if self.head_dim is None:
+            assert (
+                self.hidden_size % self.heads == 0
+            ), "Transformer Model dimension {} must be divisible by the number of heads {}".format(
+                self.hidden_size, self.heads
+            )
         return self
 
 
