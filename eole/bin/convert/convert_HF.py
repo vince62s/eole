@@ -575,6 +575,12 @@ def build_config_dict(hf):
             val = config.get(key, None)
             if val is not None:
                 model_config.setdefault("decoder", {})[key] = val
+        # GDA requires equal key/value head counts; default value heads to key heads
+        dec = model_config.setdefault("decoder", {})
+        if "linear_num_key_heads" in dec and "linear_num_value_heads" not in dec:
+            dec["linear_num_value_heads"] = dec["linear_num_key_heads"]
+        elif "linear_num_value_heads" in dec and "linear_num_key_heads" not in dec:
+            dec["linear_num_key_heads"] = dec["linear_num_value_heads"]
 
     return model_config, training_config, params
 

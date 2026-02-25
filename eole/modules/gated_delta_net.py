@@ -314,9 +314,9 @@ class GatedDeltaNet(nn.Module):
             )
         else:
             if self.conv_state is not None:
-                # save state for next step
+                # save state for next step (clamp to 0 avoids negative padding when seq_len > conv_kernel_size)
                 self.conv_state.copy_(
-                    F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))[:, :, -self.conv_kernel_size:]
+                    F.pad(mixed_qkv, (max(0, self.conv_kernel_size - mixed_qkv.shape[-1]), 0))[:, :, -self.conv_kernel_size:]
                 )
             if self._causal_conv1d_fn is not None:
                 mixed_qkv = self._causal_conv1d_fn(
