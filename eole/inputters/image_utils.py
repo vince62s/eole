@@ -11,20 +11,23 @@ DATASET_MEAN = {
     "gemma3": (0.5, 0.5, 0.5),
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.48145466, 0.4578275, 0.40821073),
+    "qwen3_5vl": (0.48145466, 0.4578275, 0.40821073),
 }
 DATASET_STD = {
     "llava": (0.26862954, 0.26130258, 0.27577711),
     "gemma3": (0.5, 0.5, 0.5),
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.26862954, 0.26130258, 0.27577711),
+    "qwen3_5vl": (0.26862954, 0.26130258, 0.27577711),
 }
 RESAMPLE = {
     "llava": Image.BICUBIC,
     "gemma3": Image.BILINEAR,
     "deepseekocr": Image.BILINEAR,
     "hunyuanocr": Image.BILINEAR,
+    "qwen3_5vl": Image.BICUBIC,
 }
-SQUARE = {"llava": False, "gemma3": True, "deepseekocr": True, "hunyuanocr": False}
+SQUARE = {"llava": False, "gemma3": True, "deepseekocr": True, "hunyuanocr": False, "qwen3_5vl": False}
 
 
 def _convert_to_rgb(image: Image.Image) -> Image.Image:
