@@ -80,6 +80,9 @@ class MultiHeadedAttention(torch.nn.Module):
         self.heads_kv = model_config.heads_kv if model_config.heads_kv is not None else model_config.heads
         self.attn_scaling = model_config.attn_scaling
         self.parallel_gpu = getattr(running_config, "parallel_gpu", 1)
+        # Gated query attention (Qwen3.5): linear_query has 2× output size;
+        # the second half is used as a sigmoid gate applied to the attention output.
+        self.q_gating = getattr(model_config, "q_gating", False)
 
         assert (
             self.dim_per_head * self.heads_kv
@@ -96,10 +99,15 @@ class MultiHeadedAttention(torch.nn.Module):
             out_features=self.dim_per_head * self.heads_kv // self.parallel_gpu,
             bias=model_config.add_qkvbias,
         )
+        # When q_gating is enabled the projection is doubled: first half is the
+        # actual query, second half is the gate.
+        q_out_features = self.dim_per_head * self.heads // self.parallel_gpu
+        if self.q_gating:
+            q_out_features *= 2
         self.linear_query = skip_init(
             nn.Linear,
             in_features=model_config.hidden_size,
-            out_features=self.dim_per_head * self.heads // self.parallel_gpu,
+            out_features=q_out_features,
             bias=model_config.add_qkvbias,
         )
         self.dropout_p = getattr(running_config, "attention_dropout", [0.0])[0]
@@ -245,6 +253,14 @@ class MultiHeadedAttention(torch.nn.Module):
             key = self.maybe_ckpt(self.linear_keys, key)
             value = self.maybe_ckpt(self.linear_values, value)
             query = self.maybe_ckpt(self.linear_query, query)
+
+        # Gated-query attention (Qwen3.5): split query and gate from doubled projection
+        if self.q_gating:
+            qdim = self.dim_per_head * self.heads // self.parallel_gpu
+            # query: (B, S, 2*qdim) → split into actual query and gate
+            self._attn_gate = torch.sigmoid(query[:, :, qdim:])  # (B, S, qdim)
+            query = query[:, :, :qdim]
+
         key = bld_to_blhd(key, self.dim_per_head)
         value = bld_to_blhd(value, self.dim_per_head)
         query = bld_to_blhd(query, self.dim_per_head)
@@ -394,6 +410,10 @@ class MultiHeadedAttention(torch.nn.Module):
             attn_output = self.final_linear(context)
         else:
             attn_output = self.maybe_ckpt(self.final_linear, context)
+
+        # Apply sigmoid gate if gated-query attention is enabled (Qwen3.5)
+        if self.q_gating and hasattr(self, "_attn_gate"):
+            attn_output = attn_output * self._attn_gate
 
         if self.parallel_gpu > 1:
             # all_reduce is an inplace op - not easily backprop

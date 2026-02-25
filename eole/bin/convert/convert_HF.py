@@ -504,6 +504,22 @@ def build_config_dict(hf):
 
             model_config = recursive_update_dict(model_config, arch_config, {})
 
+    # Qwen3.5-specific: extract hybrid layer types and linear attention parameters
+    if arch in ["Qwen3_5TextForCausalLM"]:
+        layer_types = config.get("layer_types", None)
+        if layer_types is not None:
+            model_config.setdefault("decoder", {})["layer_types"] = layer_types
+        for key in [
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        ]:
+            val = config.get(key, None)
+            if val is not None:
+                model_config.setdefault("decoder", {})[key] = val
+
     return model_config, training_config, params
 
 

@@ -71,6 +71,31 @@ MODEL_OVERRIDES = {
             }
         },
     },
+    "Qwen3_5TextForCausalLM": {
+        "decoder": {
+            # Full-attention layer additions (on top of BASE_KEY_MAP defaults)
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            # Linear-attention layer weights (GatedDeltaNet) — skipped for
+            # full-attention layers because the keys won't exist in the checkpoint.
+            ".linear_attn.in_proj_qkv.": ".linear_attn.in_proj_qkv.",
+            ".linear_attn.in_proj_z.": ".linear_attn.in_proj_z.",
+            ".linear_attn.in_proj_b.": ".linear_attn.in_proj_b.",
+            ".linear_attn.in_proj_a.": ".linear_attn.in_proj_a.",
+            ".linear_attn.conv1d.": ".linear_attn.conv1d.",
+            ".linear_attn.dt_bias": ".linear_attn.dt_bias",
+            ".linear_attn.A_log": ".linear_attn.A_log",
+            ".linear_attn.norm.": ".linear_attn.norm.",
+            ".linear_attn.out_proj.": ".linear_attn.out_proj.",
+        },
+        "config": {
+            "decoder": {
+                "query_norm": True,
+                "key_norm": True,
+                "q_gating": True,
+            }
+        },
+    },
     "Gemma2ForCausalLM": {
         "decoder": {
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
@@ -583,6 +608,7 @@ LN_TABLE = defaultdict(
         "Gemma3ForCausalLM": "gemma-rms",
         "M2M100ForConditionalGeneration": "standard",
         "Gemma3ForConditionalGeneration": "gemma-rms",
+        "Qwen3_5TextForCausalLM": "gemma-rms",
     },
 )
 

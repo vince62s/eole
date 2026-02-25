@@ -8,6 +8,7 @@ from eole.decoders.decoder import DecoderBase
 from eole.modules.multi_headed_attn import SelfMHA, ContextMHA
 from eole.modules.transformer_mlp import MLP
 from eole.modules.moe import MoE
+from eole.modules.gated_delta_net import GatedDeltaNet
 from eole.modules.rope import build_rope
 from eole.constants import LayerNorm, PositionEncodingType
 from eole import EOLE_TORCH_COMPILE, EOLE_COMPILE_MODE
@@ -31,25 +32,40 @@ class TransformerDecoderLayer(nn.Module):
         self.alignment_heads = decoder_config.alignment_heads
         self.ffn_layernorm = decoder_config.ffn_layernorm
 
+        # Determine the layer type for hybrid architectures (e.g. Qwen3.5).
+        layer_types = getattr(decoder_config, "layer_types", None)
+        if layer_types is not None and idx < len(layer_types):
+            self.layer_type = layer_types[idx]
+        else:
+            self.layer_type = "full_attention"
+
         # order of layers corresponds to forward flow of tensors
         self.input_layernorm = LayerNorm[decoder_config.layer_norm](
             decoder_config.hidden_size, eps=decoder_config.norm_eps
         )
-        self.self_attn = SelfMHA(
-            decoder_config,
-            running_config=running_config,
-        )
-        self.dropout = nn.Dropout(self.dropout_p)
-        if decoder_config.with_cross_attn:
-            self.precontext_layernorm = LayerNorm[decoder_config.layer_norm](
-                decoder_config.hidden_size, eps=decoder_config.norm_eps
-            )
-            self.context_attn = ContextMHA(
+
+        if self.layer_type == "linear_attention":
+            # Replace the standard self-attention with a GatedDeltaNet layer.
+            self.linear_attn = GatedDeltaNet(decoder_config, layer_idx=idx)
+            self.self_attn = None
+            self.context_attn = None
+        else:
+            self.self_attn = SelfMHA(
                 decoder_config,
                 running_config=running_config,
             )
-        else:
-            self.context_attn = None
+            if decoder_config.with_cross_attn:
+                self.precontext_layernorm = LayerNorm[decoder_config.layer_norm](
+                    decoder_config.hidden_size, eps=decoder_config.norm_eps
+                )
+                self.context_attn = ContextMHA(
+                    decoder_config,
+                    running_config=running_config,
+                )
+            else:
+                self.context_attn = None
+
+        self.dropout = nn.Dropout(self.dropout_p)
 
         if self.ffn_layernorm:
             self.pre_feedforward_layernorm = LayerNorm[decoder_config.layer_norm](
@@ -81,7 +97,9 @@ class TransformerDecoderLayer(nn.Module):
                 running_config=running_config,
             )
 
-        if self.ffn_layernorm:
+        if self.layer_type == "linear_attention":
+            self._forward = self._forward_linear_attn
+        elif self.ffn_layernorm:
             self._forward = self._forward_ffn_layernorm
         elif self.parallel_residual:
             self._forward = self._forward_parallel_residual
@@ -179,6 +197,13 @@ class TransformerDecoderLayer(nn.Module):
         # we apply residual with un-normed
         return self_attn + self.mlp(ff_in), attns
 
+    def _forward_linear_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        """Forward pass for linear attention (GatedDeltaNet) layers."""
+        # Note: self_attn here is already the output of linear_attn (set by _forward_eager)
+        self_attn.add_(layer_in)
+        ff_in = self.post_attention_layernorm(self_attn)
+        return self_attn + self.mlp(ff_in), attns
+
     def _forward_no_cross_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
         self_attn.add_(layer_in)
         ff_in = self.post_attention_layernorm(self_attn)
@@ -230,15 +255,24 @@ class TransformerDecoderLayer(nn.Module):
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
         norm_layer_in = self.input_layernorm(layer_in)
 
-        self_attn, attns = self.self_attn(
-            norm_layer_in,
-            attn_mask=attn_mask,
-            return_attn=return_attn,
-            position_embeddings=position_embeddings,
-            cache_seqlens=cache_seqlens,
-            cache_slice=cache_slice,
-            pos_ids_2d=pos_ids_2d,
-        )
+        if self.layer_type == "linear_attention":
+            # GatedDeltaNet: attn_mask is passed as a 2D boolean mask if available
+            lin_attn_mask = None
+            if attn_mask is not None:
+                # Convert 4-D (B,1,S,T) causal mask to 2-D (B,S) boolean
+                lin_attn_mask = attn_mask[:, 0, :, 0].bool() if attn_mask.dim() == 4 else attn_mask
+            self_attn = self.linear_attn(norm_layer_in, attn_mask=lin_attn_mask)
+            attns = None
+        else:
+            self_attn, attns = self.self_attn(
+                norm_layer_in,
+                attn_mask=attn_mask,
+                return_attn=return_attn,
+                position_embeddings=position_embeddings,
+                cache_seqlens=cache_seqlens,
+                cache_slice=cache_slice,
+                pos_ids_2d=pos_ids_2d,
+            )
 
         if self.dropout_p > 0:
             self_attn = self.dropout(self_attn)
@@ -247,6 +281,8 @@ class TransformerDecoderLayer(nn.Module):
 
     def get_attn_align(self, layer_in, **kwargs):
         """:cite:`garg2019jointly`."""
+        if self.layer_type == "linear_attention":
+            return None
         attns = kwargs.pop("attns", None)
         if self.full_context_alignment:
             # return _, (B, Q_len, K_len)
@@ -262,7 +298,8 @@ class TransformerDecoderLayer(nn.Module):
         return attn_align
 
     def update_dropout(self, dropout, attention_dropout):
-        self.self_attn.update_dropout(attention_dropout)
+        if self.self_attn is not None:
+            self.self_attn.update_dropout(attention_dropout)
         if self.context_attn:
             self.context_attn.update_dropout(attention_dropout)
         self.mlp.update_dropout(dropout)
@@ -355,15 +392,18 @@ class TransformerDecoder(DecoderBase):
         if self.cache_seqlens is not None:
             self.cache_seqlens = fn(self.cache_seqlens)
         for layer in self.transformer_layers:
-            if self.with_cross_attn:
-                if layer.context_attn.kcache is not None:
-                    layer.context_attn.kcache = fn(layer.context_attn.kcache)
-                    layer.context_attn.vcache = fn(layer.context_attn.vcache)
-            if layer.self_attn.kcache is not None:
-                layer.self_attn.kcache = fn(layer.self_attn.kcache)
-                layer.self_attn.vcache = fn(layer.self_attn.vcache)
-            if layer.self_attn.cache_leftpad is not None:
-                layer.self_attn.cache_leftpad = fn(layer.self_attn.cache_leftpad)
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn.map_state(fn)
+            else:
+                if self.with_cross_attn:
+                    if layer.context_attn.kcache is not None:
+                        layer.context_attn.kcache = fn(layer.context_attn.kcache)
+                        layer.context_attn.vcache = fn(layer.context_attn.vcache)
+                if layer.self_attn.kcache is not None:
+                    layer.self_attn.kcache = fn(layer.self_attn.kcache)
+                    layer.self_attn.vcache = fn(layer.self_attn.vcache)
+                if layer.self_attn.cache_leftpad is not None:
+                    layer.self_attn.cache_leftpad = fn(layer.self_attn.cache_leftpad)
 
     def update_dropout(self, dropout, attention_dropout):
         for layer in self.transformer_layers:
@@ -575,12 +615,17 @@ class TransformerDecoder(DecoderBase):
         if torch.is_autocast_enabled():
             dtype = torch.get_autocast_gpu_dtype()
 
+        has_linear_attn = any(
+            getattr(layer, "layer_type", "full_attention") == "linear_attention"
+            for layer in self.transformer_layers
+        )
         self.flash = (
             _FLASH_ATTN_AVAILABLE
             and self.self_attn_backend == "flash"
             and self.position_encoding_type not in [PositionEncodingType.Relative, PositionEncodingType.Alibi]
             and dtype in [torch.float16, torch.bfloat16]
             and device != torch.device("cpu")
+            and not has_linear_attn
         )
 
         if self.dynamic_shapes is None:
@@ -604,19 +649,31 @@ class TransformerDecoder(DecoderBase):
         self.cache_seqlens = torch.zeros((b,), device=device, dtype=torch.int32)
 
         for layer in self.transformer_layers:
-            heads_kv = layer.self_attn.heads_kv
-            dph = layer.self_attn.dim_per_head
-            layer.self_attn.kcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
-            layer.self_attn.vcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
-            layer.self_attn.cache_leftpad = cache_leftpad
-            layer.self_attn.causal = True
-            if layer.context_attn:
-                # prefill context KV with encoder out
-                layer.context_attn._prefill_cache(enc_out)
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn.init_cache(b, dtype, device)
+            else:
+                heads_kv = layer.self_attn.heads_kv
+                dph = layer.self_attn.dim_per_head
+                layer.self_attn.kcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
+                layer.self_attn.vcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
+                layer.self_attn.cache_leftpad = cache_leftpad
+                layer.self_attn.causal = True
+                if layer.context_attn:
+                    # prefill context KV with encoder out
+                    layer.context_attn._prefill_cache(enc_out)
 
     def _extend_cache(self, threshold=1, addzeros=32):
         if self.dynamic_shapes and (self.cache_len_tgt - self.cache_seqlens[0].item()) < threshold:
+            ref_layer = None
             for layer in self.transformer_layers:
+                if layer.layer_type != "linear_attention":
+                    ref_layer = layer
+                    break
+            if ref_layer is None:
+                return
+            for layer in self.transformer_layers:
+                if layer.layer_type == "linear_attention":
+                    continue
                 b, l, h, d = layer.self_attn.kcache.shape
                 extend = torch.zeros(
                     b, addzeros, h, d, device=layer.self_attn.kcache.device, dtype=layer.self_attn.kcache.dtype
@@ -624,7 +681,7 @@ class TransformerDecoder(DecoderBase):
                 layer.self_attn.kcache = torch.cat([layer.self_attn.kcache, extend], dim=1)
                 layer.self_attn.vcache = torch.cat([layer.self_attn.vcache, extend], dim=1)
             self.cache_len_tgt += addzeros
-            self.position_indices = torch.arange(self.cache_len_tgt, device=layer.self_attn.kcache.device).unsqueeze(0)
+            self.position_indices = torch.arange(self.cache_len_tgt, device=ref_layer.self_attn.kcache.device).unsqueeze(0)
             b, _ = self.left_pad_attn_mask.shape
             extend = torch.ones(b, addzeros, device=self.left_pad_attn_mask.device, dtype=torch.bool)
             self.left_pad_attn_mask = torch.cat([self.left_pad_attn_mask, extend], dim=1)
@@ -634,7 +691,10 @@ class TransformerDecoder(DecoderBase):
         self.cache_seqlens = None
         self.flash = False
         for layer in self.transformer_layers:
-            layer.self_attn.kcache, layer.self_attn.vcache = None, None
-            layer.self_attn.cache_leftpad = None
-            if layer.context_attn:
-                layer.context_attn.kcache, layer.context_attn.vcache = None, None
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn.disable_cache()
+            else:
+                layer.self_attn.kcache, layer.self_attn.vcache = None, None
+                layer.self_attn.cache_leftpad = None
+                if layer.context_attn:
+                    layer.context_attn.kcache, layer.context_attn.vcache = None, None
