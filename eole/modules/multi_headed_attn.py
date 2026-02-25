@@ -406,14 +406,15 @@ class MultiHeadedAttention(torch.nn.Module):
 
         context = blhd_to_bld(attn_output)
 
+        # Apply sigmoid gate if gated-query attention is enabled (Qwen3.5).
+        # Gate is in heads*head_dim space (before output projection), matching HF implementation.
+        if self.q_gating and hasattr(self, "_attn_gate"):
+            context = context * self._attn_gate
+
         if self.kcache is not None:
             attn_output = self.final_linear(context)
         else:
             attn_output = self.maybe_ckpt(self.final_linear, context)
-
-        # Apply sigmoid gate if gated-query attention is enabled (Qwen3.5)
-        if self.q_gating and hasattr(self, "_attn_gate"):
-            attn_output = attn_output * self._attn_gate
 
         if self.parallel_gpu > 1:
             # all_reduce is an inplace op - not easily backprop
