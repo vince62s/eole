@@ -428,6 +428,20 @@ class VisionEncoderConfig(TransformerConfig, EncoderConfig):
     encoder_sam: bool = False  # True for DeepSeekOCR (Segment Anything Model as 1st step)
     use_class_embedding: bool = False
 
+    # Qwen3.5 VL / Qwen3 VL style options
+    temporal_patch_size: int = Field(
+        default=1,
+        description="Temporal kernel size for Conv3D patch embedding. "
+        "When >1 a nn.Conv3d is used (e.g. Qwen3.5 VL uses 2).",
+    )
+    num_position_embeddings: int | None = Field(
+        default=None,
+        description="Size of the absolute position embedding table "
+        "(Qwen3.5 VL uses 2304 = 48×48). When set together with "
+        "position_encoding_type=Rotary both absolute embeddings and "
+        "2D RoPE are applied.",
+    )
+
 
 # use Field with default= + description would be more readable
 # was inheriting from VocabConfig, but removed for now to facilitate inference tests

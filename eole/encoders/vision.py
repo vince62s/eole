@@ -203,13 +203,41 @@ class VisionEncoder(EncoderBase):
         else:
             self.rope = build_rope(encoder_config, mode="2d")
 
-        self.patch_conv = nn.Conv2d(
-            in_channels=encoder_config.num_channels,
-            out_channels=encoder_config.hidden_size,
-            kernel_size=encoder_config.patch_size,
-            stride=encoder_config.patch_size,
-            bias=encoder_config.patch_conv_bias,
-        )
+        # Qwen3.5 VL / Qwen3 VL: optional absolute position embedding table
+        # used together with 2D RoPE (position_encoding_type=Rotary)
+        if encoder_config.num_position_embeddings and encoder_config.num_position_embeddings > 0:
+            self.pos_embed = nn.Embedding(
+                encoder_config.num_position_embeddings,
+                encoder_config.hidden_size,
+            )
+        else:
+            self.pos_embed = None
+
+        # Patch conv: Conv3D when temporal_patch_size > 1, Conv2D otherwise
+        if encoder_config.temporal_patch_size > 1:
+            self.patch_conv = nn.Conv3d(
+                in_channels=encoder_config.num_channels,
+                out_channels=encoder_config.hidden_size,
+                kernel_size=(
+                    encoder_config.temporal_patch_size,
+                    encoder_config.patch_size,
+                    encoder_config.patch_size,
+                ),
+                stride=(
+                    encoder_config.temporal_patch_size,
+                    encoder_config.patch_size,
+                    encoder_config.patch_size,
+                ),
+                bias=encoder_config.patch_conv_bias,
+            )
+        else:
+            self.patch_conv = nn.Conv2d(
+                in_channels=encoder_config.num_channels,
+                out_channels=encoder_config.hidden_size,
+                kernel_size=encoder_config.patch_size,
+                stride=encoder_config.patch_size,
+                bias=encoder_config.patch_conv_bias,
+            )
         if encoder_config.use_class_embedding:
             self.class_embedding = torch.nn.Embedding(1, encoder_config.hidden_size)
         else:
@@ -309,7 +337,10 @@ class VisionEncoder(EncoderBase):
             Tuple of (patch_embeds, mask, position_embeddings)
         """
         # Extract patches from all images
-        patch_embeds_list = [self.patch_conv(img.to(self.dtype)) for img in images]
+        if isinstance(self.patch_conv, nn.Conv3d):
+            patch_embeds_list = self._apply_conv3d(images)
+        else:
+            patch_embeds_list = [self.patch_conv(img.to(self.dtype)) for img in images]
         positions = position_ids_in_meshgrid(
             patch_embeds_list,
             max_width=self.encoder_config.image_size // self.encoder_config.patch_size,
@@ -370,16 +401,48 @@ class VisionEncoder(EncoderBase):
 
         return torch.cat(all_patch_embeds, dim=0).unsqueeze(0)
 
+    def _apply_conv3d(self, images: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Apply Conv3D patch embedding to images by treating each as a 2-frame video.
+
+        Qwen3.5 VL uses ``nn.Conv3d`` with ``temporal_patch_size`` frames.
+        For still images the same image is duplicated along the temporal axis.
+
+        Args:
+            images: List of images, each of shape (C, H, W).
+
+        Returns:
+            List of patch-embedding tensors, each of shape
+            (hidden_size, H//patch_size, W//patch_size).
+        """
+        temporal = self.encoder_config.temporal_patch_size
+        patch_embeds_list = []
+        for img in images:
+            img = img.to(self.dtype)
+            # (C, H, W) → (1, C, temporal, H, W) by duplicating across time
+            img_t = img.unsqueeze(1).expand(-1, temporal, -1, -1)  # (C, T, H, W)
+            img_t = img_t.unsqueeze(0)  # (1, C, T, H, W)
+            # Conv3d output: (1, hidden_size, 1, H//patch, W//patch)
+            pe = self.patch_conv(img_t)
+            # Drop temporal dim (always 1 after pooling) → (hidden_size, H//patch, W//patch)
+            pe = pe.squeeze(0).squeeze(1)
+            patch_embeds_list.append(pe)
+        return patch_embeds_list
+
     def _process_with_rope(
         self, patch_embeds_list: List[torch.Tensor], positions
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Process patches with RoPE 2D embeddings (Pixtral/Mistral style)."""
+        """Process patches with RoPE 2D embeddings (Pixtral/Mistral/Qwen3.5 VL style)."""
 
         # Concatenate all patches
         patch_embeds = torch.cat([p.flatten(1).permute(1, 0) for p in patch_embeds_list], dim=0)
 
         if self.ln_pre is not None:
             patch_embeds = self.ln_pre(patch_embeds)
+
+        # Qwen3.5 VL / Qwen3 VL: add absolute position embeddings on top of RoPE
+        if self.pos_embed is not None:
+            pos_ids = torch.cat(positions).to(self.device)
+            patch_embeds = patch_embeds + self.pos_embed(pos_ids)
 
         # Add batch dimension
         patch_embeds = patch_embeds.unsqueeze(0)
