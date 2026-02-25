@@ -341,6 +341,12 @@ class GatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
+        # Expand K/Q heads to match V heads (GQA-style for GDA layers, mirrors HF implementation)
+        if self.num_v_heads // self.num_k_heads > 1:
+            n_rep = self.num_v_heads // self.num_k_heads
+            query = query.repeat_interleave(n_rep, dim=2)
+            key = key.repeat_interleave(n_rep, dim=2)
+
         # Discretise decay / gate
         dt = F.softplus(a + self.dt_bias)  # (B, S, num_v_heads)
         A = -torch.exp(self.A_log.float())  # (num_v_heads,)

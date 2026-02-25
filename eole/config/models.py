@@ -379,9 +379,9 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
         description="Number of key heads for linear attention layers (Qwen3.5 GatedDeltaNet).",
     )
     linear_num_value_heads: int = Field(
-        default=16,
+        default=32,
         description="Number of value heads for linear attention layers (Qwen3.5 GatedDeltaNet). "
-        "Must equal linear_num_key_heads for the GatedDeltaNet algorithm.",
+        "May exceed linear_num_key_heads; key/query heads are expanded via repeat_interleave to match.",
     )
 
     @model_validator(mode="after")
