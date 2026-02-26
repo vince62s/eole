@@ -321,6 +321,7 @@ class Qwen3_5VisionMerger(BaseVisionAdapter):
         if image_sizes is not None:
             # Split by image, spatially merge, then concatenate
             xs, grids = split_by_image(x, image_sizes, self.patch_size)
+            m = self.spatial_merge_size
             outputs = []
             for xi, (h, w) in zip(xs, grids):
                 # xi: (h*w, D) → (1, D, h, w) for unfold
@@ -328,11 +329,16 @@ class Qwen3_5VisionMerger(BaseVisionAdapter):
                 # Unfold: (1, D*S*S, merged_h*merged_w)
                 xi = F.unfold(
                     xi,
-                    kernel_size=self.spatial_merge_size,
-                    stride=self.spatial_merge_size,
+                    kernel_size=m,
+                    stride=m,
                 )
-                # Transpose: (merged_h*merged_w, D*S*S)
-                xi = xi.view(D * self.spatial_merge_size**2, -1).t()
+                # Transpose: (merged_h*merged_w, D*S*S) — F.unfold produces
+                # channel-first layout (D outermost, then kernel positions).
+                xi = xi.view(D * m**2, -1).t()
+                # Rearrange from (D, m²) to (m², D) spatial-first layout so
+                # that each merged-block row matches HF's block-interleaved
+                # concatenation order: [patch0[0:D], patch1[0:D], ..., patchM[0:D]]
+                xi = xi.view(-1, D, m * m).transpose(1, 2).reshape(-1, D * m * m)
                 outputs.append(xi)
             merged = torch.cat(outputs, dim=0)
         else:
