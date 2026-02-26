@@ -336,8 +336,11 @@ class GatedDeltaNet(nn.Module):
     def forward(self, hidden_states, attn_mask=None, **kwargs):
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Mask padding to zero so padding tokens don't corrupt conv/recurrent state
-        if attn_mask is not None and attn_mask.shape[1] > 1 and attn_mask.shape[0] > 1:
+        # Mask padding positions to zero so they don't corrupt conv/recurrent state.
+        # attn_mask here is a 2-D (B, S) boolean where True = valid token.
+        # Only applied during prefill (S > 1); the decode step (S == 1) never
+        # passes a mask so the branch is skipped automatically.
+        if attn_mask is not None and attn_mask.shape[1] > 1:
             hidden_states = (hidden_states * attn_mask[:, :, None]).to(hidden_states.dtype)
 
         use_precomputed = (

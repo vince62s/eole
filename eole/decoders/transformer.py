@@ -256,12 +256,10 @@ class TransformerDecoderLayer(nn.Module):
         norm_layer_in = self.input_layernorm(layer_in)
 
         if self.layer_type == "linear_attention":
-            # GatedDeltaNet: attn_mask is passed as a 2D boolean mask if available
-            lin_attn_mask = None
-            if attn_mask is not None:
-                # Convert 4-D (B,1,S,T) causal mask to 2-D (B,S) boolean
-                lin_attn_mask = attn_mask[:, 0, :, 0].bool() if attn_mask.dim() == 4 else attn_mask
-            self_attn = self.linear_attn(norm_layer_in, attn_mask=lin_attn_mask)
+            # attn_mask is already a 2-D (B, S) valid-token mask (or None) —
+            # the decoder sets lin_attn_mask = ~tgt_pad_mask[:, 0, :] for prefill
+            # and None for single-step decode.
+            self_attn = self.linear_attn(norm_layer_in, attn_mask=attn_mask)
             attns = None
         else:
             self_attn, attns = self.self_attn(
@@ -557,6 +555,10 @@ class TransformerDecoder(DecoderBase):
                 attn_mask = self._causal_attn_mask(tgt_pad_mask, prefix_len=prefix_len)
                 if image_locations is not None:
                     attn_mask = self._update_causal_mask(attn_mask, image_locations)
+                # Linear-attention layers need a simple per-token pad mask so that
+                # padding positions don't corrupt the recurrent/conv state.
+                # Use the same mask as the flash path: True = valid token.
+                lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
                 # at decoding _init_cache must be called and init these
                 valid = self.position_indices <= self.cache_seqlens.view(-1, 1)
@@ -565,7 +567,7 @@ class TransformerDecoder(DecoderBase):
                     start = torch.clamp(current_step - self.sliding_window + 1, min=0)
                     valid = valid & (self.position_indices >= start)
                 attn_mask = valid.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, MAX_T or Dynamic Cache Len)
-            lin_attn_mask = None
+                lin_attn_mask = None
         else:
             attn_mask = None
             cache_slice = None  # triggers flash decoding
