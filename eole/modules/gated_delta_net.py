@@ -19,8 +19,37 @@ from torch.nn.utils import skip_init
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
+    # Fall back to fla.modules.convolution when the causal_conv1d package is absent
+    # but fla-core is installed.  The FLA API differs in two ways:
+    #   1. causal_conv1d (FLA) expects x in [B, L, D] (sequence-first) and returns
+    #      (output, final_state); causal_conv1d_fn expects [B, D, L] and returns
+    #      just the output.
+    #   2. causal_conv1d_update (FLA) has an extra `residual` positional arg before
+    #      `weight`, and accepts x as [B, D] (2-D, no time dimension); the
+    #      causal_conv1d package variant takes (x, conv_state, weight, bias, act)
+    #      with x shaped [B, D, 1] and returns just the output.
+    # The wrappers below absorb those differences so the rest of the code is unchanged.
+    try:
+        from fla.modules.convolution import causal_conv1d as _fla_causal_conv1d
+        from fla.modules.convolution import causal_conv1d_update as _fla_causal_conv1d_update
+
+        def causal_conv1d_fn(x, weight, bias=None, activation=None):
+            # x: [B, D, L] channel-first → FLA expects [B, L, D] sequence-first
+            out, _ = _fla_causal_conv1d(x.transpose(1, 2), weight=weight, bias=bias, activation=activation)
+            return out.transpose(1, 2)  # back to [B, D, L]
+
+        def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None):
+            # x: [B, D, 1] channel-first → FLA expects [B, D] (2-D)
+            # FLA signature: (x, cache, residual=None, weight=None, bias=None, activation=None)
+            out, _ = _fla_causal_conv1d_update(
+                x.squeeze(-1), conv_state,
+                residual=None, weight=weight, bias=bias, activation=activation,
+            )
+            return out.unsqueeze(-1)  # back to [B, D, 1]
+
+    except ImportError:
+        causal_conv1d_fn = None
+        causal_conv1d_update = None
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
