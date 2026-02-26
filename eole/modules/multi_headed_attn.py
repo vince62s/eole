@@ -279,7 +279,8 @@ class MultiHeadedAttention(torch.nn.Module):
             # For subsequent forwards (e.g., during autoregressive decoding), standard RoPE is used.
             if self.xdrope_section is not None and pos_ids_2d is not None:
                 query, key = apply_rotary_pos_emb_xdrope(
-                    query, key, position_embeddings, pos_ids_2d, self.xdrope_section
+                    query, key, position_embeddings, pos_ids_2d, self.xdrope_section,
+                    interleave=self.rotary_interleave,
                 )
             else:
                 query, key = apply_rotary_emb(query, key, position_embeddings, interleave=self.rotary_interleave)

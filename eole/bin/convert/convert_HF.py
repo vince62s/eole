@@ -473,12 +473,15 @@ def build_config_dict(hf):
     )
 
     # patch rotary dim
+    # partial_rotary_factor may live at the top level or inside rope_parameters (newer HF format)
+    _partial_rotary = config.get(
+        "partial_rotary_factor", config.get("rope_parameters", {}).get("partial_rotary_factor")
+    )
     if "rotary_dim" in config.keys():
         model_config["rope_config"]["rotary_dim"] = config["rotary_dim"]
-    elif "partial_rotary_factor" in config.keys():
-        model_config["rope_config"]["rotary_dim"] = int(
-            config["partial_rotary_factor"] * (model_config["hidden_size"] // model_config["heads"])
-        )
+    elif _partial_rotary is not None:
+        _head_dim = model_config.get("head_dim") or (model_config["hidden_size"] // model_config["heads"])
+        model_config["rope_config"]["rotary_dim"] = int(_partial_rotary * _head_dim)
     elif model_config.get("head_dim", None) is not None:
         model_config["rope_config"]["rotary_dim"] = model_config["head_dim"]
     else:
@@ -501,6 +504,15 @@ def build_config_dict(hf):
                 ),
             }
         )
+
+    # Handle rope_parameters (newer HF format, e.g. Qwen3.5 VL)
+    if config.get("rope_parameters", None) is not None:
+        rope_params = config["rope_parameters"]
+        mrope_section = rope_params.get("mrope_section", None)
+        if mrope_section is not None:
+            model_config["rope_config"]["xdrope_section"] = mrope_section
+        if rope_params.get("mrope_interleaved", False):
+            model_config["rope_config"]["rotary_interleave"] = True
 
     # Validate required fields
     required_fields = {
