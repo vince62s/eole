@@ -23,7 +23,26 @@ except ImportError:
     causal_conv1d_update = None
 
 try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule
+
+    # FLA's fused_recurrent_gated_delta_rule has signature (q, k, v, g, gk, gv, beta, ...).
+    # The extra gk/gv args sit between g and beta, so a positional call with (q,k,v,g,beta)
+    # would silently pass beta to gk and leave the real beta=None — producing NaN during decode.
+    # Wrap with keyword args to match eole's (q, k, v, g, beta, ...) convention.
+    def fused_recurrent_gated_delta_rule(
+        q, k, v, g, beta,
+        initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False,
+    ):
+        return _fla_fused_recurrent_gated_delta_rule(
+            q, k, v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
 except ImportError:
     chunk_gated_delta_rule = None
     fused_recurrent_gated_delta_rule = None
