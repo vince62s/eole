@@ -428,6 +428,63 @@ class VisionEncoder(EncoderBase):
             patch_embeds_list.append(pe)
         return patch_embeds_list
 
+    def _interp_pos_embed(self, h: int, w: int) -> torch.Tensor:
+        """
+        Bilinear interpolation of the absolute position-embedding table for an
+        arbitrary patch grid of size ``(h, w)``.
+
+        Matches HF's ``fast_pos_embed_interpolate``: patch coordinates are
+        mapped *uniformly* to ``[0, num_grid - 1]`` (via ``linspace``) and the
+        2-D embedding table is sampled with bilinear interpolation.  This
+        ensures that the full extent of the learned table is used for any
+        image resolution rather than only the top-left corner.
+
+        Args:
+            h: height in patches.
+            w: width in patches.
+
+        Returns:
+            Tensor of shape ``(h * w, hidden_size)`` on the encoder device,
+            in row-major patch order.
+        """
+        num_grid = int(self.pos_embed.num_embeddings**0.5)
+        D = self.pos_embed.embedding_dim
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        # Fast path: exact-size images need no interpolation
+        if h == num_grid and w == num_grid:
+            return self.pos_embed.weight  # (num_grid^2, D)
+
+        # Degenerate table (single entry)
+        if num_grid <= 1:
+            return self.pos_embed.weight.expand(h * w, -1)
+
+        # Map [0, h-1] uniformly to [0, num_grid-1] (and same for w)
+        h_idxs = torch.linspace(0, num_grid - 1, h, device=device)
+        w_idxs = torch.linspace(0, num_grid - 1, w, device=device)
+        h_pos, w_pos = torch.meshgrid(h_idxs, w_idxs, indexing="ij")  # (h, w)
+
+        # Normalize to [-1, 1] for F.grid_sample (align_corners=True)
+        h_norm = 2.0 * h_pos / (num_grid - 1) - 1.0
+        w_norm = 2.0 * w_pos / (num_grid - 1) - 1.0
+        # grid_sample convention: last dim is (x=col, y=row)
+        grid = torch.stack([w_norm, h_norm], dim=-1).unsqueeze(0)  # (1, h, w, 2)
+
+        # Reshape embedding table to (1, D, num_grid, num_grid) for interpolation
+        embed_grid = (
+            self.pos_embed.weight.reshape(num_grid, num_grid, D)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .float()
+        )
+
+        interp = F.grid_sample(
+            embed_grid, grid, mode="bilinear", padding_mode="border", align_corners=True
+        )
+        # (1, D, h, w) → (h*w, D)
+        return interp.squeeze(0).permute(1, 2, 0).reshape(h * w, D).to(dtype)
+
     def _process_with_rope(
         self, patch_embeds_list: List[torch.Tensor], positions
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -439,10 +496,15 @@ class VisionEncoder(EncoderBase):
         if self.ln_pre is not None:
             patch_embeds = self.ln_pre(patch_embeds)
 
-        # Qwen3.5 VL / Qwen3 VL: add absolute position embeddings on top of RoPE
+        # Qwen3.5 VL / Qwen3 VL: add absolute position embeddings on top of RoPE.
+        # Use per-image bilinear interpolation to uniformly sample the embedding
+        # table for any image resolution (matches HF fast_pos_embed_interpolate).
         if self.pos_embed is not None:
-            pos_ids = torch.cat(positions).to(self.device)
-            patch_embeds = patch_embeds + self.pos_embed(pos_ids)
+            pos_emb = torch.cat(
+                [self._interp_pos_embed(p.shape[-2], p.shape[-1]) for p in patch_embeds_list],
+                dim=0,
+            )
+            patch_embeds = patch_embeds + pos_emb
 
         # Add batch dimension
         patch_embeds = patch_embeds.unsqueeze(0)

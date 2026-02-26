@@ -221,13 +221,28 @@ class RotaryPosition(nn.Module):
 
     def init_2d_inv_freq(self, inv_freq):
         """
-        Initialize 2d inverse frequencies for pixtral rotary embeddings.
+        Initialize 2d inverse frequencies for 2D rotary embeddings.
+
+        Two styles are supported:
+
+        * **Pixtral** (``temporal_patch_size == 1``): height uses even-indexed
+          base frequencies (``inv_freq[::2]``), width uses odd-indexed ones
+          (``inv_freq[1::2]``).
+        * **Qwen VL** (``temporal_patch_size > 1``): both height and width use
+          the same even-indexed base frequencies (``inv_freq[::2]``), matching
+          HF's ``VisionRotaryEmbedding`` which applies the full frequency set
+          to each spatial dimension independently.
         """
         max_patches_per_side = self.model_config.image_size // self.model_config.patch_size
         h = torch.arange(max_patches_per_side, device=inv_freq.device)
         w = torch.arange(max_patches_per_side, device=inv_freq.device)
         freqs_h = torch.outer(h, inv_freq[::2]).float()
-        freqs_w = torch.outer(w, inv_freq[1::2]).float()
+        # Qwen VL uses the same base frequencies for both spatial dimensions.
+        # Pixtral interleaves even/odd frequencies between height and width.
+        if getattr(self.model_config, "temporal_patch_size", 1) > 1:
+            freqs_w = torch.outer(w, inv_freq[::2]).float()
+        else:
+            freqs_w = torch.outer(w, inv_freq[1::2]).float()
         inv_freq_2d = torch.cat(
             [
                 freqs_h[:, None, :].repeat(1, max_patches_per_side, 1),  # Use repeat, not expand
