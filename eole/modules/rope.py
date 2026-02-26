@@ -186,9 +186,13 @@ class RotaryPosition(nn.Module):
         rotary_dim = rope_config.rotary_dim if rope_config.rotary_dim != 0 else self.dim_per_head
         self.rotary_interleave = rope_config.rotary_interleave
         self.rotary_theta = rope_config.rotary_theta if variant == "global" else rope_config.rotary_theta_local
+        scaling_type = rope_config.scaling_type  # None when not explicitly set
 
         # 1. Base Inverse Frequencies (calculated in FP32)
-        if getattr(rope_config, "scaling_type", None) in ["dynamic", "xdrope"] and getattr(rope_config, "alpha", None):
+        # Alpha-adjusted base is only used for YaRN-style dynamic/xdrope scaling.
+        # When scaling_type is None (e.g. rope_parameters with rope_type="default"),
+        # this branch is skipped and base = rotary_theta as expected.
+        if scaling_type in ("dynamic", "xdrope") and rope_config.alpha:
             base = self.rotary_theta * (rope_config.alpha ** (rotary_dim / (rotary_dim - 2)))
         else:
             base = self.rotary_theta
@@ -203,9 +207,9 @@ class RotaryPosition(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # 3. Apply Scaling Logic (In-place on FP32 buffer)
-        if getattr(rope_config, "scaling_type", None) == "llama3":
+        if scaling_type == "llama3":
             self.llama3_scaling()
-        elif getattr(rope_config, "scaling_type", None) == "gemma3" and variant == "global":
+        elif scaling_type == "gemma3" and variant == "global":
             self.gemma3_scaling()
 
         # 4. Initialize cos_sin placeholder
