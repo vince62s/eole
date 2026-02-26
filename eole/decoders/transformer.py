@@ -342,6 +342,10 @@ class TransformerDecoder(DecoderBase):
         )
         self.layer_norm = LayerNorm[decoder_config.layer_norm](decoder_config.hidden_size, eps=decoder_config.norm_eps)
         self.LM_type = getattr(decoder_config, "LM_type", "causal")
+        self.has_linear_attn = any(
+            getattr(layer, "layer_type", "full_attention") == "linear_attention"
+            for layer in self.transformer_layers
+        )
         self.self_attn_backend = getattr(running_config, "self_attn_backend", "flash")
         self.position_encoding_type = decoder_config.position_encoding_type
         self.flash = False
@@ -561,19 +565,39 @@ class TransformerDecoder(DecoderBase):
                     start = torch.clamp(current_step - self.sliding_window + 1, min=0)
                     valid = valid & (self.position_indices >= start)
                 attn_mask = valid.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, MAX_T or Dynamic Cache Len)
+            lin_attn_mask = None
         else:
             attn_mask = None
             cache_slice = None  # triggers flash decoding
+            # In hybrid models (e.g. Qwen3.5), linear_attention layers cannot use
+            # flash attention and need a pad mask during prefill so that padding
+            # tokens don't corrupt their recurrent state.
+            if self.has_linear_attn and S > 1:
+                # These kwargs are used only in the non-flash path to build the
+                # causal attn_mask; pop them here to avoid leaking into layer kwargs.
+                kwargs.pop("image_locations", None)
+                kwargs.pop("prefix_len", None)
+                # tgt_pad_mask: (B, 1, S), True=padding → invert to True=valid token
+                lin_attn_mask = ~tgt_pad_mask[:, 0, :]  # (B, S)
+            else:
+                lin_attn_mask = None
 
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
         attn_aligns = []
 
         for layer, pos_emb in zip(self.transformer_layers, pos_emb_list):
+            # In hybrid flash mode, linear_attention layers get a 2D pad mask
+            # while full_attention layers get None (flash handles causal masking).
+            layer_attn_mask = (
+                lin_attn_mask
+                if (lin_attn_mask is not None and layer.layer_type == "linear_attention")
+                else attn_mask
+            )
             emb, attn = layer(
                 emb.clone() if (EOLE_COMPILE_MODE == "2" and EOLE_TORCH_COMPILE) else emb,
                 enc_out=enc_out,
                 src_pad_mask=src_pad_mask,
-                attn_mask=attn_mask,
+                attn_mask=layer_attn_mask,
                 return_attn=return_attn,
                 position_embeddings=pos_emb,
                 cache_seqlens=self.cache_seqlens,
@@ -585,7 +609,7 @@ class TransformerDecoder(DecoderBase):
                     emb.clone() if (EOLE_COMPILE_MODE == "2" and EOLE_TORCH_COMPILE) else emb,
                     enc_out=enc_out,
                     src_pad_mask=src_pad_mask,
-                    attn_mask=attn_mask,
+                    attn_mask=layer_attn_mask,
                     return_attn=return_attn,
                     position_embeddings=pos_emb,
                     cache_seqlens=self.cache_seqlens,
@@ -615,17 +639,12 @@ class TransformerDecoder(DecoderBase):
         if torch.is_autocast_enabled():
             dtype = torch.get_autocast_gpu_dtype()
 
-        has_linear_attn = any(
-            getattr(layer, "layer_type", "full_attention") == "linear_attention"
-            for layer in self.transformer_layers
-        )
         self.flash = (
             _FLASH_ATTN_AVAILABLE
             and self.self_attn_backend == "flash"
             and self.position_encoding_type not in [PositionEncodingType.Relative, PositionEncodingType.Alibi]
             and dtype in [torch.float16, torch.bfloat16]
             and device != torch.device("cpu")
-            and not has_linear_attn
         )
 
         if self.dynamic_shapes is None:
