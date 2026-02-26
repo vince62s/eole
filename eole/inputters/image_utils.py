@@ -11,16 +11,18 @@ DATASET_MEAN = {
     "gemma3": (0.5, 0.5, 0.5),
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.48145466, 0.4578275, 0.40821073),
-    "qwen3_5vl": (0.48145466, 0.4578275, 0.40821073),
-    "qwen3vl": (0.48145466, 0.4578275, 0.40821073),
+    # Qwen3VL / Qwen3.5VL: from preprocessor_config.json image_mean
+    "qwen3_5vl": (0.5, 0.5, 0.5),
+    "qwen3vl": (0.5, 0.5, 0.5),
 }
 DATASET_STD = {
     "llava": (0.26862954, 0.26130258, 0.27577711),
     "gemma3": (0.5, 0.5, 0.5),
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.26862954, 0.26130258, 0.27577711),
-    "qwen3_5vl": (0.26862954, 0.26130258, 0.27577711),
-    "qwen3vl": (0.26862954, 0.26130258, 0.27577711),
+    # Qwen3VL / Qwen3.5VL: from preprocessor_config.json image_std
+    "qwen3_5vl": (0.5, 0.5, 0.5),
+    "qwen3vl": (0.5, 0.5, 0.5),
 }
 RESAMPLE = {
     "llava": Image.BICUBIC,
@@ -38,6 +40,11 @@ SQUARE = {
     "qwen3_5vl": False,
     "qwen3vl": False,
 }
+
+# Pixel budget for Qwen VL smart resize (from preprocessor_config.json size dict).
+# "shortest_edge" = min total pixels; "longest_edge" = max total pixels.
+_QWEN_VL_MIN_PIXELS = 65536  # 256 * 256
+_QWEN_VL_MAX_PIXELS = 16777216  # 4096 * 4096
 
 
 def _convert_to_rgb(image: Image.Image) -> Image.Image:
@@ -67,6 +74,65 @@ def image_to_num_tokens(img, image_size=0, image_patch_size=16, square=False):
     width_tokens = (w - 1) // image_patch_size + 1
     height_tokens = (h - 1) // image_patch_size + 1
     # make numbers even to ensure batch even number of img tokens
+    width_tokens = width_tokens + (width_tokens % 2)
+    height_tokens = height_tokens + (height_tokens % 2)
+    return width_tokens, height_tokens
+
+
+def smart_resize_qwenvl(
+    img,
+    image_patch_size,
+    image_size=0,
+    min_pixels=_QWEN_VL_MIN_PIXELS,
+    max_pixels=_QWEN_VL_MAX_PIXELS,
+):
+    """
+    Pixel-budget smart resize matching Qwen2VLImageProcessorFast behaviour.
+
+    1. Scale up images whose total pixel count falls below ``min_pixels``.
+    2. Scale down images whose total pixel count exceeds ``max_pixels``.
+    3. Additionally cap each spatial dimension to ``image_size`` (the vision
+       encoder's 2D-RoPE positional-embedding table limit) to keep RoPE
+       position indices in-range.
+    4. Round the final dimensions to the nearest even multiple of
+       ``image_patch_size`` (= patch_size × spatial_merge_size).
+
+    Args:
+        img: PIL Image.
+        image_patch_size: Effective patch size in pixels (patch_size * merge_size).
+        image_size: Maximum pixels per side enforced by the 2D-RoPE table.
+                    0 means no per-dimension cap.
+        min_pixels: Minimum total pixel count (default: preprocessor_config shortest_edge).
+        max_pixels: Maximum total pixel count (default: preprocessor_config longest_edge).
+
+    Returns:
+        (width_tokens, height_tokens): merged-token grid dimensions (both even).
+    """
+    w, h = img.size  # PIL: (width, height)
+    pixels = w * h
+
+    # Enforce pixel budget (scale up if too small, scale down if too large)
+    if pixels < min_pixels:
+        scale = (min_pixels / pixels) ** 0.5
+    elif pixels > max_pixels:
+        scale = (max_pixels / pixels) ** 0.5
+    else:
+        scale = 1.0
+    if scale != 1.0:
+        w = round(w * scale)
+        h = round(h * scale)
+
+    # Cap per-dimension to image_size (2D RoPE table constraint)
+    if image_size > 0:
+        max_edge = max(w, h)
+        if max_edge > image_size:
+            ratio = max_edge / image_size
+            w = round(w / ratio)
+            h = round(h / ratio)
+
+    # Ceiling-divide to get patch-token counts; ensure both are even
+    width_tokens = (w - 1) // image_patch_size + 1  # ceil(w / image_patch_size)
+    height_tokens = (h - 1) // image_patch_size + 1  # ceil(h / image_patch_size)
     width_tokens = width_tokens + (width_tokens % 2)
     height_tokens = height_tokens + (height_tokens % 2)
     return width_tokens, height_tokens
@@ -287,6 +353,15 @@ def process_image(image_path, adapter="llava", image_patch_size=16, image_size=1
     if adapter in ["deepseekocr", "gemma3"]:
         # padding
         PILimage = ImageOps.pad(PILimage, (image_size, image_size), color=(127, 127, 127))
+    elif adapter in ["qwen3_5vl", "qwen3vl"]:
+        # Pixel-budget smart resize matching Qwen2VLImageProcessorFast:
+        # upscale if total pixels < min_pixels, downscale if > max_pixels,
+        # then cap per-dimension to image_size (2D-RoPE table limit).
+        w, h = smart_resize_qwenvl(
+            PILimage, image_patch_size, image_size=image_size
+        )
+        new_image_size = (w * image_patch_size, h * image_patch_size)
+        PILimage = PILimage.resize(new_image_size, resample=RESAMPLE[adapter], reducing_gap=None)
     else:
         # resize
         w, h = image_to_num_tokens(
