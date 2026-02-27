@@ -571,17 +571,18 @@ class TransformerDecoder(DecoderBase):
         else:
             attn_mask = None
             cache_slice = None  # triggers flash decoding
-            # In hybrid models (e.g. Qwen3.5), linear_attention layers cannot use
-            # flash attention and need a pad mask during prefill so that padding
-            # tokens don't corrupt their recurrent state.
-            if self.has_linear_attn and S > 1:
-                # These kwargs are used only in the non-flash path to build the
-                # causal attn_mask; pop them here to avoid leaking into layer kwargs.
+            if S > 1:
+                # Pop these kwargs (used by the non-flash path to build the causal mask)
+                # even though flash handles causality internally; keeps kwargs clean.
                 kwargs.pop("image_locations", None)
                 kwargs.pop("prefix_len", None)
-                # tgt_pad_mask: (B, 1, S), True=padding → invert to True=valid token
-                lin_attn_mask = ~tgt_pad_mask[:, 0, :]  # (B, S)
+                # Linear-attention layers (e.g. GatedDeltaNet) cannot use flash attention
+                # and need a 2-D valid-token pad mask so that padding positions don't
+                # corrupt their recurrent/conv state during prefill.
+                lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
+                # Single-step decode: GatedDeltaNet runs in recurrent mode and doesn't
+                # apply the mask anyway (shape[1] == 1 → check is False), so None is fine.
                 lin_attn_mask = None
 
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
