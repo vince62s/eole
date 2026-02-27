@@ -421,6 +421,17 @@ class GatedDeltaNet(nn.Module):
         g = dt * A.view(1, 1, -1)          # (B, S, num_v_heads)
         beta = torch.sigmoid(b)            # (B, S, num_v_heads)
 
+        # At padding positions, q/k/v are already zeroed (hidden_states was zeroed above).
+        # But g and beta are still non-trivial: g = softplus(dt_bias)*A (decay < 1) and
+        # beta = sigmoid(0) = 0.5.  This would decay the recurrent state at padding positions
+        # even though no content is written, corrupting the state for shorter sequences when
+        # batch_size > 1.  Fix: force g=0 (exp(0)=1, identity decay) and beta=0 (no write)
+        # at padding positions so they are true no-ops for the recurrent state.
+        if attn_mask is not None and attn_mask.shape[1] > 1:
+            pad_mask = ~attn_mask  # (B, S), True = padding position
+            g = g.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+            beta = beta.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+
         # Compute linear attention
         if use_precomputed:
             output, new_recurrent_state = self._recurrent_gated_delta_rule(
