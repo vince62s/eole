@@ -227,23 +227,40 @@ def _torch_recurrent_gated_delta_rule(
 # RMSNorm variants used inside GatedDeltaNet
 # ---------------------------------------------------------------------------
 
-class RMSNormGated(nn.Module):
-    """RMSNorm with a silu gate, used inside GatedDeltaNet."""
+# Prefer the FLA fused kernel (faster on CUDA) when available; fall back to a
+# pure-PyTorch implementation that is behaviourally identical.
+try:
+    from fla.modules.layernorm_gated import RMSNormGated
+    _fla_rmsnorm_gated = True
+except ImportError:
+    _fla_rmsnorm_gated = False
 
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+if not _fla_rmsnorm_gated:
+    class RMSNormGated(nn.Module):
+        """Pure-PyTorch RMSNorm with a silu gate.
 
-    def forward(self, hidden_states, gate=None):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        if gate is not None:
-            hidden_states = hidden_states * F.silu(gate.to(torch.float32)).to(input_dtype)
-        return hidden_states
+        norm_before_gate=True  → norm(x) * silu(z)   (default for GatedDeltaNet)
+        norm_before_gate=False → norm(x * silu(z))
+        """
+
+        def __init__(self, hidden_size, eps=1e-6, norm_before_gate=True):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+            self.variance_epsilon = eps
+            self.norm_before_gate = norm_before_gate
+
+        def forward(self, x, z=None):
+            input_dtype = x.dtype
+            if z is not None and not self.norm_before_gate:
+                x = x * F.silu(z.to(torch.float32)).to(input_dtype)
+                z = None  # already applied; skip post-norm multiply
+            x = x.to(torch.float32)
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.variance_epsilon)
+            x = self.weight * x.to(input_dtype)
+            if z is not None:
+                x = x * F.silu(z.to(torch.float32)).to(input_dtype)
+            return x
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +330,7 @@ class GatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
-        self.norm = RMSNormGated(self.head_v_dim, eps=decoder_config.norm_eps)
+        self.norm = RMSNormGated(self.head_v_dim, eps=decoder_config.norm_eps, norm_before_gate=True)
         self.out_proj = skip_init(
             nn.Linear, in_features=self.value_dim,
             out_features=hidden_size, bias=False,
