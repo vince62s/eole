@@ -117,17 +117,27 @@ MODEL_OVERRIDES = {
             # MoE router
             ".mlp.gate.weight": ".mlp.gate.weight",
             # Per-expert weights extracted from 3D stacked tensors:
-            #   HF: mlp.experts.gate_up_proj shape (num_experts, 2*ff, hidden)
-            #   Eole: mlp.experts.{j}.gate_up_proj.weight shape (2*ff, hidden)
+            #   HF: mlp.experts.gate_up_proj shape (num_experts, 2*ff, hidden) — fused gate+up
+            #   Eole: split into gate_up_proj.weight (ff, hidden) and up_proj.weight (ff, hidden)
             **{
-                f".mlp.experts.{j}.gate_up_proj.weight": (".mlp.experts.gate_up_proj", f"[{j}]")
+                f".mlp.experts.{j}.gate_up_proj.weight": (
+                    ".mlp.experts.gate_up_proj",
+                    f"[{j}, :moe_transformer_ff, :]",
+                )
+                for j in range(256)
+            },
+            **{
+                f".mlp.experts.{j}.up_proj.weight": (
+                    ".mlp.experts.gate_up_proj",
+                    f"[{j}, moe_transformer_ff:, :]",
+                )
                 for j in range(256)
             },
             **{
                 f".mlp.experts.{j}.down_proj.weight": (".mlp.experts.down_proj", f"[{j}]")
                 for j in range(256)
             },
-            # Shared expert (gate+up fused → gate_up_proj; down stays)
+            # Shared expert (separate gate_proj + up_proj in HF → gate_up_proj + up_proj in Eole)
             ".mlp.shared_experts.gate_up_proj.": ".mlp.shared_expert.gate_proj.",
             ".mlp.shared_experts.up_proj.": ".mlp.shared_expert.up_proj.",
             ".mlp.shared_experts.down_proj.": ".mlp.shared_expert.down_proj.",
@@ -814,7 +824,17 @@ MODEL_OVERRIDES = {
             ".linear_attn.out_proj.": ".linear_attn.out_proj.",
             ".mlp.gate.weight": ".mlp.gate.weight",
             **{
-                f".mlp.experts.{j}.gate_up_proj.weight": (".mlp.experts.gate_up_proj", f"[{j}]")
+                f".mlp.experts.{j}.gate_up_proj.weight": (
+                    ".mlp.experts.gate_up_proj",
+                    f"[{j}, :moe_transformer_ff, :]",
+                )
+                for j in range(256)
+            },
+            **{
+                f".mlp.experts.{j}.up_proj.weight": (
+                    ".mlp.experts.gate_up_proj",
+                    f"[{j}, moe_transformer_ff:, :]",
+                )
                 for j in range(256)
             },
             **{

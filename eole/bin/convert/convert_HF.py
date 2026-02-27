@@ -812,6 +812,12 @@ def build_shards(model_config, hf, args, params):
                                             "w": w,
                                             "hidden_size": hidden_size,
                                             "transformer_ff": model_config["transformer_ff"],
+                                            "moe_transformer_ff": model_config.get(
+                                                "decoder", {}
+                                            ).get(
+                                                "moe_transformer_ff",
+                                                model_config.get("moe_transformer_ff", 0),
+                                            ),
                                         },
                                     ).contiguous()
                                 target1 = target
