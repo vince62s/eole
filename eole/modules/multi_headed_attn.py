@@ -505,7 +505,10 @@ class SelfMHA(MultiHeadedAttention):
                     window_size=self.window_size,
                 )
                 self.causal = False
-                attn_output = self.final_linear(blhd_to_bld(context))
+                context = blhd_to_bld(context)
+                if self.q_gating and hasattr(self, "_attn_gate"):
+                    context = context * self._attn_gate
+                attn_output = self.final_linear(context)
                 if self.parallel_gpu > 1:
                     # all_reduce is an inplace op - not easily backprop
                     attn_output1 = attn_output.detach().clone()
