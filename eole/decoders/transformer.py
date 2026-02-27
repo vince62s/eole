@@ -111,7 +111,7 @@ class TransformerDecoderLayer(nn.Module):
         self.compiled_shapes = set()
         self.hidden_size = decoder_config.hidden_size
 
-        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
+        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"] and self.layer_type != "linear_attention":
             self._compile_decoder()
 
     def _compile_decoder(
@@ -122,7 +122,9 @@ class TransformerDecoderLayer(nn.Module):
         position_embeddings=None,
         cache_seqlens=None,
     ):
-        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
+        # linear_attention layers (GatedDeltaNet) use fla ops that torch.dynamo cannot
+        # trace (staticmethod.__call__).  Skip compilation for those layers entirely.
+        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"] and self.layer_type != "linear_attention":
             self._forward_compile = torch.compile(
                 self._forward_eager,
                 fullgraph=True,
@@ -132,7 +134,7 @@ class TransformerDecoderLayer(nn.Module):
                     "triton.cudagraphs": EOLE_COMPILE_MODE == "2",
                 },
             )
-        if layer_in is not None:
+        if layer_in is not None and self.layer_type != "linear_attention":
             # assumes that _init_cache was before warmup and tiling along beam_size
             B = cache_seqlens.size(0)
             S = enc_out.size(1) if enc_out is not None else 0
@@ -212,7 +214,8 @@ class TransformerDecoderLayer(nn.Module):
     def forward(self, layer_in, **kwargs):
         if layer_in.size(1) > 1:
             return self._forward_eager(layer_in, **kwargs)
-        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
+        # linear_attention layers (GatedDeltaNet) are not compiled – always run eager.
+        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"] and self.layer_type != "linear_attention":
             return self._forward_compile(layer_in, **kwargs)
 
         return self._forward_eager(layer_in, **kwargs)
@@ -362,7 +365,10 @@ class TransformerDecoder(DecoderBase):
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
         self._forward_compile = torch.compile(
             self._forward_eager,
-            fullgraph=True,
+            # GDA (linear_attention) layers call fla.LayerNormFn.apply which is a
+            # staticmethod that torch.dynamo cannot trace.  Allow graph breaks so
+            # those layers fall back to eager while the rest of the graph is compiled.
+            fullgraph=not self.has_linear_attn,
             dynamic=False,
             options={
                 "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
