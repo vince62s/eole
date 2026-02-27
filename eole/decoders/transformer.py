@@ -569,18 +569,24 @@ class TransformerDecoder(DecoderBase):
                 attn_mask = valid.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, MAX_T or Dynamic Cache Len)
                 lin_attn_mask = None
         else:
-            attn_mask = None
-            cache_slice = None  # triggers flash decoding
             if S > 1:
-                # Pop these kwargs (used by the non-flash path to build the causal mask)
-                # even though flash handles causality internally; keeps kwargs clean.
-                kwargs.pop("image_locations", None)
-                kwargs.pop("prefix_len", None)
-                # Linear-attention layers (e.g. GatedDeltaNet) cannot use flash attention
-                # and need a 2-D valid-token pad mask so that padding positions don't
-                # corrupt their recurrent/conv state during prefill.
+                # Prefill in flash mode: fall back to SDPA with a PAD-aware causal mask,
+                # identical to the non-flash prefill path.  flash_attn_with_kvcache does
+                # not accept a per-sequence key-padding mask, so left-PAD positions would
+                # be included in the attention window, corrupting the activations of real
+                # tokens in padded sequences (batch_size > 1 discrepancy).
+                image_locations = kwargs.pop("image_locations", None)
+                prefix_len = kwargs.pop("prefix_len", None)
+                cache_slice = pos_ids_1d
+                attn_mask = self._causal_attn_mask(tgt_pad_mask, prefix_len=prefix_len)
+                if image_locations is not None:
+                    attn_mask = self._update_causal_mask(attn_mask, image_locations)
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
+                # Decode (S == 1): use flash_attn_with_kvcache fast path.
+                # cache_leftpad already tells flash to skip left-PAD positions in the KV cache.
+                attn_mask = None
+                cache_slice = None  # triggers flash_attn_with_kvcache
                 # Single-step decode: GatedDeltaNet runs in recurrent mode and doesn't
                 # apply the mask anyway (shape[1] == 1 → check is False), so None is fine.
                 lin_attn_mask = None
@@ -589,8 +595,8 @@ class TransformerDecoder(DecoderBase):
         attn_aligns = []
 
         for layer, pos_emb in zip(self.transformer_layers, pos_emb_list):
-            # In hybrid flash mode, linear_attention layers get a 2D pad mask
-            # while full_attention layers get None (flash handles causal masking).
+            # Linear-attention (GDA) layers receive the 2-D valid-token mask;
+            # full-attention layers receive the 4-D causal mask (or None for flash decode).
             layer_attn_mask = (
                 lin_attn_mask
                 if (lin_attn_mask is not None and layer.layer_type == "linear_attention")
