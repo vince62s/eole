@@ -629,7 +629,8 @@ class BaseModel(nn.Module):
                             param.data = param.data.to(device=device, dtype=dtype)
                     for buf_name, buf in module._buffers.items():
                         if buf is not None:
-                            module._buffers[buf_name] = buf.to(device=device, dtype=dtype)
+                            buf_dtype = dtype if buf.is_floating_point() else buf.dtype
+                            module._buffers[buf_name] = buf.to(device=device, dtype=buf_dtype)
                 else:
                     module.to(device=device, dtype=dtype)
                 if getattr(running_config, "compute_dtype", None) == torch.int8:
