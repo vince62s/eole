@@ -416,7 +416,6 @@ def build_config_dict(hf):
     if arch in [
         "Qwen3VLForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
     ]:
         # Vision config uses different key names from standard vision models
         num_pos_embed = vision_config.get("num_position_embeddings", 0)
