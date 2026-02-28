@@ -608,7 +608,9 @@ class BaseModel(nn.Module):
         # Load leaf modules
         for module_name, module in self.named_modules():
             has_children = any(module.children())
-            has_own_params = next(module.parameters(recurse=False), None) is not None
+            has_own_params = next(module.parameters(recurse=False), None) is not None or next(
+                module.buffers(recurse=False), None
+            ) is not None
             if not has_children or has_own_params:
                 self._load_module_parameters(
                     module_name, module, f, keys_shard, updated_params, buf_list, keyfound, tp_offset, strict
@@ -618,8 +620,9 @@ class BaseModel(nn.Module):
                     # Move only this module's direct parameters/buffers to device; do NOT
                     # call module.to() which would recursively move child modules too.
                     # Example: VisionEncoderDecoderModel (SAM encoder variant) has direct
-                    # nn.Parameter attrs (image_newline, view_separator) but also has encoder/
-                    # decoder children whose Params4bit weights must not be moved to CUDA yet
+                    # nn.Parameter attrs (image_newline, view_separator) and the SAM
+                    # VisionEncoder has a direct registered buffer (position_ids); child
+                    # modules whose Params4bit weights must not be moved to CUDA yet
                     # (that would pack them before their checkpoint data is loaded).
                     for param in module._parameters.values():
                         if param is not None:
