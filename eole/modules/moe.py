@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from eole.modules.transformer_mlp import MLP
 from torch.distributed import all_reduce
 from eole.triton.fused_moe import fused_experts_impl
+from eole import EOLE_TORCH_COMPILE
 
 logger = logging.getLogger(__name__)
 
@@ -84,20 +85,49 @@ def vectorized_moe(x, topk_weights, topk_ids, K, experts):
     return y
 
 
-def is_quant_moe(mlp):
-    """Return True if *mlp* is a MoE whose expert weights are quantized and not yet
-    pre-dequantized into the Triton cache (_w1 not set).
-
-    Used by the torch.compile infrastructure to decide whether ``fullgraph=True``
-    is safe (it is NOT safe when vectorized_moe will be called, because that
-    function uses .tolist() and data-dependent Python loops).
+def _vectorized_moe_compile(x, topk_weights, topk_ids, K, experts):
     """
-    return (
-        isinstance(mlp, MoE)
-        and bool(mlp.experts)
-        and not isinstance(mlp.experts[0].gate_up_proj, torch.nn.Linear)
-        and mlp._w1 is None
-    )
+    Torch.compile-compatible MoE dispatch using mask-based routing.
+
+    Replaces the sort-based dispatch (.tolist() + data-dependent loops that are
+    incompatible with fullgraph=True) with a fixed-length loop over experts —
+    fully traceable by torch.dynamo with fullgraph=True, enabling CUDA-graph
+    capture via triton.cudagraphs.
+
+    Every expert is run on all BT*K tokens; non-routed tokens are zeroed out
+    before being passed to each expert.  This incurs extra FLOPs (all experts
+    are evaluated) but eliminates all graph breaks.  The compiled path is only
+    active during single-token decode (prefill always falls back to eager), so
+    BT*K is small and the overhead is bounded.
+
+    x: (BT*K, hidden)  repeat_interleave'd tokens
+    topk_weights: (BT, K)
+    topk_ids: (BT, K)
+    K: num_experts_per_token
+    experts: nn.ModuleList
+    """
+    BTK, hidden = x.shape
+    BT = BTK // K
+    num_experts = len(experts)
+
+    if BTK == 0:
+        return x.new_empty((0, hidden))
+
+    flat_ids = topk_ids.reshape(-1)  # (BTK,)
+    y_flat = torch.zeros(BTK, hidden, device=x.device, dtype=x.dtype)
+
+    # Fixed-length loop over all experts — no data-dependent control flow,
+    # fully traceable by torch.dynamo with fullgraph=True.
+    for eid in range(num_experts):
+        mask = (flat_ids == eid).unsqueeze(-1)  # (BTK, 1) bool
+        # Zero out non-routed tokens before the expert and mask the output.
+        # The output mask is required for correctness when experts have biases
+        # (add_ffnbias=True): zero input through a biased linear gives the bias,
+        # not zero, so the output must be explicitly zeroed.
+        y_flat = y_flat + experts[eid](x * mask) * mask
+
+    # Weighted combination: (BT, K, hidden) → (BT, hidden)
+    return (y_flat.reshape(BT, K, hidden) * topk_weights.unsqueeze(-1)).sum(dim=1)
 
 
 class MoE(nn.Module):
@@ -333,7 +363,14 @@ class MoE(nn.Module):
             ).view(B, T, C)
         else:
             x_flat = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)
-            y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
+            if EOLE_TORCH_COMPILE:
+                # Use compile-compatible dispatch (mask-based, no graph breaks).
+                # vectorized_moe uses .tolist() and data-dependent Python loops which
+                # are incompatible with fullgraph=True.  EOLE_TORCH_COMPILE is a
+                # module-level constant so torch.dynamo folds this branch statically.
+                y = _vectorized_moe_compile(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
+            else:
+                y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
             """
             For educational purpose, we leave here the original implementation
             y = naive_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
