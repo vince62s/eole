@@ -89,9 +89,9 @@ def is_quant_moe(mlp):
     pre-dequantized into the Triton cache (_w1 not set).
 
     Used by the torch.compile infrastructure to decide whether ``fullgraph=True``
-    is safe: it is NOT safe for quantized MoE because the lazy-dequantize path
-    (``_build_fused_weights_lazy``) uses ``@torch.compiler.disable`` which causes
-    a graph break incompatible with ``fullgraph=True``.
+    is safe: it is NOT safe for quantized MoE because the ``vectorized_moe`` path
+    (used for quantized experts) calls ``.tolist()`` which causes a graph break
+    incompatible with ``fullgraph=True``.
     """
     return (
         isinstance(mlp, MoE)
@@ -216,36 +216,6 @@ class MoE(nn.Module):
         self._w1 = torch.cat(w1_list, dim=0)
         self._w2 = torch.cat(w2_list, dim=0)
 
-    @torch.compiler.disable
-    def _build_fused_weights_lazy(self, device, dtype):
-        """Dequantize all expert weights on-the-fly and return (w1, w2) for fused_experts_impl.
-
-        This method is decorated with ``@torch.compiler.disable`` so that bitsandbytes
-        custom CUDA ops (dequantize_4bit) run eagerly even inside a compiled context.
-        The caller (``forward``) is compiled with ``fullgraph=False`` for quantized
-        layers, which allows this graph break.
-
-        The returned tensors are **temporary**: the caller should ``del w1, w2`` after
-        the ``fused_experts_impl`` call to reclaim VRAM immediately.
-
-        **Peak VRAM** – one layer at a time, e.g. for Qwen2.5-35B-A3B (128 experts,
-        7168×768 gate_up, 768×7168 down, float16): ≈ 2.8 GB freed after the call.
-        """
-        w1_list = []
-        w2_list = []
-        for e in self.experts:
-            Wg = self._dequantize_weight(e.gate_up_proj, device, dtype)
-            Wu = getattr(e, "up_proj", None)
-            if Wu is not None:
-                Wu = self._dequantize_weight(Wu, device, dtype)
-                W1 = torch.cat([Wg, Wu], dim=0)  # (2*ffn, hidden)
-            else:
-                W1 = Wg
-            w1_list.append(W1.unsqueeze(0))
-            W2 = self._dequantize_weight(e.down_proj, device, dtype)
-            w2_list.append(W2.unsqueeze(0))
-        return torch.cat(w1_list, dim=0), torch.cat(w2_list, dim=0)
-
     def precompute_expert_weights(self, device=None, dtype=None):
         """Explicitly dequantize and cache all expert weights for the Triton fast path.
 
@@ -256,9 +226,9 @@ class MoE(nn.Module):
 
         Calling this method switches this MoE layer to the fast Triton
         ``fused_experts_impl`` path for all subsequent inference calls.  Skip it
-        to stay on the lower-memory lazy-dequantize fallback (the default for
-        quantized models, which dequantizes one layer at a time during each forward
-        pass and immediately frees the dequantized tensors).
+        to stay on the lower-memory ``vectorized_moe`` fallback (the default for
+        quantized models, which dequantizes only the K selected experts per token
+        on-the-fly rather than all experts at once).
 
         **Memory estimate** – for Qwen2.5-35B-A3B (128 experts, gate_up (7168×768),
         down (768×7168)), dequantized to float16:
@@ -308,7 +278,7 @@ class MoE(nn.Module):
             # For plain nn.Linear experts, build the Triton weight cache permanently (once).
             # type() is (not isinstance) is intentional: subclasses such as
             # bitsandbytes Linear4bit or AWQ WQLinear must NOT match here so
-            # that quantized models default to the lazy-dequantize Triton path.
+            # that quantized models fall through to the vectorized_moe path.
             if self._w1 is None and self.experts and type(self.experts[0].gate_up_proj) is torch.nn.Linear:
                 self._maybe_fused_moe_weights(x.device, x.dtype)
         else:
@@ -351,29 +321,18 @@ class MoE(nn.Module):
                 topk_ids=expert_indices,
                 activation=self.activation_function,
             ).view(B, T, C)
-        elif not self.training:
-            # Quantized experts (bnb_NF4/8bit, AWQ …): dequantize all expert weights
-            # on-the-fly for this forward pass, run the Triton fused kernel, then
-            # immediately free the dequantized tensors to reclaim VRAM.
-            #
-            # _build_fused_weights_lazy is decorated with @torch.compiler.disable so
-            # bitsandbytes custom CUDA ops run eagerly without breaking fullgraph=True.
-            # When torch.compile is active the caller sets fullgraph=False for layers
-            # containing quantized MoE (see TransformerDecoderLayer._compile_decoder),
-            # allowing this graph break while still JIT-compiling attention/norms and
-            # the Triton kernel.
-            w1, w2 = self._build_fused_weights_lazy(x_flat.device, x_flat.dtype)
-            y = fused_experts_impl(
-                hidden_states=x_flat,
-                w1=w1,
-                w2=w2,
-                topk_weights=expert_weights,
-                topk_ids=expert_indices,
-                activation=self.activation_function,
-            ).view(B, T, C)
-            del w1, w2  # free immediately to reclaim VRAM
         else:
-            # Training: each expert's forward() handles quantization on-the-fly.
+            # Quantized experts (bnb_NF4/8bit, AWQ …) or training: call each selected
+            # expert's own forward(), so bitsandbytes/AWQ dequantize on-the-fly for
+            # just the K active experts.
+            #
+            # For a decode step with batch_size=1 and K=8 out of 256 experts, this
+            # dequantizes only 8 expert weight matrices — ~32× less work than
+            # dequantizing all experts at once.
+            #
+            # In torch.compile mode the caller sets fullgraph=False for quantized MoE
+            # layers (see TransformerDecoderLayer._compile_decoder) to allow the
+            # .tolist() graph break in vectorized_moe.
             x_flat = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)
             y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
             """
