@@ -167,7 +167,14 @@ class MoE(nn.Module):
     def forward(self, x):
 
         if not self.training:
-            self._maybe_fused_moe_weights(x.device, x.dtype)
+            # Only use the Triton fused kernels for plain (unquantized) nn.Linear expert
+            # weights.  Quantized experts (bnb_NF4/8bit, AWQ …) must go through the
+            # vectorized fallback so that each expert's own forward() handles
+            # dequantization on-the-fly.  Calling _maybe_fused_moe_weights with quantized
+            # weights would silently dequantize and cache all expert weights (~5 GB per MoE
+            # layer) permanently in self._w1/_w2, causing OOM after a handful of layers.
+            if self.experts and type(self.experts[0].gate_up_proj) is torch.nn.Linear:
+                self._maybe_fused_moe_weights(x.device, x.dtype)
         else:
             self._maybe_fuse_gates()
 
@@ -191,7 +198,7 @@ class MoE(nn.Module):
         if self.moe_softmax_after:
             expert_weights = expert_weights.softmax(dim=-1)
 
-        if not self.training:
+        if not self.training and self._w1 is not None:
             y = fused_experts_impl(
                 hidden_states=x_flat,
                 w1=self._w1,
