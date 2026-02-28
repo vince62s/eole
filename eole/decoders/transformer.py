@@ -126,16 +126,16 @@ class TransformerDecoderLayer(nn.Module):
         # linear_attention layers (GatedDeltaNet) use fla ops that torch.dynamo cannot
         # trace (staticmethod.__call__).  Skip compilation for those layers entirely.
         #
-        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use vectorized_moe which calls
-        # .tolist() — a data-dependent Python loop that causes a graph break
-        # incompatible with fullgraph=True.  Use fullgraph=False and disable CUDA
-        # graphs for those layers so attention/norms are still JIT-compiled while
-        # the expert dispatch runs in eager.
+        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use _quant_moe_dispatch which is
+        # decorated with @torch.compiler.disable — torch.compile treats it as an opaque
+        # eager call (not a graph break), so fullgraph=True is safe even for quantized
+        # MoE.  CUDA graphs are still disabled because the dispatch calls .tolist()
+        # (GPU→CPU sync) inside the compiler-disabled region.
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"] and self.layer_type != "linear_attention":
             _quant_moe = is_quant_moe(self.mlp)
             self._forward_compile = torch.compile(
                 self._forward_eager,
-                fullgraph=not _quant_moe,
+                fullgraph=True,
                 dynamic=False,
                 options={
                     "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
@@ -379,12 +379,13 @@ class TransformerDecoder(DecoderBase):
         # staticmethod that torch.dynamo cannot trace.  Allow graph breaks so
         # those layers fall back to eager while the rest of the graph is compiled.
         #
-        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use vectorized_moe which calls
-        # .tolist() — a data-dependent Python loop causing graph breaks incompatible
-        # with fullgraph=True.  Allow graph breaks (and disable CUDA graphs) for
-        # decoders that contain such layers so attention/norms are still compiled.
+        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use _quant_moe_dispatch which
+        # is decorated with @torch.compiler.disable — torch.compile treats it as an
+        # opaque eager call rather than a graph break, so fullgraph=True is safe.
+        # CUDA graphs are still disabled for quantized MoE because the dispatch
+        # calls .tolist() (GPU→CPU sync) inside the compiler-disabled region.
         _has_quant_moe = any(is_quant_moe(layer.mlp) for layer in self.transformer_layers if hasattr(layer, "mlp"))
-        _fullgraph = not self.has_linear_attn and not _has_quant_moe
+        _fullgraph = not self.has_linear_attn
         _cudagraphs = EOLE_COMPILE_MODE == "0" and not _has_quant_moe
         self._forward_compile = torch.compile(
             self._forward_eager,

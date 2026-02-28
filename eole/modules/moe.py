@@ -84,14 +84,38 @@ def vectorized_moe(x, topk_weights, topk_ids, K, experts):
     return y
 
 
+@torch.compiler.disable
+def _quant_moe_dispatch(x_expanded, expert_weights, expert_indices, K, experts):
+    """Expert dispatch for quantized MoE (bnb_NF4/8bit, AWQ …).
+
+    Decorated with ``@torch.compiler.disable`` so that an enclosing
+    ``torch.compile(fullgraph=True)`` region treats this as an *opaque* eager
+    call rather than as a graph break.  This lets the decoder's attention,
+    layer-norms, gate-linear, topk selection, and weighted output-sum all
+    compile into a single continuous Triton kernel graph, while only the
+    expert dispatch (which must call each bnb/AWQ expert's forward() on a
+    data-dependent subset of tokens) runs in eager.
+
+    Only ACTIVE experts (≤ K unique entries in ``expert_indices``) are ever
+    called; we never loop over all N experts.
+    """
+    return vectorized_moe(x_expanded, expert_weights, expert_indices, K, experts)
+
+
 def is_quant_moe(mlp):
     """Return True if *mlp* is a MoE whose expert weights are quantized and not yet
     pre-dequantized into the Triton cache (_w1 not set).
 
-    Used by the torch.compile infrastructure to decide whether ``fullgraph=True``
-    is safe: it is NOT safe for quantized MoE because the ``vectorized_moe`` path
-    (used for quantized experts) calls ``.tolist()`` which causes a graph break
-    incompatible with ``fullgraph=True``.
+    Used by the torch.compile infrastructure to decide whether CUDA graphs are safe:
+    CUDA graphs are NOT safe for quantized MoE because ``_quant_moe_dispatch``
+    calls ``.tolist()`` internally — a GPU→CPU synchronisation that is
+    incompatible with CUDA graph capture.
+
+    Note: ``fullgraph=True`` *is* safe for quantized MoE.  ``_quant_moe_dispatch``
+    is decorated with ``@torch.compiler.disable``, so torch.compile treats it as
+    an opaque eager call rather than a graph break.  The decoder's attention,
+    norms, gate, topk, and weighted-sum are therefore still compiled as one
+    contiguous graph.
     """
     return (
         isinstance(mlp, MoE)
@@ -322,20 +346,17 @@ class MoE(nn.Module):
                 activation=self.activation_function,
             ).view(B, T, C)
         else:
-            # Quantized experts (bnb_NF4/8bit, AWQ …) or training: call each selected
-            # expert's own forward(), so bitsandbytes/AWQ run their native quantized
-            # GEMM kernels without any dequantization overhead.
-            #
-            # Dequantizing expert weights on-the-fly during decoding is too slow
-            # even for just the K active experts per step (the dequantization cost
-            # itself is the bottleneck).  A future Triton kernel that operates
-            # directly on quantized weight storage would be needed to improve on this.
-            #
-            # In torch.compile mode the caller sets fullgraph=False for quantized MoE
-            # layers (see TransformerDecoderLayer._compile_decoder) to allow the
-            # .tolist() graph break in vectorized_moe.
-            x_flat = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)
-            y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
+            # Quantized experts (bnb_NF4/8bit, AWQ …) or training.
+            # repeat_interleave is a standard tensor op — compiled by torch.compile.
+            # _quant_moe_dispatch is @torch.compiler.disable'd so an enclosing
+            # torch.compile(fullgraph=True) treats it as an opaque eager call rather
+            # than a graph break, enabling full compilation of the decoder graph
+            # (attention, norms, gate, topk, weighted sum) even for quantized MoE.
+            # Inside _quant_moe_dispatch, vectorized_moe calls only the ≤K ACTIVE
+            # experts (not all N), and the data-dependent Python loop stays in eager
+            # where bitsandbytes/AWQ native quantized-GEMM kernels run directly.
+            x_expanded = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)
+            y = _quant_moe_dispatch(x_expanded, expert_weights, expert_indices, K, self.experts).view(B, T, C)
             """
             For educational purpose, we leave here the original implementation
             y = naive_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
