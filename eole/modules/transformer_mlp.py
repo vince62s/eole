@@ -65,6 +65,11 @@ class MLP(nn.Module):
         self.maybe_ckpt = checkpoint if "ffn" in getattr(running_config, "use_ckpting", []) else lambda f, x: f(x)
 
     def _fuse_gate(self) -> None:
+        # Skip fusion for bitsandbytes 4-bit quantized layers: their weights are packed
+        # uint8 tensors that cannot be naively concatenated into a valid fused Linear.
+        # Linear4bit modules have a quant_state attribute; regular nn.Linear does not.
+        if hasattr(self.gate_up_proj, "quant_state"):
+            return
         if hasattr(self.gate_up_proj, "weight"):
             new_gate = skip_init(
                 nn.Linear,

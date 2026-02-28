@@ -162,6 +162,11 @@ class MultiHeadedAttention(torch.nn.Module):
         self.dropout_p = dropout
 
     def _fuse_KVQ(self) -> None:
+        # Skip fusion for bitsandbytes 4-bit quantized layers: their weights are packed
+        # uint8 tensors that cannot be naively concatenated into a valid fused Linear.
+        # Linear4bit modules have a quant_state attribute; regular nn.Linear does not.
+        if hasattr(self.linear_keys, "quant_state"):
+            return
         if hasattr(self.linear_keys, "weight"):
             self.linear_kvq = skip_init(
                 nn.Linear,
