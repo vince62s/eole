@@ -777,15 +777,42 @@ MODEL_OVERRIDES = {
         },
     },
     # ---------------------------------------------------------------------------
-    # Qwen3.5 MoE text-only (e.g. Qwen/Qwen3.5-35B-A3B) — same decoder structure
-    # as Qwen3_5MoeForCausalLM, different HF architecture class name.
+    # Qwen3.5 MoE VL (same vision encoder as Qwen3.5 VL + MoE text decoder)
     # ---------------------------------------------------------------------------
     "Qwen3_5MoeForConditionalGeneration": {
+        "decoder_layer_prefix": "model.language_model.layers.",
+        "tgt_emb.embeddings.weight": "model.language_model.embed_tokens.weight",
+        "decoder.layer_norm.weight": "model.language_model.norm.weight",
+        "generator.weight": "lm_head.weight",
+        # Vision encoder (identical to Qwen3.5 VL)
+        "encoder_layer_prefix": "model.visual.blocks.",
+        "encoder.patch_conv.weight": "model.visual.patch_embed.proj.weight",
+        "encoder.patch_conv.bias": "model.visual.patch_embed.proj.bias",
+        "encoder.pos_embed.weight": "model.visual.pos_embed.weight",
+        "encoder": {
+            ".self_attn.linear_query.weight": (".attn.qkv.weight", "[:hidden_size, :]"),
+            ".self_attn.linear_keys.weight": (".attn.qkv.weight", "[hidden_size:2*hidden_size, :]"),
+            ".self_attn.linear_values.weight": (".attn.qkv.weight", "[-hidden_size:, :]"),
+            ".self_attn.linear_query.bias": (".attn.qkv.bias", "[:hidden_size]"),
+            ".self_attn.linear_keys.bias": (".attn.qkv.bias", "[hidden_size:2*hidden_size]"),
+            ".self_attn.linear_values.bias": (".attn.qkv.bias", "[-hidden_size:]"),
+            ".self_attn.final_linear.weight": ".attn.proj.weight",
+            ".self_attn.final_linear.bias": ".attn.proj.bias",
+            ".mlp.gate_up_proj.": ".mlp.linear_fc1.",
+            ".mlp.down_proj.": ".mlp.linear_fc2.",
+            ".input_layernorm.": ".norm1.",
+            ".post_attention_layernorm.": ".norm2.",
+        },
+        "adapter.norm.weight": "model.visual.merger.norm.weight",
+        "adapter.norm.bias": "model.visual.merger.norm.bias",
+        "adapter.linear_fc1.weight": "model.visual.merger.linear_fc1.weight",
+        "adapter.linear_fc1.bias": "model.visual.merger.linear_fc1.bias",
+        "adapter.linear_fc2.weight": "model.visual.merger.linear_fc2.weight",
+        "adapter.linear_fc2.bias": "model.visual.merger.linear_fc2.bias",
+        # MoE decoder layers
         "decoder": {
-            # Full-attention layers: q/k norms
             ".self_attn.q_norm.": ".self_attn.q_norm.",
             ".self_attn.k_norm.": ".self_attn.k_norm.",
-            # Linear-attention (GatedDeltaNet) layers
             ".linear_attn.in_proj_qkv.": ".linear_attn.in_proj_qkv.",
             ".linear_attn.in_proj_z.": ".linear_attn.in_proj_z.",
             ".linear_attn.in_proj_b.": ".linear_attn.in_proj_b.",
@@ -795,11 +822,7 @@ MODEL_OVERRIDES = {
             ".linear_attn.A_log": ".linear_attn.A_log",
             ".linear_attn.norm.": ".linear_attn.norm.",
             ".linear_attn.out_proj.": ".linear_attn.out_proj.",
-            # MoE router
             ".mlp.gate.weight": ".mlp.gate.weight",
-            # Per-expert weights extracted from 3D stacked tensors:
-            #   HF: mlp.experts.gate_up_proj shape (num_experts, 2*ff, hidden) — fused gate+up
-            #   Eole: split into gate_up_proj.weight (ff, hidden) and up_proj.weight (ff, hidden)
             **{
                 f".mlp.experts.{j}.gate_up_proj.weight": (
                     ".mlp.experts.gate_up_proj",
@@ -818,20 +841,29 @@ MODEL_OVERRIDES = {
                 f".mlp.experts.{j}.down_proj.weight": (".mlp.experts.down_proj", f"[{j}]")
                 for j in range(256)
             },
-            # Shared expert (separate gate_proj + up_proj in HF → gate_up_proj + up_proj in Eole)
             ".mlp.shared_experts.gate_up_proj.": ".mlp.shared_expert.gate_proj.",
             ".mlp.shared_experts.up_proj.": ".mlp.shared_expert.up_proj.",
             ".mlp.shared_experts.down_proj.": ".mlp.shared_expert.down_proj.",
-            # Sigmoid gate for the shared expert output
             ".mlp.shared_expert_gate.weight": ".mlp.shared_expert_gate.weight",
         },
         "config": {
+            "adapter": "qwen3_5vl",
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
                 "q_gating": True,
                 "shared_expert_gate": True,
-            }
+            },
+            "encoder": {
+                "layer_norm": "standard",
+                "mlp_activation_fn": "gelu-tanh",
+                "add_ffnbias": True,
+                "add_final_linear_bias": True,
+                "add_qkvbias": True,
+                "layernorm_pre": False,
+                "layernorm_post": False,
+                "temporal_patch_size": 2,
+            },
         },
     },
 }
@@ -895,6 +927,7 @@ ARCH_TABLE = defaultdict(
         "HunYuanVLForConditionalGeneration": VisionTransformerLMModelConfig,
         "Qwen3VLForConditionalGeneration": VisionTransformerLMModelConfig,
         "Qwen3_5ForConditionalGeneration": VisionTransformerLMModelConfig,
+        "Qwen3_5MoeForConditionalGeneration": VisionTransformerLMModelConfig,
     },
 )
 
