@@ -17,6 +17,12 @@ def build_config():
         max_length=8192,
         world_size=1,
         gpu_ranks=[0],
+        quant_type="bnb_NF4",  # HF default, using it for initial reproducibility checks
+        quant_layers=[
+            "gate_up_proj",
+            "down_proj",
+            "up_proj",
+        ],
         compute_dtype="bf16",
         top_p=0.0,
         top_k=1,

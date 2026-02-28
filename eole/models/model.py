@@ -503,11 +503,32 @@ class BaseModel(nn.Module):
         base_name = module_name.split(".")[-1]
         is_buffer = f"{module_name}.{param_name}" in buf_list
         is_wq = module.__class__.__name__ == "WQLinear_GEMM"
+        is_4bit = param.__class__.__name__ == "Params4bit"
 
         # WQLinear_GEMM fix MUST happen before slicing
         if is_wq:
             param.data = param.data.transpose(0, 1)
             ckpt_t = ckpt_t.transpose(0, 1)
+
+        if is_4bit:
+            # Params4bit stores data as packed uint8, but the checkpoint contains float weights.
+            # We must use the checkpoint tensor shape for slicing, then create a new Params4bit.
+            # param.quant_type is always set on Params4bit instances (e.g. 'nf4' or 'fp4').
+            slices = self._get_tp_slices(ckpt_t, base_name, tp_offset)
+            if ckpt_t.dim() == 2:
+                col_start, col_end, row_start, row_end = slices
+                sliced = ckpt_t[col_start:col_end, row_start:row_end]
+            else:
+                col_start, col_end = slices
+                sliced = ckpt_t[col_start:col_end]
+            from bitsandbytes.nn import Params4bit
+
+            setattr(
+                module,
+                param_name,
+                Params4bit(sliced.contiguous(), requires_grad=False, quant_type=param.quant_type),
+            )
+            return
 
         slices = self._get_tp_slices(param, base_name, tp_offset)
 
