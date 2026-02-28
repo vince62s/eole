@@ -84,6 +84,22 @@ def vectorized_moe(x, topk_weights, topk_ids, K, experts):
     return y
 
 
+def is_quant_moe(mlp):
+    """Return True if *mlp* is a MoE whose expert weights are quantized and not yet
+    pre-dequantized into the Triton cache (_w1 not set).
+
+    Used by the torch.compile infrastructure to decide whether ``fullgraph=True``
+    is safe (it is NOT safe when vectorized_moe will be called, because that
+    function uses .tolist() and data-dependent Python loops).
+    """
+    return (
+        isinstance(mlp, MoE)
+        and bool(mlp.experts)
+        and not isinstance(mlp.experts[0].gate_up_proj, torch.nn.Linear)
+        and mlp._w1 is None
+    )
+
+
 class MoE(nn.Module):
     def __init__(
         self,
