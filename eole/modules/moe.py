@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from eole.modules.transformer_mlp import MLP
 from torch.distributed import all_reduce
 from eole.triton.fused_moe import fused_experts_impl
-from eole import EOLE_TORCH_COMPILE
 
 logger = logging.getLogger(__name__)
 
@@ -85,49 +84,21 @@ def vectorized_moe(x, topk_weights, topk_ids, K, experts):
     return y
 
 
-def _vectorized_moe_compile(x, topk_weights, topk_ids, K, experts):
+def is_quant_moe(mlp):
+    """Return True if *mlp* is a MoE whose expert weights are quantized and not yet
+    pre-dequantized into the Triton cache (_w1 not set).
+
+    Used by the torch.compile infrastructure to decide whether ``fullgraph=True``
+    is safe: it is NOT safe for quantized MoE because the lazy-dequantize path
+    (``_build_fused_weights_lazy``) uses ``@torch.compiler.disable`` which causes
+    a graph break incompatible with ``fullgraph=True``.
     """
-    Torch.compile-compatible MoE dispatch using mask-based routing.
-
-    Replaces the sort-based dispatch (.tolist() + data-dependent loops that are
-    incompatible with fullgraph=True) with a fixed-length loop over experts —
-    fully traceable by torch.dynamo with fullgraph=True, enabling CUDA-graph
-    capture via triton.cudagraphs.
-
-    Every expert is run on all BT*K tokens; non-routed tokens are zeroed out
-    before being passed to each expert.  This incurs extra FLOPs (all experts
-    are evaluated) but eliminates all graph breaks.  The compiled path is only
-    active during single-token decode (prefill always falls back to eager), so
-    BT*K is small and the overhead is bounded.
-
-    x: (BT*K, hidden)  repeat_interleave'd tokens
-    topk_weights: (BT, K)
-    topk_ids: (BT, K)
-    K: num_experts_per_token
-    experts: nn.ModuleList
-    """
-    BTK, hidden = x.shape
-    BT = BTK // K
-    num_experts = len(experts)
-
-    if BTK == 0:
-        return x.new_empty((0, hidden))
-
-    flat_ids = topk_ids.reshape(-1)  # (BTK,)
-    y_flat = torch.zeros(BTK, hidden, device=x.device, dtype=x.dtype)
-
-    # Fixed-length loop over all experts — no data-dependent control flow,
-    # fully traceable by torch.dynamo with fullgraph=True.
-    for eid in range(num_experts):
-        mask = (flat_ids == eid).unsqueeze(-1)  # (BTK, 1) bool
-        # Zero out non-routed tokens before the expert and mask the output.
-        # The output mask is required for correctness when experts have biases
-        # (add_ffnbias=True): zero input through a biased linear gives the bias,
-        # not zero, so the output must be explicitly zeroed.
-        y_flat = y_flat + experts[eid](x * mask) * mask
-
-    # Weighted combination: (BT, K, hidden) → (BT, hidden)
-    return (y_flat.reshape(BT, K, hidden) * topk_weights.unsqueeze(-1)).sum(dim=1)
+    return (
+        isinstance(mlp, MoE)
+        and bool(mlp.experts)
+        and not isinstance(mlp.experts[0].gate_up_proj, torch.nn.Linear)
+        and mlp._w1 is None
+    )
 
 
 class MoE(nn.Module):
@@ -245,6 +216,36 @@ class MoE(nn.Module):
         self._w1 = torch.cat(w1_list, dim=0)
         self._w2 = torch.cat(w2_list, dim=0)
 
+    @torch.compiler.disable
+    def _build_fused_weights_lazy(self, device, dtype):
+        """Dequantize all expert weights on-the-fly and return (w1, w2) for fused_experts_impl.
+
+        This method is decorated with ``@torch.compiler.disable`` so that bitsandbytes
+        custom CUDA ops (dequantize_4bit) run eagerly even inside a compiled context.
+        The caller (``forward``) is compiled with ``fullgraph=False`` for quantized
+        layers, which allows this graph break.
+
+        The returned tensors are **temporary**: the caller should ``del w1, w2`` after
+        the ``fused_experts_impl`` call to reclaim VRAM immediately.
+
+        **Peak VRAM** – one layer at a time, e.g. for Qwen2.5-35B-A3B (128 experts,
+        7168×768 gate_up, 768×7168 down, float16): ≈ 2.8 GB freed after the call.
+        """
+        w1_list = []
+        w2_list = []
+        for e in self.experts:
+            Wg = self._dequantize_weight(e.gate_up_proj, device, dtype)
+            Wu = getattr(e, "up_proj", None)
+            if Wu is not None:
+                Wu = self._dequantize_weight(Wu, device, dtype)
+                W1 = torch.cat([Wg, Wu], dim=0)  # (2*ffn, hidden)
+            else:
+                W1 = Wg
+            w1_list.append(W1.unsqueeze(0))
+            W2 = self._dequantize_weight(e.down_proj, device, dtype)
+            w2_list.append(W2.unsqueeze(0))
+        return torch.cat(w1_list, dim=0), torch.cat(w2_list, dim=0)
+
     def precompute_expert_weights(self, device=None, dtype=None):
         """Explicitly dequantize and cache all expert weights for the Triton fast path.
 
@@ -255,8 +256,9 @@ class MoE(nn.Module):
 
         Calling this method switches this MoE layer to the fast Triton
         ``fused_experts_impl`` path for all subsequent inference calls.  Skip it
-        to stay on the lower-memory ``vectorized_moe`` fallback (the default for
-        quantized models).
+        to stay on the lower-memory lazy-dequantize fallback (the default for
+        quantized models, which dequantizes one layer at a time during each forward
+        pass and immediately frees the dequantized tensors).
 
         **Memory estimate** – for Qwen2.5-35B-A3B (128 experts, gate_up (7168×768),
         down (768×7168)), dequantized to float16:
@@ -303,32 +305,12 @@ class MoE(nn.Module):
     def forward(self, x):
 
         if not self.training:
-            # Only use the Triton fused kernels for plain (unquantized) nn.Linear expert
-            # weights, OR when the user has explicitly called precompute_expert_weights()
-            # to dequantize quantized weights into the _w1/_w2 cache.
-            #
-            # For quantized experts (bnb_NF4/8bit, AWQ …) the default fallback is
-            # vectorized_moe, which calls each expert's own forward() so that
-            # bitsandbytes/AWQ dequantize on-the-fly without any persistent memory
-            # overhead.  _maybe_fused_moe_weights is NOT called automatically here
-            # because dequantizing all experts permanently would require ~5 GB of
-            # VRAM per MoE layer, causing OOM.
-            #
-            # To enable Triton for quantized models (if VRAM allows), call
-            # precompute_expert_weights() explicitly after model load.
+            # For plain nn.Linear experts, build the Triton weight cache permanently (once).
             # type() is (not isinstance) is intentional: subclasses such as
             # bitsandbytes Linear4bit or AWQ WQLinear must NOT match here so
-            # that quantized models default to vectorized_moe.
+            # that quantized models default to the lazy-dequantize Triton path.
             if self._w1 is None and self.experts and type(self.experts[0].gate_up_proj) is torch.nn.Linear:
                 self._maybe_fused_moe_weights(x.device, x.dtype)
-            elif self._w1 is None and not hasattr(self, "_triton_unavailable_warned"):
-                self._triton_unavailable_warned = True
-                logger.info(
-                    "MoE: expert weights are quantized – using vectorized_moe fallback "
-                    "(bitsandbytes dequantizes on-the-fly).  To enable the faster Triton "
-                    "path at the cost of extra VRAM, call precompute_expert_weights() "
-                    "after model load."
-                )
         else:
             self._maybe_fuse_gates()
 
@@ -350,9 +332,17 @@ class MoE(nn.Module):
         expert_weights, expert_indices = torch.topk(scores, K, dim=-1, sorted=False)  # both are (BT, K)
 
         if self.moe_softmax_after:
+            # Mixtral-style: softmax is applied *after* topk selection.
             expert_weights = expert_weights.softmax(dim=-1)
+        else:
+            # Qwen-style (default): softmax is applied over all experts before topk.
+            # After topk selection the remaining weights no longer sum to 1, so we
+            # re-normalize to restore a proper probability distribution.
+            # clamp prevents a theoretical zero-sum when all selected logits are tiny.
+            expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
         if not self.training and self._w1 is not None:
+            # Precomputed weights (plain nn.Linear, or explicit precompute_expert_weights()).
             y = fused_experts_impl(
                 hidden_states=x_flat,
                 w1=self._w1,
@@ -361,16 +351,31 @@ class MoE(nn.Module):
                 topk_ids=expert_indices,
                 activation=self.activation_function,
             ).view(B, T, C)
+        elif not self.training:
+            # Quantized experts (bnb_NF4/8bit, AWQ …): dequantize all expert weights
+            # on-the-fly for this forward pass, run the Triton fused kernel, then
+            # immediately free the dequantized tensors to reclaim VRAM.
+            #
+            # _build_fused_weights_lazy is decorated with @torch.compiler.disable so
+            # bitsandbytes custom CUDA ops run eagerly without breaking fullgraph=True.
+            # When torch.compile is active the caller sets fullgraph=False for layers
+            # containing quantized MoE (see TransformerDecoderLayer._compile_decoder),
+            # allowing this graph break while still JIT-compiling attention/norms and
+            # the Triton kernel.
+            w1, w2 = self._build_fused_weights_lazy(x_flat.device, x_flat.dtype)
+            y = fused_experts_impl(
+                hidden_states=x_flat,
+                w1=w1,
+                w2=w2,
+                topk_weights=expert_weights,
+                topk_ids=expert_indices,
+                activation=self.activation_function,
+            ).view(B, T, C)
+            del w1, w2  # free immediately to reclaim VRAM
         else:
+            # Training: each expert's forward() handles quantization on-the-fly.
             x_flat = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)
-            if EOLE_TORCH_COMPILE:
-                # Use compile-compatible dispatch (mask-based, no graph breaks).
-                # vectorized_moe uses .tolist() and data-dependent Python loops which
-                # are incompatible with fullgraph=True.  EOLE_TORCH_COMPILE is a
-                # module-level constant so torch.dynamo folds this branch statically.
-                y = _vectorized_moe_compile(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
-            else:
-                y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
+            y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
             """
             For educational purpose, we leave here the original implementation
             y = naive_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)

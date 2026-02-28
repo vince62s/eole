@@ -7,7 +7,7 @@ import torch.nn as nn
 from eole.decoders.decoder import DecoderBase
 from eole.modules.multi_headed_attn import SelfMHA, ContextMHA
 from eole.modules.transformer_mlp import MLP
-from eole.modules.moe import MoE
+from eole.modules.moe import MoE, is_quant_moe
 from eole.modules.gated_delta_net import GatedDeltaNet
 from eole.modules.rope import build_rope
 from eole.constants import LayerNorm, PositionEncodingType
@@ -111,7 +111,8 @@ class TransformerDecoderLayer(nn.Module):
         self.compiled_shapes = set()
         self.hidden_size = decoder_config.hidden_size
         # _forward_compile is initialized lazily on the first single-token forward()
-        # call (after model quantization), rather than at __init__ time.
+        # call (after model quantization), so is_quant_moe() returns the correct
+        # answer and fullgraph / cudagraphs are chosen accordingly.
         self._forward_compile = None
 
     def _compile_decoder(
@@ -124,14 +125,21 @@ class TransformerDecoderLayer(nn.Module):
     ):
         # linear_attention layers (GatedDeltaNet) use fla ops that torch.dynamo cannot
         # trace (staticmethod.__call__).  Skip compilation for those layers entirely.
+        #
+        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use _build_fused_weights_lazy()
+        # which is decorated with @torch.compiler.disable.  That causes a graph break
+        # incompatible with fullgraph=True.  Use fullgraph=False and disable CUDA
+        # graphs for those layers so attention/norms and the Triton kernel are still
+        # JIT-compiled while the bitsandbytes dequantize runs in eager.
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"] and self.layer_type != "linear_attention":
+            _quant_moe = is_quant_moe(self.mlp)
             self._forward_compile = torch.compile(
                 self._forward_eager,
-                fullgraph=True,
+                fullgraph=not _quant_moe,
                 dynamic=False,
                 options={
                     "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
-                    "triton.cudagraphs": EOLE_COMPILE_MODE == "2",
+                    "triton.cudagraphs": EOLE_COMPILE_MODE == "2" and not _quant_moe,
                 },
             )
         if layer_in is not None and self.layer_type != "linear_attention":
@@ -367,16 +375,24 @@ class TransformerDecoder(DecoderBase):
             self._compile_decoder()
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
+        # GDA (linear_attention) layers call fla.LayerNormFn.apply which is a
+        # staticmethod that torch.dynamo cannot trace.  Allow graph breaks so
+        # those layers fall back to eager while the rest of the graph is compiled.
+        #
+        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use _build_fused_weights_lazy()
+        # with @torch.compiler.disable, causing graph breaks incompatible with
+        # fullgraph=True.  Allow graph breaks (and disable CUDA graphs) for decoders
+        # that contain such layers so attention/norms and Triton are still compiled.
+        _has_quant_moe = any(is_quant_moe(layer.mlp) for layer in self.transformer_layers if hasattr(layer, "mlp"))
+        _fullgraph = not self.has_linear_attn and not _has_quant_moe
+        _cudagraphs = EOLE_COMPILE_MODE == "0" and not _has_quant_moe
         self._forward_compile = torch.compile(
             self._forward_eager,
-            # GDA (linear_attention) layers call fla.LayerNormFn.apply which is a
-            # staticmethod that torch.dynamo cannot trace.  Allow graph breaks so
-            # those layers fall back to eager while the rest of the graph is compiled.
-            fullgraph=not self.has_linear_attn,
+            fullgraph=_fullgraph,
             dynamic=False,
             options={
                 "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
-                "triton.cudagraphs": EOLE_COMPILE_MODE == "0",
+                "triton.cudagraphs": _cudagraphs,
             },
         )
 
