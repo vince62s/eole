@@ -1,11 +1,14 @@
 """MoE mixture of experts"."""
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from eole.modules.transformer_mlp import MLP
 from torch.distributed import all_reduce
 from eole.triton.fused_moe import fused_experts_impl
+
+logger = logging.getLogger(__name__)
 
 
 def naive_moe(x, topk_weights, topk_ids, K, experts):
@@ -138,6 +141,38 @@ class MoE(nn.Module):
 
         self._gates_fused = True
 
+    @staticmethod
+    def _dequantize_weight(linear_layer, device, dtype):
+        """Return the float weight tensor for *linear_layer*.
+
+        Handles three cases:
+        * Plain ``nn.Linear`` – returns ``weight.to(device, dtype)`` as usual.
+        * ``bitsandbytes.nn.Linear4bit`` whose ``Params4bit`` has already been
+          quantized (first forward pass happened) – uses
+          ``bitsandbytes.functional.dequantize_4bit`` to recover a float tensor.
+        * ``bitsandbytes.nn.Linear4bit`` whose weight is still in float form
+          (model was built but not yet used) – falls through to plain ``.to()``.
+        """
+        w = linear_layer.weight
+        # Check for bitsandbytes 4-bit quantized storage
+        if hasattr(w, "quant_state") and w.quant_state is not None:
+            try:
+                import bitsandbytes.functional as bnbF
+
+                return bnbF.dequantize_4bit(w.data, w.quant_state).to(device=device, dtype=dtype)
+            except ImportError:
+                logger.warning(
+                    "bitsandbytes is not importable; falling back to plain weight.to() "
+                    "which may yield incorrect results for 4-bit quantized weights."
+                )
+            except Exception as e:
+                logger.warning(
+                    "dequantize_4bit failed (%s); falling back to plain weight.to(). "
+                    "Results may be incorrect for 4-bit quantized weights.",
+                    e,
+                )
+        return w.to(device=device, dtype=dtype)
+
     def _maybe_fused_moe_weights(self, device, dtype):
         if self._w1 is not None:
             return  # already initialized
@@ -147,34 +182,107 @@ class MoE(nn.Module):
 
         for e in self.experts:
             # --- W1 (gate_up + up) ---
-            Wg = e.gate_up_proj.weight.to(device=device, dtype=dtype)
+            Wg = self._dequantize_weight(e.gate_up_proj, device, dtype)
             Wu = getattr(e, "up_proj", None)
             if Wu is not None:
-                Wu = Wu.weight.to(device=device, dtype=dtype)
+                Wu = self._dequantize_weight(Wu, device, dtype)
                 W1 = torch.cat([Wg, Wu], dim=0)  # (2*ffn, hidden)
             else:
                 W1 = Wg  # Only gate_up_proj is available
             w1_list.append(W1.unsqueeze(0))
 
             # --- W2 (down_proj) ---
-            W2 = e.down_proj.weight.to(device=device, dtype=dtype)
+            W2 = self._dequantize_weight(e.down_proj, device, dtype)
             w2_list.append(W2.unsqueeze(0))
 
         # stack all experts -> (num_experts, ...)
         self._w1 = torch.cat(w1_list, dim=0)
         self._w2 = torch.cat(w2_list, dim=0)
 
+    def precompute_expert_weights(self, device=None, dtype=None):
+        """Explicitly dequantize and cache all expert weights for the Triton fast path.
+
+        This is an **opt-in** method for users who:
+
+        * Run with quantized experts (``bnb_NF4``, ``bnb_FP4``, ``bnb_8bit``, AWQ …)
+        * AND have enough VRAM to hold all dequantized expert weight matrices.
+
+        Calling this method switches this MoE layer to the fast Triton
+        ``fused_experts_impl`` path for all subsequent inference calls.  Skip it
+        to stay on the lower-memory ``vectorized_moe`` fallback (the default for
+        quantized models).
+
+        **Memory estimate** – for Qwen2.5-35B-A3B (128 experts, gate_up (7168×768),
+        down (768×7168)), dequantized to float16:
+        ``128 × (7168×768 + 768×7168) × 2 bytes ≈ 2.8 GB per MoE layer``.
+        With 94 transformer layers this totals ~260 GB – far beyond most GPU setups.
+        For most users ``bnb_NF4`` is chosen *because* they lack that VRAM, so the
+        default fallback is the appropriate choice.
+
+        Example usage after model load::
+
+            model.eval()
+            for layer in model.decoder.transformer_layers:
+                if hasattr(layer, "feed_forward") and isinstance(layer.feed_forward, MoE):
+                    layer.feed_forward.precompute_expert_weights(
+                        device=torch.device("cuda"), dtype=torch.float16
+                    )
+
+        Notes
+        -----
+        * Must be called **after** the first forward pass if using ``bnb_NF4`` /
+          ``bnb_FP4``, because bitsandbytes only quantizes on the first call.
+        * If this method has already been called (or the model is unquantized and
+          the Triton path was already set up via ``_maybe_fused_moe_weights``), it
+          is a no-op.
+        """
+        if self._w1 is not None:
+            return  # already populated
+
+        if device is None:
+            # infer from first expert
+            device = next(self.experts[0].parameters()).device
+        if dtype is None:
+            dtype = next(self.experts[0].parameters()).dtype
+
+        logger.info(
+            "MoE.precompute_expert_weights: dequantizing %d expert(s) to %s/%s "
+            "for the Triton fast path.  This requires sufficient VRAM.",
+            len(self.experts),
+            device,
+            dtype,
+        )
+        self._maybe_fused_moe_weights(device, dtype)
+
     def forward(self, x):
 
         if not self.training:
             # Only use the Triton fused kernels for plain (unquantized) nn.Linear expert
-            # weights.  Quantized experts (bnb_NF4/8bit, AWQ …) must go through the
-            # vectorized fallback so that each expert's own forward() handles
-            # dequantization on-the-fly.  Calling _maybe_fused_moe_weights with quantized
-            # weights would silently dequantize and cache all expert weights (~5 GB per MoE
-            # layer) permanently in self._w1/_w2, causing OOM after a handful of layers.
-            if self.experts and type(self.experts[0].gate_up_proj) is torch.nn.Linear:
+            # weights, OR when the user has explicitly called precompute_expert_weights()
+            # to dequantize quantized weights into the _w1/_w2 cache.
+            #
+            # For quantized experts (bnb_NF4/8bit, AWQ …) the default fallback is
+            # vectorized_moe, which calls each expert's own forward() so that
+            # bitsandbytes/AWQ dequantize on-the-fly without any persistent memory
+            # overhead.  _maybe_fused_moe_weights is NOT called automatically here
+            # because dequantizing all experts permanently would require ~5 GB of
+            # VRAM per MoE layer, causing OOM.
+            #
+            # To enable Triton for quantized models (if VRAM allows), call
+            # precompute_expert_weights() explicitly after model load.
+            # type() is (not isinstance) is intentional: subclasses such as
+            # bitsandbytes Linear4bit or AWQ WQLinear must NOT match here so
+            # that quantized models default to vectorized_moe.
+            if self._w1 is None and self.experts and type(self.experts[0].gate_up_proj) is torch.nn.Linear:
                 self._maybe_fused_moe_weights(x.device, x.dtype)
+            elif self._w1 is None and not hasattr(self, "_triton_unavailable_warned"):
+                self._triton_unavailable_warned = True
+                logger.info(
+                    "MoE: expert weights are quantized – using vectorized_moe fallback "
+                    "(bitsandbytes dequantizes on-the-fly).  To enable the faster Triton "
+                    "path at the cost of extra VRAM, call precompute_expert_weights() "
+                    "after model load."
+                )
         else:
             self._maybe_fuse_gates()
 
