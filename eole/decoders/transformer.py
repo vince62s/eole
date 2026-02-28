@@ -126,11 +126,11 @@ class TransformerDecoderLayer(nn.Module):
         # linear_attention layers (GatedDeltaNet) use fla ops that torch.dynamo cannot
         # trace (staticmethod.__call__).  Skip compilation for those layers entirely.
         #
-        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use _fused_experts_active
-        # which calls unique_ids.tolist() — a data-dependent Python loop that causes
-        # a graph break incompatible with fullgraph=True.  Use fullgraph=False and
-        # disable CUDA graphs for those layers so attention/norms are still
-        # JIT-compiled while the active-expert dequantize loop runs in eager.
+        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use vectorized_moe which calls
+        # .tolist() — a data-dependent Python loop that causes a graph break
+        # incompatible with fullgraph=True.  Use fullgraph=False and disable CUDA
+        # graphs for those layers so attention/norms are still JIT-compiled while
+        # the expert dispatch runs in eager.
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"] and self.layer_type != "linear_attention":
             _quant_moe = is_quant_moe(self.mlp)
             self._forward_compile = torch.compile(
@@ -379,11 +379,10 @@ class TransformerDecoder(DecoderBase):
         # staticmethod that torch.dynamo cannot trace.  Allow graph breaks so
         # those layers fall back to eager while the rest of the graph is compiled.
         #
-        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use _fused_experts_active
-        # which calls unique_ids.tolist() — a data-dependent Python loop causing
-        # graph breaks incompatible with fullgraph=True.  Allow graph breaks (and
-        # disable CUDA graphs) for decoders that contain such layers so
-        # attention/norms are still compiled.
+        # Quantized MoE layers (bnb_NF4/8bit, AWQ …) use vectorized_moe which calls
+        # .tolist() — a data-dependent Python loop causing graph breaks incompatible
+        # with fullgraph=True.  Allow graph breaks (and disable CUDA graphs) for
+        # decoders that contain such layers so attention/norms are still compiled.
         _has_quant_moe = any(is_quant_moe(layer.mlp) for layer in self.transformer_layers if hasattr(layer, "mlp"))
         _fullgraph = not self.has_linear_attn and not _has_quant_moe
         _cudagraphs = EOLE_COMPILE_MODE == "0" and not _has_quant_moe

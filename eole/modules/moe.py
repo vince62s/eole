@@ -89,10 +89,9 @@ def is_quant_moe(mlp):
     pre-dequantized into the Triton cache (_w1 not set).
 
     Used by the torch.compile infrastructure to decide whether ``fullgraph=True``
-    is safe: it is NOT safe for quantized MoE because the
-    ``_fused_experts_active`` path uses ``unique_ids.tolist()`` — a
-    data-dependent Python loop — which causes a graph break incompatible with
-    ``fullgraph=True``.
+    is safe: it is NOT safe for quantized MoE because the ``vectorized_moe`` path
+    (used for quantized experts) calls ``.tolist()`` which causes a graph break
+    incompatible with ``fullgraph=True``.
     """
     return (
         isinstance(mlp, MoE)
@@ -217,66 +216,6 @@ class MoE(nn.Module):
         self._w1 = torch.cat(w1_list, dim=0)
         self._w2 = torch.cat(w2_list, dim=0)
 
-    def _fused_experts_active(self, x_flat, expert_weights, expert_indices):
-        """Dequantize only the active (unique) experts and run fused_experts_impl.
-
-        This is the inference path for quantized experts (bnb_NF4/8bit, AWQ …).
-        It combines the memory efficiency of dequantizing only the K selected
-        experts with the throughput of the Triton fused kernel.
-
-        Algorithm:
-        1. Collect the unique expert IDs present in ``expert_indices``.
-        2. Dequantize those weight matrices only (at most K entries, often fewer
-           when multiple tokens share an expert).
-        3. Build compact ``w1 / w2`` tensors shaped ``(num_unique, ...)``.
-        4. Remap ``expert_indices`` from original IDs to compact 0..num_unique-1.
-        5. Call :func:`fused_experts_impl` with the compact weights.
-
-        For a single-token decode with K=8 out of 256 experts this dequantizes
-        exactly 8 expert weight matrices (~32x less than dequantizing all) while
-        still running the full Triton fused matmul kernel.
-        """
-        device = x_flat.device
-        dtype = x_flat.dtype
-
-        # 1. Unique active expert IDs in sorted order (sorted=True is the default
-        #    for torch.unique, but specified explicitly because searchsorted below
-        #    requires a sorted haystack).
-        unique_ids = expert_indices.view(-1).unique(sorted=True)  # 1-D, sorted, <= K entries
-
-        # 2 & 3. Dequantize only those experts and stack into compact weight tensors
-        w1_list = []
-        w2_list = []
-        for eid in unique_ids.tolist():
-            e = self.experts[eid]
-            Wg = self._dequantize_weight(e.gate_up_proj, device, dtype)
-            Wu = getattr(e, "up_proj", None)
-            if Wu is not None:
-                Wu = self._dequantize_weight(Wu, device, dtype)
-                W1 = torch.cat([Wg, Wu], dim=0)  # (2*ffn, hidden)
-            else:
-                W1 = Wg
-            w1_list.append(W1.unsqueeze(0))
-            W2 = self._dequantize_weight(e.down_proj, device, dtype)
-            w2_list.append(W2.unsqueeze(0))
-        w1 = torch.cat(w1_list, dim=0)  # (num_unique, 2*I, H)
-        w2 = torch.cat(w2_list, dim=0)  # (num_unique, H, I)
-
-        # 4. Remap original expert IDs -> compact 0..num_unique-1
-        # torch.searchsorted requires a sorted 1-D haystack; unique_ids is sorted
-        # because we called .unique(sorted=True) above.
-        remapped = torch.searchsorted(unique_ids, expert_indices.contiguous())  # (BT, K)
-
-        # 5. Triton fused kernel
-        return fused_experts_impl(
-            hidden_states=x_flat,
-            w1=w1,
-            w2=w2,
-            topk_weights=expert_weights,
-            topk_ids=remapped,
-            activation=self.activation_function,
-        )
-
     def precompute_expert_weights(self, device=None, dtype=None):
         """Explicitly dequantize and cache all expert weights for the Triton fast path.
 
@@ -287,9 +226,9 @@ class MoE(nn.Module):
 
         Calling this method switches this MoE layer to the fast Triton
         ``fused_experts_impl`` path for all subsequent inference calls.  Skip it
-        to stay on the lower-memory lazy-dequantize Triton path (the default for
-        quantized models, which dequantizes only the unique active expert weights
-        per forward pass and runs the Triton kernel with a compact weight tensor).
+        to stay on the lower-memory ``vectorized_moe`` fallback (the default for
+        quantized models, which calls each expert's own quantized forward() without
+        any dequantization, so bitsandbytes/AWQ native kernels handle the GEMM).
 
         **Memory estimate** – for Qwen2.5-35B-A3B (128 experts, gate_up (7168×768),
         down (768×7168)), dequantized to float16:
@@ -383,29 +322,26 @@ class MoE(nn.Module):
                 activation=self.activation_function,
             ).view(B, T, C)
         else:
-            # Quantized experts (bnb_NF4/8bit, AWQ …) at inference time:
-            # dequantize only the unique active experts, then run the Triton
-            # fused kernel.  This gives both memory efficiency (≤ K expert
-            # weight matrices are dequantized) and Triton kernel throughput.
+            # Quantized experts (bnb_NF4/8bit, AWQ …) or training: call each selected
+            # expert's own forward(), so bitsandbytes/AWQ run their native quantized
+            # GEMM kernels without any dequantization overhead.
             #
-            # During training each expert's own forward() is used so that
-            # quantization-aware gradients flow correctly.
+            # Dequantizing expert weights on-the-fly during decoding is too slow
+            # even for just the K active experts per step (the dequantization cost
+            # itself is the bottleneck).  A future Triton kernel that operates
+            # directly on quantized weight storage would be needed to improve on this.
             #
-            # In torch.compile mode the caller sets fullgraph=False for layers
-            # with quantized MoE (see TransformerDecoderLayer._compile_decoder)
-            # because _fused_experts_active calls unique_ids.tolist() — a
-            # data-dependent Python loop that is a graph break.
-            if not self.training:
-                y = self._fused_experts_active(x_flat, expert_weights, expert_indices).view(B, T, C)
-            else:
-                x_flat = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)
-                y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
-                """
-                For educational purpose, we leave here the original implementation
-                y = naive_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
-                and a faster vectorized version
-                y = self._grouped.forward_tokens(x_flat, expert_weights, expert_indices, K).view(B, T, C)
-                """
+            # In torch.compile mode the caller sets fullgraph=False for quantized MoE
+            # layers (see TransformerDecoderLayer._compile_decoder) to allow the
+            # .tolist() graph break in vectorized_moe.
+            x_flat = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)
+            y = vectorized_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
+            """
+            For educational purpose, we leave here the original implementation
+            y = naive_moe(x_flat, expert_weights, expert_indices, K, self.experts).view(B, T, C)
+            and a faster vectorized version
+            y = self._grouped.forward_tokens(x_flat, expert_weights, expert_indices, K).view(B, T, C)
+            """
 
         # optional shared experts
         if self.shared_experts is not None:
