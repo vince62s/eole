@@ -613,7 +613,22 @@ class BaseModel(nn.Module):
                 self._load_module_parameters(
                     module_name, module, f, keys_shard, updated_params, buf_list, keyfound, tp_offset, strict
                 )
-                module.to(device=device, dtype=dtype)
+                if has_children:
+                    # Only reached when has_children=True AND has_own_params=True.
+                    # Move only this module's direct parameters/buffers to device; do NOT
+                    # call module.to() which would recursively move child modules too.
+                    # Example: VisionEncoderDecoderModel (SAM encoder variant) has direct
+                    # nn.Parameter attrs (image_newline, view_separator) but also has encoder/
+                    # decoder children whose Params4bit weights must not be moved to CUDA yet
+                    # (that would pack them before their checkpoint data is loaded).
+                    for param in module._parameters.values():
+                        if param is not None:
+                            param.data = param.data.to(device=device, dtype=dtype)
+                    for buf_name, buf in module._buffers.items():
+                        if buf is not None:
+                            module._buffers[buf_name] = buf.to(device=device, dtype=dtype)
+                else:
+                    module.to(device=device, dtype=dtype)
                 if getattr(running_config, "compute_dtype", None) == torch.int8:
                     torch.quantization.quantize_dynamic(module, inplace=True)
         return keyfound
