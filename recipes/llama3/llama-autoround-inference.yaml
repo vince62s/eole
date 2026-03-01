@@ -1,0 +1,25 @@
+transforms: [onmt_tokenize]
+
+transforms_configs:
+  onmt_tokenize:
+    src_subword_type: bpe
+    src_subword_model: "${EOLE_MODEL_DIR}/llama3.1-8b-instruct-autoround-int4/bpe.model"
+    tgt_subword_type: bpe
+    tgt_subword_model: "${EOLE_MODEL_DIR}/llama3.1-8b-instruct-autoround-int4/bpe.model"
+    gpt2_pretok: true
+
+# Model info
+model_path: "${EOLE_MODEL_DIR}/llama3.1-8b-instruct-autoround-int4"
+
+# Inference
+seed: 42
+max_length: 256
+batch_type: sents
+batch_size: 4
+world_size: 1
+gpu_ranks: [0]
+compute_dtype: fp16
+beam_size: 1
+n_best: 1
+report_time: true
+src: None

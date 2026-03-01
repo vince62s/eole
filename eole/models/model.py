@@ -343,6 +343,19 @@ class BaseModel(nn.Module):
                     group_size=running_config.group_size,
                     q_type=running_config.quant_type,
                 )
+            elif running_config.quant_type == "autoround":
+                logger.info("%s compression of layer %s" % (running_config.quant_type, nonlora_to_quant))
+                try:
+                    from eole.modules.autoround_linear import replace_autoround_linear
+                except ImportError:
+                    raise ImportError("Install auto-round to use autoround quantized model")
+                replace_autoround_linear(
+                    self,
+                    module_to_convert=nonlora_to_quant,
+                    w_bit=running_config.w_bit,
+                    group_size=running_config.group_size,
+                    sym=getattr(running_config, "autoround_sym", True),
+                )
             else:
                 logger.info("compression type %s not supported." % running_config.quant_type)
 

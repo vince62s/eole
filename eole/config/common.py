@@ -57,11 +57,14 @@ class QuantizeConfig(Config):
     quant_layers: List[str] = Field(
         default=[], description="List of layers to be compressed in 4/8bit."
     )  # validate against list of layers names ?
-    quant_type: Literal["", "bnb_8bit", "bnb_FP4", "bnb_NF4", "awq_gemm", "awq_gemv"] = Field(
+    quant_type: Literal["", "bnb_8bit", "bnb_FP4", "bnb_NF4", "awq_gemm", "awq_gemv", "autoround"] = Field(
         default="", description="Type of compression."
     )
     w_bit: int = Field(default=4, description="W_bit quantization")  # single authorized value for now actually
     group_size: int = Field(default=128, description="Group size quantization.")  # same
+    autoround_sym: bool = Field(
+        default=True, description="Use symmetric quantization for autoround (True) or asymmetric (False)."
+    )
 
 
 class MiscConfig(Config):
