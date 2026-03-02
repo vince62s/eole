@@ -588,53 +588,6 @@ MODEL_OVERRIDES = {
             }
         },
     },
-    # Qwen3.5 MoE text-only — e.g. Qwen3.5-35B-A3B and AutoRound int4 variants
-    # (Intel/Qwen3.5-35B-A3B-int4-AutoRound)
-    "Qwen3_5MoeForCausalLM": {
-        # Standard text-only prefix (no vision prefix)
-        "decoder": {
-            ".self_attn.q_norm.": ".self_attn.q_norm.",
-            ".self_attn.k_norm.": ".self_attn.k_norm.",
-            ".linear_attn.in_proj_qkv.": ".linear_attn.in_proj_qkv.",
-            ".linear_attn.in_proj_z.": ".linear_attn.in_proj_z.",
-            ".linear_attn.in_proj_b.": ".linear_attn.in_proj_b.",
-            ".linear_attn.in_proj_a.": ".linear_attn.in_proj_a.",
-            ".linear_attn.conv1d.": ".linear_attn.conv1d.",
-            ".linear_attn.dt_bias": ".linear_attn.dt_bias",
-            ".linear_attn.A_log": ".linear_attn.A_log",
-            ".linear_attn.norm.": ".linear_attn.norm.",
-            ".linear_attn.out_proj.": ".linear_attn.out_proj.",
-            ".mlp.gate.weight": ".mlp.gate.weight",
-            **{
-                f".mlp.experts.{j}.gate_up_proj.weight": (
-                    ".mlp.experts.gate_up_proj",
-                    f"[{j}, :moe_transformer_ff, :]",
-                )
-                for j in range(256)
-            },
-            **{
-                f".mlp.experts.{j}.up_proj.weight": (
-                    ".mlp.experts.gate_up_proj",
-                    f"[{j}, moe_transformer_ff:, :]",
-                )
-                for j in range(256)
-            },
-            **{f".mlp.experts.{j}.down_proj.weight": (".mlp.experts.down_proj", f"[{j}]") for j in range(256)},
-            ".mlp.shared_experts.gate_up_proj.": ".mlp.shared_expert.gate_proj.",
-            ".mlp.shared_experts.up_proj.": ".mlp.shared_expert.up_proj.",
-            ".mlp.shared_experts.down_proj.": ".mlp.shared_expert.down_proj.",
-            ".mlp.shared_expert_gate.weight": ".mlp.shared_expert_gate.weight",
-        },
-        "config": {
-            "decoder": {
-                "query_norm": True,
-                "key_norm": True,
-                "q_gating": True,
-                "shared_expert_gate": True,
-                "moe_renormalize": True,
-            },
-        },
-    },
     "Qwen3_5ForConditionalGeneration": {
         "decoder_layer_prefix": "model.language_model.layers.",
         "tgt_emb.embeddings.weight": "model.language_model.embed_tokens.weight",
@@ -747,6 +700,7 @@ MODEL_OVERRIDES = {
             ".linear_attn.norm.": ".linear_attn.norm.",
             ".linear_attn.out_proj.": ".linear_attn.out_proj.",
             ".mlp.gate.weight": ".mlp.gate.weight",
+            # Non-quantized: stacked float experts stored without .weight suffix
             **{
                 f".mlp.experts.{j}.gate_up_proj.weight": (
                     ".mlp.experts.gate_up_proj",
@@ -762,6 +716,22 @@ MODEL_OVERRIDES = {
                 for j in range(256)
             },
             **{f".mlp.experts.{j}.down_proj.weight": (".mlp.experts.down_proj", f"[{j}]") for j in range(256)},
+            # Quantized (AutoRound/AWQ): stacked expert params use .qweight/.scales/.qzeros suffix
+            **{
+                f".mlp.experts.{j}.gate_up_proj.": (
+                    ".mlp.experts.gate_up_proj.",
+                    f"[{j}, :moe_transformer_ff, :]",
+                )
+                for j in range(256)
+            },
+            **{
+                f".mlp.experts.{j}.up_proj.": (
+                    ".mlp.experts.gate_up_proj.",
+                    f"[{j}, moe_transformer_ff:, :]",
+                )
+                for j in range(256)
+            },
+            **{f".mlp.experts.{j}.down_proj.": (".mlp.experts.down_proj.", f"[{j}]") for j in range(256)},
             ".mlp.shared_experts.gate_up_proj.": ".mlp.shared_expert.gate_proj.",
             ".mlp.shared_experts.up_proj.": ".mlp.shared_expert.up_proj.",
             ".mlp.shared_experts.down_proj.": ".mlp.shared_expert.down_proj.",
@@ -810,7 +780,6 @@ LN_TABLE = defaultdict(
         "Gemma3ForConditionalGeneration": "gemma-rms",
         "Qwen3_5ForConditionalGeneration": "gemma-rms",
         "Qwen3_5MoeForConditionalGeneration": "gemma-rms",
-        "Qwen3_5MoeForCausalLM": "gemma-rms",
     },
 )
 
