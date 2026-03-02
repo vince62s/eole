@@ -137,6 +137,14 @@ class MoE(nn.Module):
         if self._w1 is not None:
             return  # already initialized
 
+        # Quantized experts (e.g. AutoRound QuantLinear) have no .weight attribute.
+        # Fused weight tensors require dense floats, so skip this path and let the
+        # caller fall back to the per-expert vectorized path.
+        # AutoRound quantizes all experts uniformly, so checking the first expert
+        # is sufficient to determine whether the fused path is applicable.
+        if self.experts and not hasattr(self.experts[0].gate_up_proj, "weight"):
+            return
+
         w1_list = []
         w2_list = []
 
@@ -163,7 +171,10 @@ class MoE(nn.Module):
 
         if not self.training:
             self._maybe_fused_moe_weights(x.device, x.dtype)
-        else:
+
+        # When fused weights are unavailable (training or quantized-expert inference),
+        # ensure gates are fused before taking the per-expert vectorized path.
+        if self._w1 is None:
             self._maybe_fuse_gates()
 
         B, T, C = x.shape
@@ -186,7 +197,7 @@ class MoE(nn.Module):
         if self.moe_softmax_after:
             expert_weights = expert_weights.softmax(dim=-1)
 
-        if not self.training:
+        if self._w1 is not None:
             y = fused_experts_impl(
                 hidden_states=x_flat,
                 w1=self._w1,
