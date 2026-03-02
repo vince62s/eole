@@ -309,7 +309,7 @@ def build_config_dict(hf):
         ),
         "sliding_window": config.get("sliding_window", 0) or 4096,
         "num_experts": config.get("num_local_experts", config.get("n_routed_experts", config.get("num_experts", 0))),
-        "num_shared_experts": config.get("n_shared_experts", 0),
+        "num_shared_experts": config.get("n_shared_experts", 1 if config.get("shared_expert_intermediate_size") else 0),
         "first_k_dense_replace": config.get("first_k_dense_replace", 0),
         "num_experts_per_tok": config.get("num_experts_per_tok", 0),
         "moe_transformer_ff": config.get("moe_intermediate_size", None),
@@ -468,12 +468,15 @@ def build_config_dict(hf):
     )
 
     # patch rotary dim
+    # partial_rotary_factor may live at the top level or inside rope_parameters (newer HF format)
+    _partial_rotary = config.get(
+        "partial_rotary_factor", config.get("rope_parameters", {}).get("partial_rotary_factor")
+    )
     if "rotary_dim" in config.keys():
         model_config["rope_config"]["rotary_dim"] = config["rotary_dim"]
-    elif "partial_rotary_factor" in config.keys():
-        model_config["rope_config"]["rotary_dim"] = int(
-            config["partial_rotary_factor"] * (model_config["hidden_size"] // model_config["heads"])
-        )
+    elif _partial_rotary is not None:
+        _head_dim = model_config.get("head_dim") or (model_config["hidden_size"] // model_config["heads"])
+        model_config["rope_config"]["rotary_dim"] = int(_partial_rotary * _head_dim)
     elif model_config.get("head_dim", None) is not None:
         model_config["rope_config"]["rotary_dim"] = model_config["head_dim"]
     else:
@@ -791,6 +794,10 @@ def build_shards(model_config, hf, args, params):
             print("Loading %s" % ckpt)
             checkpoint = hf.checkpoint(ckpt)
             for i in shard_layer_ranges[shard]:
+                # Cache raw tensors read from this checkpoint+layer to avoid
+                # re-reading the same stacked tensor (e.g. mlp.experts.gate_up_proj)
+                # hundreds of times when splitting MoE expert weights.
+                _layer_tensor_cache = {}
                 prefix_mapping = (
                     ("encoder", hf.encoder_layer_prefix, "encoder.transformer_layers."),
                     ("encoder.sam", hf.encoder_sam_layer_prefix, "encoder.sam.blocks."),
@@ -809,10 +816,13 @@ def build_shards(model_config, hf, args, params):
 
                             if srckey.endswith("."):
                                 srckey = srckey + param
-                            w = get_weight(
-                                checkpoint,
-                                hf_prefix + str(i) + srckey,
-                            )
+                            full_srckey = hf_prefix + str(i) + srckey
+                            if full_srckey not in _layer_tensor_cache:
+                                _layer_tensor_cache[full_srckey] = get_weight(
+                                    checkpoint,
+                                    full_srckey,
+                                )
+                            w = _layer_tensor_cache[full_srckey]
 
                             if w is not None:
                                 if srcmap is not None:
@@ -827,12 +837,17 @@ def build_shards(model_config, hf, args, params):
                                             "w": w,
                                             "hidden_size": hidden_size,
                                             "transformer_ff": model_config["transformer_ff"],
+                                            "moe_transformer_ff": model_config.get("decoder", {}).get(
+                                                "moe_transformer_ff",
+                                                model_config.get("moe_transformer_ff", 0),
+                                            ),
                                         },
                                     ).contiguous()
                                 target1 = target
                                 if target.endswith("."):
                                     target1 = target + param
                                 eole_safetensor[eole_prefix + str(i) + target1] = w
+                _layer_tensor_cache.clear()
 
         # Convert to another dtype if specified
         if args.dtype is not None:
