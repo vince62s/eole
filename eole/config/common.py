@@ -62,8 +62,11 @@ class QuantizeConfig(Config):
     )
     w_bit: int = Field(default=4, description="W_bit quantization")  # single authorized value for now actually
     group_size: int = Field(default=128, description="Group size quantization.")  # same
-    autoround_sym: bool = Field(
-        default=True, description="Use symmetric quantization for autoround (True) or asymmetric (False)."
+    autoround_packing_format: str = Field(
+        default="auto_round:auto_gptq",
+        description="AutoRound packing format (from quantization_config.packing_format). "
+        "Determines whether qzeros use GPTQ-style (zeros-1) packing. "
+        "Use 'auto_round:auto_gptq' for GPTQ-format (default), or 'auto_round' for direct zero-point.",
     )
 
 

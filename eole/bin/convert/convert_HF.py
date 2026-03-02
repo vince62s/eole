@@ -485,11 +485,11 @@ def build_config_dict(hf):
                 "final_linear",
             ]
             params = ["qweight", "qzeros", "scales"] + ["weight", "bias"]
-        elif quant_config.get("quant_method") in ["intel/auto-round", "autoround"]:
+        elif quant_config.get("quant_method") in ["intel/auto-round", "autoround", "auto-round"]:
             training_config["quant_type"] = "autoround"
             training_config["w_bit"] = quant_config.get("bits", 4)
             training_config["group_size"] = quant_config.get("group_size", 128)
-            training_config["autoround_sym"] = quant_config.get("sym", True)
+            training_config["autoround_packing_format"] = quant_config.get("packing_format", "auto_round:auto_gptq")
             training_config["quant_layers"] = [
                 "gate_up_proj",
                 "down_proj",

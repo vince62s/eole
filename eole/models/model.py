@@ -354,7 +354,7 @@ class BaseModel(nn.Module):
                     module_to_convert=nonlora_to_quant,
                     w_bit=running_config.w_bit,
                     group_size=running_config.group_size,
-                    sym=getattr(running_config, "autoround_sym", True),
+                    packing_format=getattr(running_config, "autoround_packing_format", "auto_round:auto_gptq"),
                 )
             else:
                 logger.info("compression type %s not supported." % running_config.quant_type)
