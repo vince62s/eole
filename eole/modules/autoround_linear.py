@@ -5,6 +5,30 @@ import torch.nn as nn
 from torch.cuda import is_available as cuda_is_available
 
 
+@contextlib.contextmanager
+def _suppress_all_output():
+    """Redirect stdout and stderr at the file-descriptor level.
+
+    Unlike contextlib.redirect_stdout/stderr, this also suppresses output
+    from C extensions that write directly to fd 1/fd 2 — e.g. the PyTorch
+    C++ warning "[W302] torch.backends.cuda.preferred_linalg_library is an
+    experimental feature" that gptqmodel triggers during initialisation.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    try:
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(devnull_fd)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+
+
 def replace_autoround_linear(
     model, module_to_convert=[], w_bit=4, group_size=128, packing_format="auto_round:auto_gptq", sym=True
 ):
@@ -82,16 +106,14 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
         # Marlin is fastest but only supports symmetric quantization
         if sym:
             try:
-                # Suppress verbose gptqmodel initialization output.
-                # gptqmodel uses logbar (writes to stdout): redirect stdout to devnull.
-                # PyTorch C++ preferred_linalg_library warning goes to stderr: redirect
-                # stderr to devnull too.  get_marlin_layer() is called inside the block
-                # because it triggers `import gptqmodel` at call-time (not import-time),
-                # which is when the logbar banner and GIL warnings are emitted.
-                # After the block, silence the logbar logger for any later calls.
-                with open(os.devnull, "w") as _devnull, \
-                        contextlib.redirect_stdout(_devnull), \
-                        contextlib.redirect_stderr(_devnull):
+                # Suppress verbose gptqmodel initialisation output at the
+                # file-descriptor level so that both Python-level writes
+                # (logbar ASCII banner) and C++ direct fd writes
+                # (PyTorch [W302] preferred_linalg_library warning) are
+                # silenced.  get_marlin_layer() is called inside the block
+                # because it triggers `import gptqmodel` at call-time.
+                # After the block, silence the logbar logger for later calls.
+                with _suppress_all_output():
                     from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
                     marlin_cls = get_marlin_layer()
                 logging.getLogger("logbar").setLevel(logging.ERROR)
