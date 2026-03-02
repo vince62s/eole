@@ -82,12 +82,16 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
         # Marlin is fastest but only supports symmetric quantization
         if sym:
             try:
-                # Suppress verbose gptqmodel initialization output (GIL warnings, BitBLAS
-                # probes, ASCII banner) and the PyTorch C++ preferred_linalg_library warning
-                # that gptqmodel triggers at import time.
-                logging.getLogger("gptqmodel").setLevel(logging.ERROR)
-                with open(os.devnull, "w") as _devnull, contextlib.redirect_stderr(_devnull):
+                # Suppress verbose gptqmodel initialization output during import.
+                # gptqmodel uses logbar (writes to stdout): redirect stdout to devnull.
+                # PyTorch C++ preferred_linalg_library warning goes to stderr: redirect
+                # stderr to devnull too.  After import, silence the logbar logger so that
+                # any later gptqmodel calls are also quiet.
+                with open(os.devnull, "w") as _devnull, \
+                        contextlib.redirect_stdout(_devnull), \
+                        contextlib.redirect_stderr(_devnull):
                     from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
+                logging.getLogger("logbar").setLevel(logging.ERROR)
 
                 return get_marlin_layer(), True
             except ImportError:
