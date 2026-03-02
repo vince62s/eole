@@ -332,7 +332,6 @@ def build_config_dict(hf):
     # For Qwen3.5 MoE: use shared_expert_intermediate_size as shared expert FF size
     # (overrides the default moe_transformer_ff * num_shared_experts calculation in MoE.__init__)
     if config.get("shared_expert_intermediate_size") and arch in [
-        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
     ]:
         model_config["moe_transformer_ff"] = config["moe_intermediate_size"]
@@ -521,7 +520,9 @@ def build_config_dict(hf):
             raise ValueError(error_msg)
 
     # Handle quantization
-    quant_config = config.get("quantization_config", {})
+    # quantization_config may be at the top level (e.g. Qwen3_5MoeForConditionalGeneration)
+    # or inside text_config; check top-level (other_config) first, then text_config fallback.
+    quant_config = other_config.get("quantization_config", config.get("quantization_config", {}))
     if quant_config:
         if quant_config.get("quant_method") == "awq":
             backend = quant_config.get("backend", "autoawq")
@@ -591,7 +592,6 @@ def build_config_dict(hf):
         "Qwen3_5ForCausalLM",
         "Qwen3_5TextForCausalLM",
         "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
     ]:
         layer_types = config.get("layer_types", None)
