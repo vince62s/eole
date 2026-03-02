@@ -82,18 +82,21 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
         # Marlin is fastest but only supports symmetric quantization
         if sym:
             try:
-                # Suppress verbose gptqmodel initialization output during import.
+                # Suppress verbose gptqmodel initialization output.
                 # gptqmodel uses logbar (writes to stdout): redirect stdout to devnull.
                 # PyTorch C++ preferred_linalg_library warning goes to stderr: redirect
-                # stderr to devnull too.  After import, silence the logbar logger so that
-                # any later gptqmodel calls are also quiet.
+                # stderr to devnull too.  get_marlin_layer() is called inside the block
+                # because it triggers `import gptqmodel` at call-time (not import-time),
+                # which is when the logbar banner and GIL warnings are emitted.
+                # After the block, silence the logbar logger for any later calls.
                 with open(os.devnull, "w") as _devnull, \
                         contextlib.redirect_stdout(_devnull), \
                         contextlib.redirect_stderr(_devnull):
                     from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
+                    marlin_cls = get_marlin_layer()
                 logging.getLogger("logbar").setLevel(logging.ERROR)
 
-                return get_marlin_layer(), True
+                return marlin_cls, True
             except ImportError:
                 pass
         # Triton is the next best option on CUDA
