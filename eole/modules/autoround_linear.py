@@ -1,85 +1,96 @@
 import torch.nn as nn
 from torch.cuda import is_available as cuda_is_available
 
-def replace_autoround_linear(model, module_to_convert=[], w_bit=4, group_size=128, packing_format="auto_round:auto_gptq"):
+
+def replace_autoround_linear(
+    model, module_to_convert=[], w_bit=4, group_size=128, packing_format="auto_round:auto_gptq", sym=True
+):
     """Replace nn.Linear layers with AutoRound QuantLinear for quantized inference.
 
-    The packing_format determines which QuantLinear implementation to use:
-    - If 'gptq' is in packing_format, qzeros are stored as (zero_point - 1) per GPTQ convention,
-      so qlinear_*_zp is used (which adds +1 during dequantization).
-    - Otherwise, qzeros are stored directly and qlinear_* (no zp) is used.
+    The packing_format determines how qzeros are stored:
+    - 'gptq' in packing_format: qzeros stored as (zero_point - 1) per GPTQ convention.
+    - Otherwise: qzeros stored directly (direct zero-point).
 
-    Backend preference order:
-    1. CUDA/Marlin kernels — fastest; only available for symmetric (non-GPTQ-zp) format on CUDA.
-    2. Triton kernels — fast GPU kernels, avoid re-dequantizing weights on every forward pass.
-    3. PyTorch fallback — works everywhere but dequantizes weights on every forward pass.
+    Backend preference order (fastest first):
+    1. Marlin CUDA kernels (requires CUDA + gptqmodel, sym=True only) — fastest
+    2. Triton GPU kernels (requires CUDA + triton) — fast GPU kernels
+    3. PyTorch fallback — works everywhere, but dequantizes weights on every forward pass
+
+    For Marlin layers, call post_init_autoround_linear(model) after loading the weights
+    to repack them into the Marlin-optimized layout.
     """
     use_gptq_zp = "gptq" in packing_format
-
-    # Prefer CUDA/Marlin, then Triton on CUDA, fall back to PyTorch-only kernels.
-    QuantLinear = _get_autoround_quant_linear_cls(use_gptq_zp)
+    QuantLinear, use_marlin = _get_autoround_quant_linear_cls(use_gptq_zp, sym)
 
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
-            replace_autoround_linear(module, module_to_convert, w_bit, group_size, packing_format)
+            replace_autoround_linear(module, module_to_convert, w_bit, group_size, packing_format, sym)
 
         if isinstance(module, nn.Linear) and name in module_to_convert:
-            model._modules[name] = QuantLinear(
-                bits=w_bit,
-                group_size=group_size,
-                infeatures=module.in_features,
-                outfeatures=module.out_features,
-                bias=module.bias is not None,
-            )
+            if use_marlin:
+                model._modules[name] = QuantLinear(
+                    bits=w_bit,
+                    group_size=group_size,
+                    desc_act=False,
+                    sym=sym,
+                    in_features=module.in_features,
+                    out_features=module.out_features,
+                    bias=module.bias is not None,
+                )
+            else:
+                model._modules[name] = QuantLinear(
+                    bits=w_bit,
+                    group_size=group_size,
+                    infeatures=module.in_features,
+                    outfeatures=module.out_features,
+                    bias=module.bias is not None,
+                )
     return model
 
 
-def _get_autoround_quant_linear_cls(use_gptq_zp: bool):
+def post_init_autoround_linear(model):
+    """Call post_init() on all AutoRound QuantLinear modules in the model.
+
+    This is required for Marlin layers: it repacks the GPTQ-format weights into Marlin's
+    optimized memory layout and pre-allocates the Marlin workspace buffer.
+    It is a no-op for Triton and PyTorch backends.
+    Must be called after weights have been loaded and the model moved to CUDA.
+    """
+    for module in model.modules():
+        module_cls = type(module)
+        module_pkg = getattr(module_cls, "__module__", "") or ""
+        if module_pkg.startswith("auto_round_extension") and hasattr(module, "post_init"):
+            module.post_init()
+
+
+def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
     """Return the best available QuantLinear class for AutoRound inference.
 
     Preference order:
-    1. CUDA/Marlin kernels (requires CUDA + gptqmodel_marlin_kernels) — fastest; symmetric only
-    2. Triton kernels (requires CUDA + triton) — fast for GPU inference
+    1. Marlin CUDA kernels (requires CUDA + gptqmodel, sym=True only) — fastest
+    2. Triton kernels (requires CUDA + triton) — fast GPU kernels
     3. PyTorch fallback — works everywhere but dequantizes weights on every forward pass
 
-    Marlin only supports symmetric quantization, so it is skipped when use_gptq_zp=True
-    (GPTQ zero-point format is asymmetric).
+    Returns:
+        (QuantLinear class, use_marlin: bool)
+            use_marlin=True means the Marlin constructor signature must be used.
     """
     if cuda_is_available():
-        # Try CUDA/Marlin first (fastest) — only supports symmetric quantization
-        if not use_gptq_zp:
+        # Marlin is fastest but only supports symmetric quantization
+        if sym:
             try:
-                import gptqmodel_marlin_kernels  # noqa: F401 — verify Marlin CUDA kernels are available
                 from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
 
-                _MarlinCls = get_marlin_layer()
-
-                # Wrap to normalize the interface: Marlin uses in_features/out_features/sym/desc_act
-                # while the rest of our code uses infeatures/outfeatures.
-                class MarlinQuantLinear(_MarlinCls):
-                    def __init__(self, bits, group_size, infeatures, outfeatures, bias, **kwargs):
-                        super().__init__(
-                            bits=bits,
-                            group_size=group_size,
-                            desc_act=False,
-                            sym=True,  # Marlin only supports symmetric quantization
-                            in_features=infeatures,
-                            out_features=outfeatures,
-                            bias=bias,
-                            **kwargs,
-                        )
-
-                return MarlinQuantLinear
+                return get_marlin_layer(), True
             except ImportError:
                 pass
-
-        # Try Triton kernels
+        # Triton is the next best option on CUDA
         try:
             if use_gptq_zp:
                 from auto_round_extension.triton.qlinear_tritonv2_zp import QuantLinear
             else:
                 from auto_round_extension.triton.qlinear_tritonv2 import QuantLinear
-            return QuantLinear
+            return QuantLinear, False
         except ImportError:
             pass
     # Fallback to pure PyTorch kernels
@@ -88,6 +99,6 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool):
             from auto_round_extension.torch.qlinear_torch_zp import QuantLinear
         else:
             from auto_round_extension.torch.qlinear_torch import QuantLinear
-        return QuantLinear
+        return QuantLinear, False
     except ImportError:
         raise ImportError("Install auto-round to use autoround quantized models")

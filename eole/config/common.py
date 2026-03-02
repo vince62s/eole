@@ -68,6 +68,11 @@ class QuantizeConfig(Config):
         "Determines whether qzeros use GPTQ-style (zeros-1) packing. "
         "Use 'auto_round:auto_gptq' for GPTQ-format (default), or 'auto_round' for direct zero-point.",
     )
+    autoround_sym: bool = Field(
+        default=True,
+        description="AutoRound symmetric quantization flag (from quantization_config.sym). "
+        "Required to select the Marlin CUDA backend, which only supports symmetric quantization.",
+    )
 
 
 class MiscConfig(Config):

@@ -490,6 +490,7 @@ def build_config_dict(hf):
             training_config["w_bit"] = quant_config.get("bits", 4)
             training_config["group_size"] = quant_config.get("group_size", 128)
             training_config["autoround_packing_format"] = quant_config.get("packing_format", "auto_round:auto_gptq")
+            training_config["autoround_sym"] = quant_config.get("sym", True)
             training_config["quant_layers"] = [
                 "gate_up_proj",
                 "down_proj",

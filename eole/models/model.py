@@ -355,6 +355,7 @@ class BaseModel(nn.Module):
                     w_bit=running_config.w_bit,
                     group_size=running_config.group_size,
                     packing_format=getattr(running_config, "autoround_packing_format", "auto_round:auto_gptq"),
+                    sym=getattr(running_config, "autoround_sym", True),
                 )
             else:
                 logger.info("compression type %s not supported." % running_config.quant_type)
@@ -697,6 +698,10 @@ class BaseModel(nn.Module):
         self._report_extra_keys(keys_shard, keyfound, buf_list)
         self._reset_lora_to_fp32()
         self._reset_invfreq_to_fp32(buf_list)
+        if getattr(running_config, "quant_type", "") == "autoround":
+            from eole.modules.autoround_linear import post_init_autoround_linear
+
+            post_init_autoround_linear(self)
 
     def count_parameters(self, log=print):
         """Count number of parameters in model (& print with `log` callback).
