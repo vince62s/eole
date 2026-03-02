@@ -280,6 +280,16 @@ class BaseModel(nn.Module):
             update_dict["quant_type"] = metadata["config"].training.quant_type
         if "quant_layers" not in running_config.model_fields_set:
             update_dict["quant_layers"] = metadata["config"].training.quant_layers
+        if "autoround_packing_format" not in running_config.model_fields_set:
+            autoround_packing_format = getattr(
+                metadata["config"].training, "autoround_packing_format", None
+            )
+            if autoround_packing_format is not None:
+                update_dict["autoround_packing_format"] = autoround_packing_format
+        if "autoround_sym" not in running_config.model_fields_set:
+            autoround_sym = getattr(metadata["config"].training, "autoround_sym", None)
+            if autoround_sym is not None:
+                update_dict["autoround_sym"] = autoround_sym
         running_config.update(**update_dict)
 
         # Build vocabs
