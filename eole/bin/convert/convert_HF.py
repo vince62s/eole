@@ -727,6 +727,77 @@ def get_shards_map(model_config, hf, nshards):
     return [sorted(s) for s in shard_checkpoints], shard_layer_ranges
 
 
+class _StreamingTensorStore:
+    """Write safetensors tensors to disk immediately to avoid RAM accumulation.
+
+    Acts as a write-only dict-like store. Each tensor assigned via __setitem__
+    is serialised to a temporary data file instantly, so peak RAM stays bounded
+    by one layer's worth of tensors rather than the entire output shard.
+    Call .save(path) to flush and assemble the final safetensors file.
+    """
+
+    # safetensors dtype string for each torch dtype we may encounter
+    _DTYPE_MAP = {
+        torch.float64: "F64",
+        torch.float32: "F32",
+        torch.float16: "F16",
+        torch.bfloat16: "BF16",
+        torch.int64: "I64",
+        torch.int32: "I32",
+        torch.int16: "I16",
+        torch.int8: "I8",
+        torch.uint8: "U8",
+    }
+
+    def __init__(self, tmp_path: str):
+        self._tmp_path = tmp_path
+        self._fp = open(tmp_path, "wb")
+        self._meta: dict = {}
+        self._offset: int = 0
+
+    def __setitem__(self, name: str, tensor):
+        t = tensor.contiguous()
+        dtype_str = self._DTYPE_MAP[t.dtype]
+        nbytes = t.nbytes
+        self._meta[name] = {
+            "dtype": dtype_str,
+            "shape": list(t.shape),
+            "data_offsets": [self._offset, self._offset + nbytes],
+        }
+        # torch.bfloat16 has no NumPy equivalent; reinterpret bits as int16.
+        if t.dtype == torch.bfloat16:
+            self._fp.write(t.view(torch.int16).numpy().tobytes())
+        else:
+            self._fp.write(t.numpy().tobytes())
+        self._offset += nbytes
+
+    def keys(self):
+        return self._meta.keys()
+
+    def save(self, output_path: str) -> None:
+        """Finalize: assemble header + raw data into a valid safetensors file."""
+        import json
+        import shutil
+        import struct
+
+        self._fp.flush()
+        self._fp.close()
+        self._fp = None
+
+        header_bytes = json.dumps(self._meta, separators=(",", ":")).encode("utf-8")
+        # Safetensors spec: header must be padded to a multiple of 8 bytes with spaces.
+        pad = (-len(header_bytes)) % 8
+        header_bytes += b" " * pad
+
+        with open(output_path, "wb") as fout:
+            fout.write(struct.pack("<Q", len(header_bytes)))
+            fout.write(header_bytes)
+            with open(self._tmp_path, "rb") as ftmp:
+                shutil.copyfileobj(ftmp, fout, length=64 * 1024 * 1024)
+
+        os.remove(self._tmp_path)
+
+
 def build_shards(model_config, hf, args, params):
     """
     Build sharded model files from HuggingFace checkpoint.
@@ -742,11 +813,13 @@ def build_shards(model_config, hf, args, params):
     The first shard contains embeddings and model-level parameters on top of its layer split.
     """
     shard_checkpoints, shard_layer_ranges = get_shards_map(model_config, hf, args.nshards)
+    target_dtype = TORCH_DTYPES[args.dtype] if args.dtype is not None else None
 
     for shard in range(args.nshards):
 
         print("starting output shard: %d/%d" % (shard + 1, args.nshards))
-        eole_safetensor = {}
+        output_path = os.path.join(args.output, "model.{:02d}.safetensors".format(shard))
+        eole_safetensor = _StreamingTensorStore(output_path + ".part")
 
         def build_first_shard(hf, eole_safetensor):
             for target in KEY_MAPS[hf.arch].keys():
@@ -780,6 +853,8 @@ def build_shards(model_config, hf, args, params):
                                 "transformer_ff": model_config["transformer_ff"],
                             },
                         ).contiguous()
+                    if target_dtype is not None:
+                        w = w.to(target_dtype)
                     if target == "encoder.class_embedding.weight":
                         eole_safetensor[target] = w.unsqueeze(0)
                     else:
@@ -853,21 +928,16 @@ def build_shards(model_config, hf, args, params):
                                             ),
                                         },
                                     ).contiguous()
+                                if target_dtype is not None:
+                                    w = w.to(target_dtype)
                                 target1 = target
                                 if target.endswith("."):
                                     target1 = target + param
                                 eole_safetensor[eole_prefix + str(i) + target1] = w
                 _layer_tensor_cache.clear()
 
-        # Convert to another dtype if specified
-        if args.dtype is not None:
-            for key in eole_safetensor.keys():
-                eole_safetensor[key] = eole_safetensor[key].to(TORCH_DTYPES[args.dtype])
         print("Saving output model shard: %d" % shard)
-        save_file(
-            eole_safetensor,
-            os.path.join(args.output, "model.{:02d}.safetensors".format(shard)),
-        )
+        eole_safetensor.save(output_path)
 
 
 def check_sentencepiece_tokenizer(hf):
