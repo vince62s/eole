@@ -1,11 +1,14 @@
 #!/usr/bin/env python
 # Standard Library Imports
 import configparser
+import ctypes
 import json
 import logging
 import math
 import os
 import re
+import shutil
+import struct
 from dataclasses import dataclass, field, fields
 from typing import Optional
 
@@ -764,11 +767,9 @@ class _StreamingTensorStore:
             "shape": list(t.shape),
             "data_offsets": [self._offset, self._offset + nbytes],
         }
-        # torch.bfloat16 has no NumPy equivalent; reinterpret bits as int16.
-        if t.dtype == torch.bfloat16:
-            self._fp.write(t.view(torch.int16).numpy().tobytes())
-        else:
-            self._fp.write(t.numpy().tobytes())
+        # Use ctypes to read raw bytes — dtype-agnostic, works for bfloat16
+        # and every other PyTorch dtype without requiring NumPy.
+        self._fp.write(ctypes.string_at(t.data_ptr(), nbytes))
         self._offset += nbytes
 
     def keys(self):
@@ -776,15 +777,14 @@ class _StreamingTensorStore:
 
     def save(self, output_path: str) -> None:
         """Finalize: assemble header + raw data into a valid safetensors file."""
-        import json
-        import shutil
-        import struct
-
         self._fp.flush()
         self._fp.close()
         self._fp = None
 
-        header_bytes = json.dumps(self._meta, separators=(",", ":")).encode("utf-8")
+        # safetensors requires a "__metadata__" key in the header.
+        header = {"__metadata__": {}}
+        header.update(self._meta)
+        header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
         # Safetensors spec: header must be padded to a multiple of 8 bytes with spaces.
         pad = (-len(header_bytes)) % 8
         header_bytes += b" " * pad
