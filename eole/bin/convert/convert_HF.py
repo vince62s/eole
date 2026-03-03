@@ -583,9 +583,8 @@ def build_config_dict(hf):
                 _HF_TO_EOLE_MODULE = {"shared_expert": "shared_experts"}
                 excluded_hf_parents = set()
                 for hf_path, layer_cfg in extra_config.items():
-                    if layer_cfg.get("bits", target_bits) != target_bits or layer_cfg.get(
-                        "dtype", ""
-                    ).startswith("float"):
+                    bits_val = layer_cfg.get("bits", target_bits)
+                    if bits_val >= 16 or layer_cfg.get("dtype", "").startswith("float"):
                         parts = hf_path.split(".")
                         if len(parts) >= 2:
                             excluded_hf_parents.add(parts[-2])

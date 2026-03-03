@@ -291,6 +291,12 @@ class BaseModel(nn.Module):
             update_dict["quant_type"] = metadata["config"].training.quant_type
         if "quant_layers" not in running_config.model_fields_set:
             update_dict["quant_layers"] = metadata["config"].training.quant_layers
+        if "quant_exclude_modules" not in running_config.model_fields_set:
+            update_dict["quant_exclude_modules"] = metadata["config"].training.quant_exclude_modules
+        if "autoround_packing_format" not in running_config.model_fields_set:
+            update_dict["autoround_packing_format"] = metadata["config"].training.autoround_packing_format
+        if "autoround_sym" not in running_config.model_fields_set:
+            update_dict["autoround_sym"] = metadata["config"].training.autoround_sym
         running_config.update(**update_dict)
 
         # Build vocabs
