@@ -173,6 +173,11 @@ class BaseModel(nn.Module):
         if running_config.compute_dtype == torch.int8:
             torch.quantization.quantize_dynamic(self, dtype=torch.qint8, inplace=True)
 
+        if getattr(running_config, "quant_type", "") == "autoround":
+            from eole.modules.autoround_linear import post_init_autoround_linear
+
+            post_init_autoround_linear(self)
+
         self.eval()
         for name, module in self.named_modules():
             if hasattr(module, "dropout_p"):
@@ -317,6 +322,17 @@ class BaseModel(nn.Module):
             if layer not in getattr(running_config, "lora_layers", [])
         ]
         if hasattr(running_config, "quant_layers") and len(nonlora_to_quant) > 0:
+            # For models with a vision encoder, only quantize the decoder.
+            # Vision encoder weights are full-precision and must not be replaced.
+            quant_target = (
+                self.decoder
+                if (
+                    hasattr(self, "encoder")
+                    and self.encoder is not None
+                    and isinstance(self.encoder, VisionEncoder)
+                )
+                else self
+            )
             if running_config.quant_type in ["bnb_8bit", "bnb_FP4", "bnb_NF4"]:
                 logger.info("%s compression of layer %s" % (running_config.quant_type, nonlora_to_quant))
                 try:
@@ -325,7 +341,7 @@ class BaseModel(nn.Module):
                     raise ImportError("Install bitsandbytes to use 4/8bit compression")
                 # try to do this inplace, not sure it'll work
                 replace_bnb_linear(
-                    self,
+                    quant_target,
                     module_to_convert=nonlora_to_quant,
                     q_type=running_config.quant_type,
                 )
@@ -337,11 +353,25 @@ class BaseModel(nn.Module):
                     raise ImportError("Install AutoAWQ to use awq quantized model")
                 # try to do this inplace, not sure it'll work
                 replace_awq_linear(
-                    self,
+                    quant_target,
                     module_to_convert=nonlora_to_quant,
                     w_bit=running_config.w_bit,
                     group_size=running_config.group_size,
                     q_type=running_config.quant_type,
+                )
+            elif running_config.quant_type == "autoround":
+                logger.info("%s compression of layer %s" % (running_config.quant_type, nonlora_to_quant))
+                try:
+                    from eole.modules.autoround_linear import replace_autoround_linear
+                except ImportError:
+                    raise ImportError("Install auto-round to use autoround quantized model")
+                replace_autoround_linear(
+                    quant_target,
+                    module_to_convert=nonlora_to_quant,
+                    w_bit=running_config.w_bit,
+                    group_size=running_config.group_size,
+                    packing_format=getattr(running_config, "autoround_packing_format", "auto_round:auto_gptq"),
+                    sym=getattr(running_config, "autoround_sym", True),
                 )
             else:
                 logger.info("compression type %s not supported." % running_config.quant_type)

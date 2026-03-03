@@ -933,7 +933,9 @@ def build_shards(model_config, hf, args, params):
                                 target1 = target
                                 if target.endswith("."):
                                     target1 = target + param
-                                eole_safetensor[eole_prefix + str(i) + target1] = w
+                                eole_key = eole_prefix + str(i) + target1
+                                if eole_key not in eole_safetensor.keys():
+                                    eole_safetensor[eole_key] = w
                 _layer_tensor_cache.clear()
 
         print("Saving output model shard: %d" % shard)
