@@ -378,6 +378,7 @@ class BaseModel(nn.Module):
                     group_size=running_config.group_size,
                     packing_format=getattr(running_config, "autoround_packing_format", "auto_round:auto_gptq"),
                     sym=getattr(running_config, "autoround_sym", True),
+                    module_to_not_convert=getattr(running_config, "quant_exclude_modules", []),
                 )
             else:
                 logger.info("compression type %s not supported." % running_config.quant_type)

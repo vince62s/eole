@@ -570,6 +570,28 @@ def build_config_dict(hf):
                 "in_proj_a",
                 "out_proj",
             ]
+            # Parse extra_config to detect modules kept in fp16 (not quantized).
+            # extra_config maps full HF module paths to per-layer settings; entries
+            # with bits != target indicate layers that were intentionally skipped
+            # during quantization (e.g. shared_expert in MoE models).
+            # We extract the direct parent module name so that replace_autoround_linear
+            # can skip entire subtrees rather than just individual nn.Linear leaves.
+            extra_config = quant_config.get("extra_config", {})
+            target_bits = quant_config.get("bits", 4)
+            if extra_config:
+                # Map known HF module names to their eole equivalents.
+                _HF_TO_EOLE_MODULE = {"shared_expert": "shared_experts"}
+                excluded_hf_parents = set()
+                for hf_path, layer_cfg in extra_config.items():
+                    if layer_cfg.get("bits", target_bits) != target_bits or layer_cfg.get(
+                        "dtype", ""
+                    ).startswith("float"):
+                        parts = hf_path.split(".")
+                        if len(parts) >= 2:
+                            excluded_hf_parents.add(parts[-2])
+                training_config["quant_exclude_modules"] = [
+                    _HF_TO_EOLE_MODULE.get(p, p) for p in excluded_hf_parents
+                ]
             params = ["qweight", "qzeros", "scales"] + ["weight", "bias"]
         else:
             raise ValueError("Can convert only awq or autoround models for now")

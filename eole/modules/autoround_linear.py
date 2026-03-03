@@ -30,7 +30,8 @@ def _suppress_all_output():
 
 
 def replace_autoround_linear(
-    model, module_to_convert=[], w_bit=4, group_size=128, packing_format="auto_round:auto_gptq", sym=True
+    model, module_to_convert=[], w_bit=4, group_size=128, packing_format="auto_round:auto_gptq", sym=True,
+    module_to_not_convert=[]
 ):
     """Replace nn.Linear layers with AutoRound QuantLinear for quantized inference.
 
@@ -45,13 +46,19 @@ def replace_autoround_linear(
 
     For Marlin layers, call post_init_autoround_linear(model) after loading the weights
     to repack them into the Marlin-optimized layout.
+
+    module_to_not_convert: list of module names (direct children) whose entire subtree
+        should be skipped.  Use this for parent modules that were kept in fp16 during
+        quantization (e.g. ``shared_experts`` in MoE models).
     """
     use_gptq_zp = "gptq" in packing_format
     QuantLinear, use_marlin = _get_autoround_quant_linear_cls(use_gptq_zp, sym)
 
     for name, module in model.named_children():
+        if name in module_to_not_convert:
+            continue  # skip entire subtree — this parent was kept in fp16
         if len(list(module.children())) > 0:
-            replace_autoround_linear(module, module_to_convert, w_bit, group_size, packing_format, sym)
+            replace_autoround_linear(module, module_to_convert, w_bit, group_size, packing_format, sym, module_to_not_convert)
 
         if isinstance(module, nn.Linear) and name in module_to_convert:
             if use_marlin:
