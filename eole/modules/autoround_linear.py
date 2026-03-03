@@ -29,6 +29,10 @@ def _suppress_all_output():
         os.close(saved_stderr)
 
 
+_MARLIN_OUT_FEATURES_MULTIPLE = 64  # Marlin kernel requires out_features % 64 == 0
+_MARLIN_IN_FEATURES_MULTIPLE = 128  # Marlin kernel requires in_features % 128 == 0
+
+
 def replace_autoround_linear(
     model, module_to_convert=[], w_bit=4, group_size=128, packing_format="auto_round:auto_gptq", sym=True,
     module_to_not_convert=[]
@@ -47,12 +51,24 @@ def replace_autoround_linear(
     For Marlin layers, call post_init_autoround_linear(model) after loading the weights
     to repack them into the Marlin-optimized layout.
 
+    Marlin alignment constraints: out_features must be divisible by 64 and in_features
+    by 128.  Layers that do not satisfy these constraints are silently replaced with the
+    next available backend (Triton or PyTorch) while the rest of the model still uses
+    the faster Marlin kernels.
+
     module_to_not_convert: list of module names (direct children) whose entire subtree
         should be skipped.  Use this for parent modules that were kept in fp16 during
         quantization (e.g. ``shared_experts`` in MoE models).
     """
     use_gptq_zp = "gptq" in packing_format
     QuantLinear, use_marlin = _get_autoround_quant_linear_cls(use_gptq_zp, sym)
+
+    # Pre-compute a non-Marlin fallback class for layers whose dimensions don't
+    # satisfy Marlin's alignment requirements (out_features % 64 == 0,
+    # in_features % 128 == 0).  This is a no-op when use_marlin is False.
+    fallback_cls = None
+    if use_marlin:
+        fallback_cls, _ = _get_autoround_quant_linear_cls(use_gptq_zp, sym=False)
 
     for name, module in model.named_children():
         if name in module_to_not_convert:
@@ -61,7 +77,12 @@ def replace_autoround_linear(
             replace_autoround_linear(module, module_to_convert, w_bit, group_size, packing_format, sym, module_to_not_convert)
 
         if isinstance(module, nn.Linear) and name in module_to_convert:
-            if use_marlin:
+            marlin_ok = (
+                use_marlin
+                and module.out_features % _MARLIN_OUT_FEATURES_MULTIPLE == 0
+                and module.in_features % _MARLIN_IN_FEATURES_MULTIPLE == 0
+            )
+            if marlin_ok:
                 model._modules[name] = QuantLinear(
                     bits=w_bit,
                     group_size=group_size,
@@ -69,6 +90,20 @@ def replace_autoround_linear(
                     sym=sym,
                     in_features=module.in_features,
                     out_features=module.out_features,
+                    bias=module.bias is not None,
+                )
+            elif use_marlin:
+                # Marlin alignment not satisfied — use fallback backend for this layer
+                logging.getLogger(__name__).debug(
+                    "Layer %s (in=%d, out=%d) does not meet Marlin alignment requirements; "
+                    "using fallback backend for this layer.",
+                    name, module.in_features, module.out_features,
+                )
+                model._modules[name] = fallback_cls(
+                    bits=w_bit,
+                    group_size=group_size,
+                    infeatures=module.in_features,
+                    outfeatures=module.out_features,
                     bias=module.bias is not None,
                 )
             else:
@@ -123,23 +158,11 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
                 with _suppress_all_output():
                     from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
                     marlin_cls = get_marlin_layer()
-                    # Probe: instantiate a minimal layer to verify this GPU meets
-                    # Marlin's hardware prerequisites (e.g. compute capability).
-                    # gptqmodel raises NotImplementedError in __init__ when the
-                    # device is unsupported, so we catch it here and fall through
-                    # to the next backend rather than crashing during model load.
-                    _ = marlin_cls(
-                        bits=4, group_size=128, desc_act=False, sym=True,
-                        in_features=128, out_features=128, bias=False,
-                    )
                 logging.getLogger("logbar").setLevel(logging.ERROR)
 
                 return marlin_cls, True
-            except (ImportError, NotImplementedError):
-                logging.getLogger(__name__).info(
-                    "Marlin backend not available (unsupported GPU or missing gptqmodel); "
-                    "falling back to Triton/PyTorch backend."
-                )
+            except ImportError:
+                pass
         # Triton is the next best option on CUDA
         try:
             if use_gptq_zp:
