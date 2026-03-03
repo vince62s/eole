@@ -724,7 +724,7 @@ def get_shards_map(model_config, hf, nshards):
             ):
                 shard_checkpoints[shard].add(ckpt)
 
-    return shard_checkpoints, shard_layer_ranges
+    return [sorted(s) for s in shard_checkpoints], shard_layer_ranges
 
 
 def build_shards(model_config, hf, args, params):
@@ -793,6 +793,13 @@ def build_shards(model_config, hf, args, params):
         for ckpt in shard_checkpoints[shard]:
             print("Loading %s" % ckpt)
             checkpoint = hf.checkpoint(ckpt)
+            # Pre-compute the set of keys available in this checkpoint once,
+            # so we can skip lookups for missing keys without repeatedly opening the file.
+            if isinstance(checkpoint, dict):
+                ckpt_keys = set(checkpoint.keys())
+            else:
+                with safetensors.safe_open(checkpoint, framework="pt", device="cpu") as f:
+                    ckpt_keys = set(f.keys())
             for i in shard_layer_ranges[shard]:
                 # Cache raw tensors read from this checkpoint+layer to avoid
                 # re-reading the same stacked tensor (e.g. mlp.experts.gate_up_proj)
@@ -818,10 +825,13 @@ def build_shards(model_config, hf, args, params):
                                 srckey = srckey + param
                             full_srckey = hf_prefix + str(i) + srckey
                             if full_srckey not in _layer_tensor_cache:
-                                _layer_tensor_cache[full_srckey] = get_weight(
-                                    checkpoint,
-                                    full_srckey,
-                                )
+                                if full_srckey not in ckpt_keys:
+                                    _layer_tensor_cache[full_srckey] = None
+                                else:
+                                    _layer_tensor_cache[full_srckey] = get_weight(
+                                        checkpoint,
+                                        full_srckey,
+                                    )
                             w = _layer_tensor_cache[full_srckey]
 
                             if w is not None:
