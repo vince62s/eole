@@ -572,24 +572,32 @@ def build_config_dict(hf):
             ]
             # Parse extra_config to detect modules kept in fp16 (not quantized).
             # extra_config maps full HF module paths to per-layer settings; entries
-            # with bits != target indicate layers that were intentionally skipped
-            # during quantization (e.g. shared_expert in MoE models).
-            # We extract the direct parent module name so that replace_autoround_linear
-            # can skip entire subtrees rather than just individual nn.Linear leaves.
+            # with bits >= 16 or a float dtype indicate layers that were intentionally
+            # skipped during quantization (e.g. shared_expert in MoE models).
+            # We search each path for a known eole module name so that
+            # replace_autoround_linear can skip entire subtrees.
             extra_config = quant_config.get("extra_config", {})
             target_bits = quant_config.get("bits", 4)
             if extra_config:
                 # Map known HF module names to their eole equivalents.
+                # Only modules listed here will ever be added to quant_exclude_modules;
+                # generic containers like "mlp" are intentionally excluded from the map
+                # so that they are never wrongly added even if they appear in a float path.
                 _HF_TO_EOLE_MODULE = {"shared_expert": "shared_experts"}
                 excluded_hf_parents = set()
                 for hf_path, layer_cfg in extra_config.items():
                     bits_val = layer_cfg.get("bits", target_bits)
                     if bits_val >= 16 or layer_cfg.get("dtype", "").startswith("float"):
-                        parts = hf_path.split(".")
-                        if len(parts) >= 2:
-                            excluded_hf_parents.add(parts[-2])
+                        # Search the path components from the leaf upward for the first
+                        # known HF module name so that paths like
+                        # "…shared_expert.mlp.gate_proj" still resolve to "shared_expert"
+                        # (not the intermediate "mlp" that parts[-2] would have returned).
+                        for part in reversed(hf_path.split(".")):
+                            if part in _HF_TO_EOLE_MODULE:
+                                excluded_hf_parents.add(part)
+                                break
                 training_config["quant_exclude_modules"] = [
-                    _HF_TO_EOLE_MODULE.get(p, p) for p in excluded_hf_parents
+                    _HF_TO_EOLE_MODULE[p] for p in excluded_hf_parents
                 ]
             params = ["qweight", "qzeros", "scales"] + ["weight", "bias"]
         elif quant_config.get("quant_method") == "gptq":
