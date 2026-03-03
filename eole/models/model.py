@@ -174,9 +174,15 @@ class BaseModel(nn.Module):
             torch.quantization.quantize_dynamic(self, dtype=torch.qint8, inplace=True)
 
         if getattr(running_config, "quant_type", "") == "autoround":
-            from eole.modules.autoround_linear import post_init_autoround_linear
+            try:
+                from eole.modules.autoround_linear import post_init_autoround_linear
 
-            post_init_autoround_linear(self)
+                post_init_autoround_linear(self)
+            except ImportError:
+                logger.warning(
+                    "auto-round package is not installed; AutoRound Marlin repacking "
+                    "skipped — weights will be used as loaded (float)."
+                )
 
         self.eval()
         for name, module in self.named_modules():
