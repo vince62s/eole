@@ -123,11 +123,23 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
                 with _suppress_all_output():
                     from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
                     marlin_cls = get_marlin_layer()
+                    # Probe: instantiate a minimal layer to verify this GPU meets
+                    # Marlin's hardware prerequisites (e.g. compute capability).
+                    # gptqmodel raises NotImplementedError in __init__ when the
+                    # device is unsupported, so we catch it here and fall through
+                    # to the next backend rather than crashing during model load.
+                    _ = marlin_cls(
+                        bits=4, group_size=128, desc_act=False, sym=True,
+                        in_features=128, out_features=128, bias=False,
+                    )
                 logging.getLogger("logbar").setLevel(logging.ERROR)
 
                 return marlin_cls, True
-            except ImportError:
-                pass
+            except (ImportError, NotImplementedError):
+                logging.getLogger(__name__).info(
+                    "Marlin backend not available (unsupported GPU or missing gptqmodel); "
+                    "falling back to Triton/PyTorch backend."
+                )
         # Triton is the next best option on CUDA
         try:
             if use_gptq_zp:
