@@ -593,8 +593,49 @@ def build_config_dict(hf):
                     _HF_TO_EOLE_MODULE.get(p, p) for p in excluded_hf_parents
                 ]
             params = ["qweight", "qzeros", "scales"] + ["weight", "bias"]
+        elif quant_config.get("quant_method") == "gptq":
+            # GPTQ models use the same tensor format as AutoRound GPTQ-packing.
+            # Reuse the autoround backend with auto_gptq packing convention.
+            training_config["quant_type"] = "autoround"
+            training_config["w_bit"] = quant_config.get("bits", 4)
+            training_config["group_size"] = quant_config.get("group_size", 128)
+            training_config["autoround_packing_format"] = "auto_round:auto_gptq"
+            training_config["autoround_sym"] = quant_config.get("sym", True)
+            training_config["quant_layers"] = [
+                "gate_up_proj",
+                "down_proj",
+                "up_proj",
+                "linear_values",
+                "linear_query",
+                "linear_keys",
+                "final_linear",
+                # GatedDeltaNet linear-attention layers (Qwen3.5)
+                "in_proj_qkv",
+                "in_proj_z",
+                "in_proj_b",
+                "in_proj_a",
+                "out_proj",
+            ]
+            # Parse the GPTQ dynamic field.  Keys prefixed with "-:" are negation
+            # patterns: regex expressions over the full HF module path that identify
+            # layers which were NOT quantized.  Match them against known eole module
+            # names so that replace_autoround_linear can skip those subtrees.
+            dynamic = quant_config.get("dynamic", {})
+            if dynamic:
+                # Eole module names that can be direct children of a transformer layer.
+                _CANDIDATE_EOLE_MODULES = ["self_attn", "linear_attn", "shared_experts", "experts", "mlp"]
+                excluded_patterns = [k[2:] for k in dynamic if k.startswith("-:")]
+                excluded_modules = []
+                for pattern in excluded_patterns:
+                    compiled = re.compile(pattern)
+                    for mod in _CANDIDATE_EOLE_MODULES:
+                        if compiled.search(mod) and mod not in excluded_modules:
+                            excluded_modules.append(mod)
+                if excluded_modules:
+                    training_config["quant_exclude_modules"] = excluded_modules
+            params = ["qweight", "qzeros", "scales"] + ["weight", "bias"]
         else:
-            raise ValueError("Can convert only awq or autoround models for now")
+            raise ValueError("Can convert only awq, autoround or gptq models for now")
     else:
         training_config["quant_type"] = ""
         training_config["w_bit"] = 0
