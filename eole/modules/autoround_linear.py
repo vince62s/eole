@@ -93,9 +93,6 @@ def replace_autoround_linear(
                     out_features=module.out_features,
                     bias=module.bias is not None,
                 )
-                # Tag with use_gptq_zp so post_init_autoround_linear can select
-                # the correct fallback backend if post_init() fails at runtime.
-                new_module._eole_use_gptq_zp = use_gptq_zp
                 model._modules[name] = new_module
             elif use_marlin:
                 # Marlin alignment not satisfied — use fallback backend for this layer
@@ -122,6 +119,57 @@ def replace_autoround_linear(
     return model
 
 
+def _check_marlin_shape_consistency(name, module):
+    """Detect the shape mismatch that triggers gptq_marlin_repack's CUDA assertion.
+
+    The gptq_marlin_repack CUDA kernel (see gptqmodel_ext/marlin/gptq_marlin_repack.cu)
+    checks::
+
+        TORCH_CHECK((size_k / pack_factor) == b_q_weight.size(0),
+                    "Shape mismatch: b_q_weight.size(0) = ", ...)
+
+    where ``size_k = self.in_features`` and ``b_q_weight = self.qweight``.  The
+    check fails when the model config's ``in_features`` is inconsistent with the
+    packed qweight shape actually stored in the checkpoint — i.e. when the Marlin
+    module was constructed for ``in_features=A`` but the loaded qweight implies
+    ``in_features=B`` (because ``qweight.size(0) * pack_factor == B != A``).
+
+    Raising a clear ValueError here lets the user identify the config/checkpoint
+    mismatch before the cryptic CUDA assertion fires inside the kernel.
+    """
+    qweight = getattr(module, "qweight", None)
+    pack_factor = getattr(module, "pack_factor", None)
+    in_features = getattr(module, "in_features", None)
+    if (
+        qweight is not None
+        and pack_factor is not None
+        and in_features is not None
+        and qweight.dim() == 2
+        and qweight.size(0) != in_features // pack_factor
+    ):
+        checkpoint_in_features = qweight.size(0) * pack_factor
+        # Mention GatedDeltaNet-specific fields only for layers that belong to
+        # a linear_attn block (in_proj_* / out_proj), where the mismatch is most
+        # commonly caused by wrong linear_num_*_heads or linear_*_head_dim values.
+        extra = ""
+        if any(pat in name for pat in ("in_proj", "out_proj")):
+            extra = (
+                " For GatedDeltaNet (linear_attn) layers check "
+                "linear_num_key_heads, linear_key_head_dim, "
+                "linear_num_value_heads and linear_value_head_dim."
+            )
+        raise ValueError(
+            f"Marlin shape mismatch for layer '{name}': "
+            f"qweight.size(0)={qweight.size(0)} but "
+            f"in_features // pack_factor = {in_features} // {pack_factor} = "
+            f"{in_features // pack_factor}. "
+            f"The model config implies in_features={in_features} but the loaded "
+            f"checkpoint implies in_features={checkpoint_in_features}. "
+            f"Ensure the model architecture config (hidden_size) matches the "
+            f"quantized checkpoint.{extra}"
+        )
+
+
 def post_init_autoround_linear(model):
     """Call post_init() on all AutoRound QuantLinear modules in the model.
 
@@ -129,86 +177,16 @@ def post_init_autoround_linear(model):
     optimized memory layout and pre-allocates the Marlin workspace buffer.
     It is a no-op for Triton and PyTorch backends.
     Must be called after weights have been loaded and the model moved to CUDA.
-
-    If a Marlin layer's post_init() raises any exception (e.g. because the layer's
-    dimensions do not satisfy all of the Marlin CUDA kernel's internal requirements),
-    the layer is replaced in-place with the best available non-Marlin backend
-    (Triton or PyTorch) so that inference can proceed for the rest of the model.
     """
     for name, module in model.named_children():
         module_cls = type(module)
         module_pkg = getattr(module_cls, "__module__", "") or ""
         if module_pkg.startswith("auto_round_extension") and hasattr(module, "post_init"):
-            # Save GPTQ-format buffers BEFORE post_init() modifies them.
-            # Marlin's post_init repacks qweight and permutes scales in-place;
-            # we need the originals if we have to fall back to Triton/PyTorch.
-            saved = {
-                attr: getattr(module, attr).detach().clone()
-                for attr in ("qweight", "scales", "qzeros", "bias")
-                if isinstance(getattr(module, attr, None), torch.Tensor)
-            }
-            try:
-                module.post_init()
-            except Exception as exc:
-                logging.getLogger(__name__).warning(
-                    "Marlin post_init failed for layer '%s' "
-                    "(in_features=%s, out_features=%s): %s "
-                    "— replacing with Triton/PyTorch fallback.",
-                    name,
-                    getattr(module, "in_features", "?"),
-                    getattr(module, "out_features", "?"),
-                    exc,
-                )
-                _replace_marlin_with_fallback(model, name, module, saved)
+            _check_marlin_shape_consistency(name, module)
+            module.post_init()
         else:
             # Recurse into containers that are not themselves QuantLinear modules.
             post_init_autoround_linear(module)
-
-
-def _replace_marlin_with_fallback(parent, name, marlin_module, saved_buffers):
-    """Replace a failed Marlin QuantLinear with the best non-Marlin fallback.
-
-    Copies the original GPTQ-format weights (saved before post_init modified them)
-    into the new fallback module, then swaps the module in the parent.
-    """
-    use_gptq_zp = getattr(marlin_module, "_eole_use_gptq_zp", False)
-    try:
-        # sym=False intentionally: Marlin requires sym=True; passing False here
-        # ensures _get_autoround_quant_linear_cls skips Marlin and returns the
-        # best available Triton/PyTorch backend for this layer.
-        fallback_cls, _ = _get_autoround_quant_linear_cls(use_gptq_zp, sym=False)
-    except ImportError:
-        logging.getLogger(__name__).error(
-            "Cannot replace failed Marlin layer '%s': no fallback backend is available.", name
-        )
-        return
-    try:
-        fallback = fallback_cls(
-            bits=marlin_module.bits,
-            group_size=marlin_module.group_size,
-            infeatures=marlin_module.in_features,
-            outfeatures=marlin_module.out_features,
-            bias="bias" in saved_buffers,
-        )
-        # Move the fallback to the same device as the saved weights before copying.
-        if saved_buffers:
-            device = next(iter(saved_buffers.values())).device
-            fallback = fallback.to(device)
-        # Copy the GPTQ-format buffers.  Triton/PyTorch use the same shapes.
-        for attr, tensor in saved_buffers.items():
-            buf = getattr(fallback, attr, None)
-            if isinstance(buf, torch.Tensor) and buf.shape == tensor.shape:
-                buf.copy_(tensor)
-        parent._modules[name] = fallback
-        logging.getLogger(__name__).info(
-            "Replaced failed Marlin layer '%s' with fallback backend (%s).",
-            name, type(fallback).__name__,
-        )
-    except Exception as exc2:
-        logging.getLogger(__name__).error(
-            "Failed to create fallback for layer '%s': %s — layer may not work correctly.",
-            name, exc2,
-        )
 
 
 def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
