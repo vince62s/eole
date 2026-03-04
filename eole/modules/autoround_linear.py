@@ -48,12 +48,29 @@ def replace_autoround_linear(
     For Marlin layers, call post_init_autoround_linear(model) after loading the weights
     to repack them into the Marlin-optimized layout.
 
+    Marlin validates layer dimensions at construction time and raises NotImplementedError
+    for unsupported shapes (e.g. out_features not divisible by 64).  Such layers are
+    silently replaced with the next available backend (Triton or PyTorch).
+
     module_to_not_convert: list of module names (direct children) whose entire subtree
         should be skipped.  Use this for parent modules that were kept in fp16 during
         quantization (e.g. ``shared_experts`` in MoE models).
     """
     use_gptq_zp = "gptq" in packing_format
     QuantLinear, use_marlin = _get_autoround_quant_linear_cls(use_gptq_zp, sym)
+
+    # Lazily computed fallback class for layers that Marlin rejects (e.g. out_features % 64 != 0).
+    # Only populated on the first rejected layer; shared across the whole recursive call tree.
+    fallback_cls = [None]
+
+    def _get_fallback():
+        if fallback_cls[0] is None:
+            # sym=False forces _get_autoround_quant_linear_cls to skip the Marlin branch
+            # and return Triton or PyTorch. The sym flag here only controls backend
+            # selection, not quantization arithmetic (Triton/PyTorch constructors don't
+            # take a sym argument).
+            fallback_cls[0], _ = _get_autoround_quant_linear_cls(use_gptq_zp, sym=False)
+        return fallback_cls[0]
 
     for name, module in model.named_children():
         if name in module_to_not_convert:
@@ -63,15 +80,25 @@ def replace_autoround_linear(
 
         if isinstance(module, nn.Linear) and name in module_to_convert:
             if use_marlin:
-                new_module = QuantLinear(
-                    bits=w_bit,
-                    group_size=group_size,
-                    desc_act=False,
-                    sym=sym,
-                    in_features=module.in_features,
-                    out_features=module.out_features,
-                    bias=module.bias is not None,
-                )
+                try:
+                    new_module = QuantLinear(
+                        bits=w_bit,
+                        group_size=group_size,
+                        desc_act=False,
+                        sym=sym,
+                        in_features=module.in_features,
+                        out_features=module.out_features,
+                        bias=module.bias is not None,
+                    )
+                except NotImplementedError:
+                    # Marlin rejected this layer's dimensions — use next-best backend.
+                    new_module = _get_fallback()(
+                        bits=w_bit,
+                        group_size=group_size,
+                        infeatures=module.in_features,
+                        outfeatures=module.out_features,
+                        bias=module.bias is not None,
+                    )
             else:
                 new_module = QuantLinear(
                     bits=w_bit,

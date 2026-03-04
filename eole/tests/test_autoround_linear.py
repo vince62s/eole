@@ -4,7 +4,8 @@ These tests use lightweight mock objects so they run without gptqmodel or
 auto_round_extension installed.  They verify:
 
 1. replace_autoround_linear replaces nn.Linear with the chosen QuantLinear.
-2. post_init_autoround_linear calls post_init() on each auto_round module.
+2. When Marlin raises NotImplementedError for a layer, the non-Marlin fallback is used.
+3. post_init_autoround_linear calls post_init() on each auto_round module.
 """
 import math
 import unittest
@@ -76,25 +77,37 @@ def _make_model_with_marlin(bits=4, group_size=128,
 class TestReplaceAutoroundLinear(unittest.TestCase):
     """replace_autoround_linear replaces nn.Linear with the chosen backend."""
 
-    def _run_replace(self, in_features, out_features, use_marlin=True):
-        """Call replace_autoround_linear with a mocked QuantLinear class."""
+    def _run_replace(self, in_features, out_features, use_marlin=True, marlin_raises=False):
+        """Call replace_autoround_linear with mocked QuantLinear classes."""
         from eole.modules.autoround_linear import replace_autoround_linear
 
         linear = nn.Linear(in_features, out_features, bias=False)
         container = nn.Module()
         container.add_module("proj", linear)
 
-        created = []
+        marlin_created = []
+        fallback_created = []
 
-        def factory(**kwargs):
+        def marlin_factory(**kwargs):
+            if marlin_raises:
+                raise NotImplementedError("unsupported dimensions")
             m = MagicMock()
-            created.append(kwargs)
+            marlin_created.append(kwargs)
             return m
 
-        quant_cls = MagicMock(side_effect=factory)
+        def fallback_factory(**kwargs):
+            f = MagicMock()
+            fallback_created.append(kwargs)
+            return f
+
+        marlin_cls = MagicMock(side_effect=marlin_factory)
+        fb_cls = MagicMock(side_effect=fallback_factory)
 
         with patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls:
-            mock_get_cls.return_value = (quant_cls, use_marlin)
+            mock_get_cls.side_effect = [
+                (marlin_cls, use_marlin),   # primary call
+                (fb_cls, False),             # fallback call (only reached when Marlin raises)
+            ]
             replace_autoround_linear(
                 container,
                 module_to_convert=["proj"],
@@ -104,21 +117,29 @@ class TestReplaceAutoroundLinear(unittest.TestCase):
                 sym=True,
             )
 
-        return created
+        return marlin_created, fallback_created
 
     def test_marlin_backend_replaces_linear(self):
-        """When Marlin is selected, the layer is replaced with Marlin QuantLinear."""
-        created = self._run_replace(2048, 8192, use_marlin=True)
-        self.assertEqual(len(created), 1)
-        self.assertIn("in_features", created[0])
-        self.assertEqual(created[0]["in_features"], 2048)
+        """When Marlin is selected and layer is supported, it is replaced with Marlin QuantLinear."""
+        marlin_created, fallback_created = self._run_replace(2048, 8192, use_marlin=True, marlin_raises=False)
+        self.assertEqual(len(marlin_created), 1)
+        self.assertEqual(len(fallback_created), 0)
+        self.assertIn("in_features", marlin_created[0])
+        self.assertEqual(marlin_created[0]["in_features"], 2048)
+
+    def test_marlin_raises_uses_fallback(self):
+        """When Marlin raises NotImplementedError (e.g. out_features % 64 != 0), fallback is used."""
+        marlin_created, fallback_created = self._run_replace(2048, 100, use_marlin=True, marlin_raises=True)
+        self.assertEqual(len(marlin_created), 0)
+        self.assertEqual(len(fallback_created), 1)
+        self.assertIn("infeatures", fallback_created[0])
+        self.assertEqual(fallback_created[0]["infeatures"], 2048)
 
     def test_non_marlin_backend_replaces_linear(self):
-        """When a non-Marlin backend is selected, the layer is also replaced."""
-        created = self._run_replace(2048, 8192, use_marlin=False)
-        self.assertEqual(len(created), 1)
-        self.assertIn("infeatures", created[0])
-        self.assertEqual(created[0]["infeatures"], 2048)
+        """When a non-Marlin backend is selected, the layer is replaced without fallback."""
+        marlin_created, fallback_created = self._run_replace(2048, 8192, use_marlin=False)
+        # The primary (non-Marlin) backend replaces the layer; no fallback is needed.
+        self.assertEqual(len(fallback_created), 0)
 
     def test_module_to_not_convert_is_skipped(self):
         """Modules listed in module_to_not_convert are not replaced."""
@@ -137,9 +158,7 @@ class TestReplaceAutoroundLinear(unittest.TestCase):
                 module_to_not_convert=["proj"],
             )
 
-        # proj was in both lists — to_not_convert takes precedence at the parent level,
-        # but since the container itself is the parent we pass module_to_not_convert at
-        # that parent level; verify the original nn.Linear is still in place.
+        # proj was in both lists — to_not_convert takes precedence at the parent level
         self.assertIsInstance(container.proj, nn.Linear)
 
 
@@ -172,4 +191,5 @@ class TestPostInitAutoround(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
