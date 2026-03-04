@@ -19,67 +19,15 @@ from torch.nn.utils import skip_init
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
-    # Fall back to fla.modules.convolution when the causal_conv1d package is absent
-    # but fla-core is installed.  The FLA API has changed over versions:
-    #
-    #   FORMAT (breaking change, Nov 2024):
-    #     Old FLA (pre-Nov 2024): head-first  x[B, D, L], same as the causal_conv1d package.
-    #     New FLA (post-Nov 2024): seq-first  x[B, T, D].
-    #     Detected by presence of the `residual` parameter (added in the new API).
-    #
-    #   RETURN VALUE: both old and new FLA return (output, final_state); the
-    #     causal_conv1d package returns only the output.
-    #
-    #   UPDATE SIGNATURE:
-    #     Old FLA: causal_conv1d_update(x, cache, weight, bias=None, activation=None)
-    #     New FLA: causal_conv1d_update(x, cache, residual=None, weight=None, bias=None, activation=None)
-    #
-    # The wrappers below absorb all these differences so the rest of the code is unchanged.
-    try:
-        import inspect as _inspect
-        from fla.modules.convolution import causal_conv1d as _fla_causal_conv1d
-        from fla.modules.convolution import causal_conv1d_update as _fla_causal_conv1d_update
-
-        # Detect format: the 'residual' parameter was added when FLA switched to seq-first.
-        _fla_seq_first = 'residual' in _inspect.signature(_fla_causal_conv1d).parameters
-        _fla_update_has_residual = 'residual' in _inspect.signature(_fla_causal_conv1d_update).parameters
-
-        def causal_conv1d_fn(x, weight, bias=None, activation=None):
-            if _fla_seq_first:
-                # x: [B, D, L] channel-first → new FLA expects [B, T, D] seq-first
-                out, _ = _fla_causal_conv1d(x.transpose(1, 2), weight=weight, bias=bias, activation=activation)
-                return out.transpose(1, 2)  # back to [B, D, L]
-            else:
-                # x: [B, D, L] channel-first → old FLA also expects [B, D, L] head-first
-                out, _ = _fla_causal_conv1d(x, weight=weight, bias=bias, activation=activation)
-                return out
-
-        def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None):
-            # x: [B, D, 1] channel-first → FLA expects [B, D] (2-D, single timestep)
-            if _fla_update_has_residual:
-                # New FLA API: (x, cache, residual=None, weight=None, bias=None, activation=None)
-                out, _ = _fla_causal_conv1d_update(
-                    x.squeeze(-1),
-                    conv_state,
-                    residual=None,
-                    weight=weight,
-                    bias=bias,
-                    activation=activation,
-                )
-            else:
-                # Old FLA API: (x, cache, weight, bias=None, activation=None)
-                out, _ = _fla_causal_conv1d_update(
-                    x.squeeze(-1),
-                    conv_state,
-                    weight=weight,
-                    bias=bias,
-                    activation=activation,
-                )
-            return out.unsqueeze(-1)  # back to [B, D, 1]
-
-    except ImportError:
-        causal_conv1d_fn = None
-        causal_conv1d_update = None
+    # The dedicated causal_conv1d package is not installed.  FLA (fla-core)
+    # also exposes a causal_conv1d kernel, but its API (tensor layout, return
+    # value, argument names) has changed incompatibly across versions, making
+    # a reliable wrapper hard to maintain.  The pure-PyTorch fallbacks that
+    # are already present in this module (F.silu(self.conv1d(...)) for the
+    # full-sequence path and _torch_causal_conv1d_update for the decode step)
+    # are correct and efficient for all cases.
+    causal_conv1d_fn = None
+    causal_conv1d_update = None
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
