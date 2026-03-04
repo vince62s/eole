@@ -7,6 +7,44 @@ from torch.cuda import is_available as cuda_is_available
 
 
 @contextlib.contextmanager
+def _protect_triton_jit():
+    """Save and restore triton.runtime.jit.JITFunction around gptqmodel imports.
+
+    gptqmodel's nogil_patcher.py patches triton.runtime.jit.JITFunction methods
+    (e.g. ``run``) to add thread-safety wrappers for Python free-threaded (nogil)
+    mode.  These patches are incompatible with other Triton-based libraries such as
+    fla-core: their Triton kernels crash at runtime (triton/runtime/jit.py, in the
+    JIT-compiled kernel launcher) because the wrapper corrupts the calling convention
+    expected by Triton's own internals.
+
+    This context manager takes a snapshot of the JITFunction class dictionary before
+    the guarded block and restores any attribute that gptqmodel's patcher changed, so
+    that FLA (and any other Triton user) continues to work correctly after gptqmodel
+    has been imported.
+    """
+    _JITFunction = None
+    _saved = {}
+    try:
+        from triton.runtime.jit import JITFunction as _JITFunction
+        # Shallow copy is sufficient: gptqmodel's patcher replaces attributes
+        # (assigns new function objects) rather than mutating them in-place.
+        _saved = dict(vars(_JITFunction))
+    except ImportError:
+        pass
+    try:
+        yield
+    finally:
+        if _JITFunction is not None:
+            current = vars(_JITFunction)
+            for attr, original_val in _saved.items():
+                if current.get(attr) is not original_val:
+                    try:
+                        setattr(_JITFunction, attr, original_val)
+                    except (AttributeError, TypeError):
+                        pass
+
+
+@contextlib.contextmanager
 def _suppress_all_output():
     """Redirect stdout and stderr at the file-descriptor level.
 
@@ -163,7 +201,7 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True, force_p
                 # silenced.  get_marlin_layer() is called inside the block
                 # because it triggers `import gptqmodel` at call-time.
                 # After the block, silence the logbar logger for later calls.
-                with _suppress_all_output():
+                with _suppress_all_output(), _protect_triton_jit():
                     from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
                     marlin_cls = get_marlin_layer()
                 logging.getLogger("logbar").setLevel(logging.ERROR)

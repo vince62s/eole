@@ -229,6 +229,71 @@ class TestPostInitAutoround(unittest.TestCase):
         post_init_autoround_linear(model)  # must not raise
 
 
+class TestProtectTritonJit(unittest.TestCase):
+    """_protect_triton_jit restores JITFunction methods patched by gptqmodel."""
+
+    def test_patches_are_reverted(self):
+        """Any attribute changed on JITFunction inside the block is restored."""
+        import types
+        from eole.modules.autoround_linear import _protect_triton_jit
+
+        # Build a minimal fake triton.runtime.jit module with a JITFunction class
+        fake_jit_mod = types.ModuleType("triton.runtime.jit")
+
+        class FakeJITFunction:
+            def run(self, *args, **kwargs):
+                pass
+
+        fake_jit_mod.JITFunction = FakeJITFunction
+        original_run = FakeJITFunction.run
+
+        import sys
+        # Save any pre-existing triton module refs before injecting fakes
+        _saved_mods = {k: sys.modules.get(k) for k in
+                       ("triton", "triton.runtime", "triton.runtime.jit")}
+        fake_triton = types.ModuleType("triton")
+        fake_runtime = types.ModuleType("triton.runtime")
+        fake_triton.runtime = fake_runtime
+        sys.modules["triton"] = fake_triton
+        sys.modules["triton.runtime"] = fake_runtime
+        sys.modules["triton.runtime.jit"] = fake_jit_mod
+
+        try:
+            with _protect_triton_jit():
+                # Simulate what gptqmodel's nogil_patcher does: replace run
+                def patched_run(self, *args, **kwargs):
+                    pass
+
+                FakeJITFunction.run = patched_run
+                self.assertIsNot(FakeJITFunction.run, original_run,
+                                 "run should be patched inside the block")
+
+            # After the context exits, run must be restored to the original
+            self.assertIs(FakeJITFunction.run, original_run,
+                          "_protect_triton_jit must restore JITFunction.run after block")
+        finally:
+            # Restore sys.modules to pre-test state
+            for key, val in _saved_mods.items():
+                if val is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = val
+
+    def test_no_triton_is_noop(self):
+        """_protect_triton_jit is a no-op when triton is not installed."""
+        import sys
+        from eole.modules.autoround_linear import _protect_triton_jit
+
+        # Temporarily hide triton
+        saved = sys.modules.pop("triton.runtime.jit", None)
+        try:
+            with _protect_triton_jit():
+                pass  # must not raise
+        finally:
+            if saved is not None:
+                sys.modules["triton.runtime.jit"] = saved
+
+
 if __name__ == "__main__":
     unittest.main()
 
