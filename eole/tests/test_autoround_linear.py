@@ -4,10 +4,11 @@ These tests use lightweight mock objects so they run without gptqmodel or
 auto_round_extension installed.  They verify:
 
 1. replace_autoround_linear replaces nn.Linear with the chosen QuantLinear.
-2. When Marlin raises NotImplementedError for a layer, the non-Marlin fallback is used.
-3. post_init_autoround_linear calls post_init() on each auto_round module.
+2. post_init_autoround_linear calls post_init() on each auto_round module.
+3. _get_autoround_quant_linear_cls selects the right backend.
 """
 import math
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -19,35 +20,34 @@ import torch.nn as nn
 # Minimal stubs for auto_round_extension modules
 # ---------------------------------------------------------------------------
 
-class _FakeMarlinModule(nn.Module):
-    """Mimics MarlinQuantLinear: buffers in GPTQ format, post_init repacks them."""
+class _FakeQuantModule(nn.Module):
+    """Mimics a QuantLinear: buffers in packed format, post_init repacks them."""
 
-    QUANT_TYPE = "marlin"
-    __module__ = "auto_round_extension.cuda.fake_marlin"
+    __module__ = "auto_round_extension.fake_quant"
 
-    def __init__(self, bits, group_size, in_features, out_features, bias):
+    def __init__(self, bits, group_size, infeatures, outfeatures, bias):
         super().__init__()
         self.bits = bits
         self.group_size = group_size
-        self.in_features = in_features
-        self.out_features = out_features
-        self.pack_factor = 32 // bits  # e.g. 8 for 4-bit
-        num_groups = math.ceil(in_features / group_size)
-        self.register_buffer("qweight", torch.zeros(in_features // self.pack_factor, out_features, dtype=torch.int32))
-        self.register_buffer("scales", torch.ones(num_groups, out_features, dtype=torch.float16))
-        self.register_buffer("qzeros", torch.zeros(num_groups, out_features // self.pack_factor, dtype=torch.int32))
+        self.infeatures = infeatures
+        self.outfeatures = outfeatures
+        pack_factor = 32 // bits
+        num_groups = math.ceil(infeatures / group_size)
+        self.register_buffer("qweight", torch.zeros(infeatures // pack_factor, outfeatures, dtype=torch.int32))
+        self.register_buffer("scales", torch.ones(num_groups, outfeatures, dtype=torch.float16))
+        self.register_buffer("qzeros", torch.zeros(num_groups, outfeatures // pack_factor, dtype=torch.int32))
         if bias:
-            self.register_buffer("bias", torch.zeros(out_features, dtype=torch.float16))
+            self.register_buffer("bias", torch.zeros(outfeatures, dtype=torch.float16))
         else:
             self.bias = None
 
     def post_init(self):
-        # Simulate in-place modification of qweight (like gptq_marlin_repack)
+        # Simulate in-place modification of qweight (like a repack)
         self.qweight.fill_(42)
 
 
 # ---------------------------------------------------------------------------
-# Helper: build a model that contains FakeMarlin leaves
+# Helper: build a model that contains _FakeQuantModule leaves
 # ---------------------------------------------------------------------------
 
 class _Container(nn.Module):
@@ -55,14 +55,13 @@ class _Container(nn.Module):
         super().__init__()
 
 
-def _make_model_with_marlin(bits=4, group_size=128,
-                             in_features=2048, out_features=8192):
-    """Return a two-level container with a Marlin leaf."""
+def _make_model_with_quant(bits=4, group_size=128, infeatures=2048, outfeatures=8192):
+    """Return a two-level container with a quantized leaf."""
     root = _Container()
     inner = _Container()
-    layer = _FakeMarlinModule(
+    layer = _FakeQuantModule(
         bits=bits, group_size=group_size,
-        in_features=in_features, out_features=out_features,
+        infeatures=infeatures, outfeatures=outfeatures,
         bias=False,
     )
     inner.add_module("proj", layer)
@@ -77,109 +76,36 @@ def _make_model_with_marlin(bits=4, group_size=128,
 class TestReplaceAutoroundLinear(unittest.TestCase):
     """replace_autoround_linear replaces nn.Linear with the chosen backend."""
 
-    def _run_replace(self, in_features, out_features, use_marlin=True, marlin_raises=False):
-        """Call replace_autoround_linear with mocked QuantLinear classes."""
+    def test_backend_replaces_linear(self):
+        """An nn.Linear in module_to_convert is replaced with a QuantLinear."""
         from eole.modules.autoround_linear import replace_autoround_linear
 
-        linear = nn.Linear(in_features, out_features, bias=False)
+        linear = nn.Linear(2048, 8192, bias=False)
         container = nn.Module()
         container.add_module("proj", linear)
 
-        marlin_created = []
-        fallback_created = []
+        created = []
 
-        def marlin_factory(**kwargs):
-            if marlin_raises:
-                raise NotImplementedError("unsupported dimensions")
+        def factory(**kwargs):
             m = MagicMock()
-            marlin_created.append(kwargs)
+            created.append(kwargs)
             return m
 
-        def fallback_factory(**kwargs):
-            f = MagicMock()
-            fallback_created.append(kwargs)
-            return f
-
-        marlin_cls = MagicMock(side_effect=marlin_factory)
-        fb_cls = MagicMock(side_effect=fallback_factory)
-
+        quant_cls = MagicMock(side_effect=factory)
         with patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls:
-            mock_get_cls.side_effect = [
-                (marlin_cls, use_marlin),   # primary call
-                (fb_cls, False),             # fallback call (only reached when Marlin raises)
-            ]
+            mock_get_cls.return_value = quant_cls
             replace_autoround_linear(
                 container,
                 module_to_convert=["proj"],
                 w_bit=4,
                 group_size=128,
-                packing_format="auto_round:auto_gptq",
-                sym=True,
             )
 
-        return marlin_created, fallback_created
-
-    def test_marlin_backend_replaces_linear(self):
-        """When Marlin is selected and layer is supported, it is replaced with Marlin QuantLinear."""
-        marlin_created, fallback_created = self._run_replace(2048, 8192, use_marlin=True, marlin_raises=False)
-        self.assertEqual(len(marlin_created), 1)
-        self.assertEqual(len(fallback_created), 0)
-        self.assertIn("in_features", marlin_created[0])
-        self.assertEqual(marlin_created[0]["in_features"], 2048)
-
-    def test_marlin_raises_uses_fallback(self):
-        """When Marlin raises NotImplementedError (e.g. out_features % 64 != 0),
-        the pure-PyTorch fallback is used (not Triton, which has the same shape
-        constraints and would also crash at runtime)."""
-        marlin_created, fallback_created = self._run_replace(2048, 100, use_marlin=True, marlin_raises=True)
-        self.assertEqual(len(marlin_created), 0)
-        self.assertEqual(len(fallback_created), 1)
-        self.assertIn("infeatures", fallback_created[0])
-        self.assertEqual(fallback_created[0]["infeatures"], 2048)
-
-    def test_marlin_fallback_uses_force_pytorch(self):
-        """Fallback for Marlin-rejected layers must call _get_autoround_quant_linear_cls
-        with force_pytorch=True to bypass Triton (which has the same shape constraints).
-        """
-        from eole.modules.autoround_linear import replace_autoround_linear
-
-        linear = nn.Linear(2048, 32, bias=False)  # out_features=32, not divisible by 64
-        container = nn.Module()
-        container.add_module("proj", linear)
-
-        def marlin_factory(**kwargs):
-            raise NotImplementedError("out_features not divisible by 64")
-
-        marlin_cls = MagicMock(side_effect=marlin_factory)
-        fb_cls = MagicMock(return_value=MagicMock())
-
-        with patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls:
-            mock_get_cls.side_effect = [
-                (marlin_cls, True),   # primary call
-                (fb_cls, False),      # fallback call — must use force_pytorch=True
-            ]
-            replace_autoround_linear(
-                container,
-                module_to_convert=["proj"],
-                w_bit=4,
-                group_size=128,
-                packing_format="auto_round:auto_gptq",
-                sym=True,
-            )
-
-        # Verify the fallback call used force_pytorch=True to skip Triton
-        self.assertEqual(mock_get_cls.call_count, 2)
-        _primary_call, fallback_call = mock_get_cls.call_args_list
-        self.assertTrue(
-            fallback_call.kwargs.get("force_pytorch") is True,
-            "fallback must pass force_pytorch=True to _get_autoround_quant_linear_cls",
-        )
-
-    def test_non_marlin_backend_replaces_linear(self):
-        """When a non-Marlin backend is selected, the layer is replaced without fallback."""
-        marlin_created, fallback_created = self._run_replace(2048, 8192, use_marlin=False)
-        # The primary (non-Marlin) backend replaces the layer; no fallback is needed.
-        self.assertEqual(len(fallback_created), 0)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["infeatures"], 2048)
+        self.assertEqual(created[0]["outfeatures"], 8192)
+        self.assertEqual(created[0]["bits"], 4)
+        self.assertEqual(created[0]["group_size"], 128)
 
     def test_module_to_not_convert_is_skipped(self):
         """Modules listed in module_to_not_convert are not replaced."""
@@ -191,7 +117,7 @@ class TestReplaceAutoroundLinear(unittest.TestCase):
 
         with patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls:
             quant_cls = MagicMock(return_value=MagicMock())
-            mock_get_cls.return_value = (quant_cls, False)
+            mock_get_cls.return_value = quant_cls
             replace_autoround_linear(
                 container,
                 module_to_convert=["proj"],
@@ -209,15 +135,15 @@ class TestPostInitAutoround(unittest.TestCase):
         """post_init() is called and qweight is modified in-place."""
         from eole.modules.autoround_linear import post_init_autoround_linear
 
-        model = _make_model_with_marlin()
+        model = _make_model_with_quant()
         proj = model.block.proj
         self.assertTrue((proj.qweight == 0).all())
 
         post_init_autoround_linear(model)
 
-        # FakeMarlinModule.post_init sets qweight to 42
+        # _FakeQuantModule.post_init sets qweight to 42
         self.assertTrue((model.block.proj.qweight == 42).all())
-        self.assertIsInstance(model.block.proj, _FakeMarlinModule)
+        self.assertIsInstance(model.block.proj, _FakeQuantModule)
 
     def test_non_auto_round_modules_are_skipped(self):
         """Regular nn.Module containers are recursed into but not called."""
@@ -229,222 +155,87 @@ class TestPostInitAutoround(unittest.TestCase):
         post_init_autoround_linear(model)  # must not raise
 
 
-class TestProtectTritonJit(unittest.TestCase):
-    """_protect_triton_jit prevents gptqmodel's side effects from breaking Triton."""
+class TestGetAutoRoundQuantLinearCls(unittest.TestCase):
+    """_get_autoround_quant_linear_cls selects Triton on CUDA, PyTorch otherwise."""
 
-    # ------------------------------------------------------------------
-    # Helper: inject / remove fake triton modules around a test
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _install_fake_triton(jit_mod):
-        import sys
-        import types
-        saved = {k: sys.modules.get(k) for k in
-                 ("triton", "triton.runtime", "triton.runtime.jit")}
-        fake_triton = types.ModuleType("triton")
-        fake_runtime = types.ModuleType("triton.runtime")
-        fake_triton.runtime = fake_runtime
-        sys.modules["triton"] = fake_triton
-        sys.modules["triton.runtime"] = fake_runtime
-        sys.modules["triton.runtime.jit"] = jit_mod
-        return saved
+    def test_triton_selected_when_cuda_available(self):
+        """Triton QuantLinear is returned when CUDA is available and triton imports."""
+        from eole.modules.autoround_linear import _get_autoround_quant_linear_cls
 
-    @staticmethod
-    def _restore_triton(saved):
-        import sys
-        for key, val in saved.items():
-            if val is None:
-                sys.modules.pop(key, None)
-            else:
-                sys.modules[key] = val
+        mock_quant = MagicMock()
+        fake_mod = MagicMock()
+        fake_mod.QuantLinear = mock_quant
+        with patch("eole.modules.autoround_linear.cuda_is_available", return_value=True), \
+             patch.dict(sys.modules, {"auto_round_extension.triton.qlinear_tritonv2": fake_mod}):
+            result = _get_autoround_quant_linear_cls(use_gptq_zp=False)
 
-    @staticmethod
-    def _restore_or_remove_module(key, saved):
-        """Restore ``key`` in sys.modules to ``saved``, or pop it if ``saved`` is None."""
-        import sys
-        if saved is not None:
-            sys.modules[key] = saved
-        else:
-            sys.modules.pop(key, None)
+        self.assertIs(result, mock_quant)
 
-    # ------------------------------------------------------------------
-    # Defence 1: nogil_patcher stub
-    # ------------------------------------------------------------------
-    def test_nogil_patcher_stub_installed_before_yield(self):
-        """A no-op stub for gptqmodel.utils.nogil_patcher is in sys.modules
-        inside the block so that any gptqmodel import finds it there."""
-        import sys
-        from eole.modules.autoround_linear import _protect_triton_jit
+    def test_triton_zp_variant_selected_for_gptq_packing(self):
+        """The _zp Triton variant is used when use_gptq_zp=True."""
+        from eole.modules.autoround_linear import _get_autoround_quant_linear_cls
 
-        _KEY = "gptqmodel.utils.nogil_patcher"
-        saved_stub = sys.modules.pop(_KEY, None)  # start with key absent
+        mock_quant = MagicMock()
+        fake_mod = MagicMock()
+        fake_mod.QuantLinear = mock_quant
+        with patch("eole.modules.autoround_linear.cuda_is_available", return_value=True), \
+             patch.dict(sys.modules, {"auto_round_extension.triton.qlinear_tritonv2_zp": fake_mod}):
+            result = _get_autoround_quant_linear_cls(use_gptq_zp=True)
+
+        self.assertIs(result, mock_quant)
+
+    def test_pytorch_fallback_when_no_cuda(self):
+        """PyTorch backend is returned when CUDA is not available."""
+        from eole.modules.autoround_linear import _get_autoround_quant_linear_cls
+
+        mock_quant = MagicMock()
+        fake_mod = MagicMock()
+        fake_mod.QuantLinear = mock_quant
+        with patch("eole.modules.autoround_linear.cuda_is_available", return_value=False), \
+             patch.dict(sys.modules, {"auto_round_extension.torch.qlinear_torch": fake_mod}):
+            result = _get_autoround_quant_linear_cls(use_gptq_zp=False)
+
+        self.assertIs(result, mock_quant)
+
+    def test_pytorch_fallback_when_triton_import_fails(self):
+        """PyTorch backend is used when Triton is unavailable even with CUDA."""
+        from eole.modules.autoround_linear import _get_autoround_quant_linear_cls
+
+        mock_quant = MagicMock()
+        fake_mod = MagicMock()
+        fake_mod.QuantLinear = mock_quant
+
+        # Remove triton variant from sys.modules so the import falls through
+        triton_key = "auto_round_extension.triton.qlinear_tritonv2"
+        saved = sys.modules.pop(triton_key, None)
         try:
-            with _protect_triton_jit():
-                stub = sys.modules.get(_KEY)
-                self.assertIsNotNone(stub,
-                                     "stub must be installed before yield")
-                # Any attribute access on the stub must return a callable no-op
-                noop = stub.patch_triton
-                self.assertTrue(callable(noop),
-                                "stub attributes must be callable")
-                self.assertIsNone(noop(),
-                                  "stub callables must return None (no-op)")
-        finally:
-            self._restore_or_remove_module(_KEY, saved_stub)
-
-    def test_nogil_patcher_stub_persists_after_context_exit(self):
-        """The stub remains in sys.modules after the context exits so that
-        later imports (e.g. auto_round_extension.triton) are also protected."""
-        import sys
-        from eole.modules.autoround_linear import _protect_triton_jit
-
-        _KEY = "gptqmodel.utils.nogil_patcher"
-        saved_stub = sys.modules.pop(_KEY, None)
-        try:
-            with _protect_triton_jit():
-                pass
-            self.assertIn(_KEY, sys.modules,
-                          "stub must persist after context exit")
-        finally:
-            self._restore_or_remove_module(_KEY, saved_stub)
-
-    # ------------------------------------------------------------------
-    # Defence 2: threadx DeviceThreadPool stub
-    # ------------------------------------------------------------------
-    def test_threadx_stub_installed_before_yield(self):
-        """A no-op stub for gptqmodel.utils.threadx is in sys.modules
-        inside the block so that gptqmodel finds it before spawning threads."""
-        import sys
-        from eole.modules.autoround_linear import _protect_triton_jit
-
-        _KEY = "gptqmodel.utils.threadx"
-        saved_stub = sys.modules.pop(_KEY, None)
-        try:
-            with _protect_triton_jit():
-                stub = sys.modules.get(_KEY)
-                self.assertIsNotNone(stub,
-                                     "threadx stub must be installed before yield")
-                # DeviceThreadPool must be the no-op class
-                pool_cls = stub.DeviceThreadPool
-                self.assertTrue(callable(pool_cls),
-                                "DeviceThreadPool must be a callable class")
-                # Instantiate: must not spawn any threads
-                import threading
-                before = threading.active_count()
-                pool = pool_cls(workers={"cuda:per": 4}, inference_mode=True)
-                after = threading.active_count()
-                self.assertEqual(
-                    before, after,
-                    "no new threads must be spawned by the stub DeviceThreadPool",
-                )
-        finally:
-            self._restore_or_remove_module(_KEY, saved_stub)
-
-    def test_threadx_stub_persists_after_context_exit(self):
-        """The threadx stub remains in sys.modules after the context exits."""
-        import sys
-        from eole.modules.autoround_linear import _protect_triton_jit
-
-        _KEY = "gptqmodel.utils.threadx"
-        saved_stub = sys.modules.pop(_KEY, None)
-        try:
-            with _protect_triton_jit():
-                pass
-            self.assertIn(_KEY, sys.modules,
-                          "threadx stub must persist after context exit")
-        finally:
-            self._restore_or_remove_module(_KEY, saved_stub)
-
-    # ------------------------------------------------------------------
-    # Defence 3: save/restore JITFunction class dict (belt-and-suspenders)
-    # ------------------------------------------------------------------
-    def test_changed_attributes_are_restored(self):
-        """Attributes changed on JITFunction inside the block are restored."""
-        import sys
-        import types
-        from eole.modules.autoround_linear import _protect_triton_jit
-
-        fake_jit_mod = types.ModuleType("triton.runtime.jit")
-
-        class FakeJITFunction:
-            def run(self, *args, **kwargs):
-                pass
-
-        fake_jit_mod.JITFunction = FakeJITFunction
-        original_run = FakeJITFunction.run
-        saved_triton = self._install_fake_triton(fake_jit_mod)
-
-        # Ensure stub keys are absent so the defences install fresh stubs
-        _KEY = "gptqmodel.utils.nogil_patcher"
-        _TX_KEY = "gptqmodel.utils.threadx"
-        saved_patcher = sys.modules.pop(_KEY, None)
-        saved_threadx = sys.modules.pop(_TX_KEY, None)
-        try:
-            with _protect_triton_jit():
-                def patched_run(self, *args, **kwargs):
-                    pass
-                FakeJITFunction.run = patched_run
-
-            self.assertIs(FakeJITFunction.run, original_run,
-                          "run must be restored to its original value")
-        finally:
-            self._restore_triton(saved_triton)
-            self._restore_or_remove_module(_KEY, saved_patcher)
-            self._restore_or_remove_module(_TX_KEY, saved_threadx)
-
-    def test_added_attributes_are_deleted(self):
-        """Attributes *added* to JITFunction inside the block are deleted."""
-        import sys
-        import types
-        from eole.modules.autoround_linear import _protect_triton_jit
-
-        fake_jit_mod = types.ModuleType("triton.runtime.jit")
-
-        class FakeJITFunction:
-            pass
-
-        fake_jit_mod.JITFunction = FakeJITFunction
-        saved_triton = self._install_fake_triton(fake_jit_mod)
-
-        _KEY = "gptqmodel.utils.nogil_patcher"
-        _TX_KEY = "gptqmodel.utils.threadx"
-        saved_patcher = sys.modules.pop(_KEY, None)
-        saved_threadx = sys.modules.pop(_TX_KEY, None)
-        try:
-            with _protect_triton_jit():
-                # Simulate patcher adding a brand-new attribute
-                FakeJITFunction.new_attr_from_patcher = "injected"
-
-            self.assertFalse(
-                hasattr(FakeJITFunction, "new_attr_from_patcher"),
-                "attributes added by the patcher must be removed on exit",
-            )
-        finally:
-            self._restore_triton(saved_triton)
-            self._restore_or_remove_module(_KEY, saved_patcher)
-            self._restore_or_remove_module(_TX_KEY, saved_threadx)
-
-    def test_no_triton_is_noop(self):
-        """_protect_triton_jit is a no-op (JIT snapshot) when triton is not installed."""
-        import sys
-        from eole.modules.autoround_linear import _protect_triton_jit
-
-        saved = sys.modules.pop("triton.runtime.jit", None)
-        _PATCHER_KEY = "gptqmodel.utils.nogil_patcher"
-        _THREADX_KEY = "gptqmodel.utils.threadx"
-        saved_patcher = sys.modules.pop(_PATCHER_KEY, None)
-        saved_threadx = sys.modules.pop(_THREADX_KEY, None)
-        try:
-            with _protect_triton_jit():
-                pass  # must not raise
+            with patch("eole.modules.autoround_linear.cuda_is_available", return_value=True), \
+                 patch.dict(sys.modules, {"auto_round_extension.torch.qlinear_torch": fake_mod}):
+                result = _get_autoround_quant_linear_cls(use_gptq_zp=False)
         finally:
             if saved is not None:
-                sys.modules["triton.runtime.jit"] = saved
-            self._restore_or_remove_module(_PATCHER_KEY, saved_patcher)
-            self._restore_or_remove_module(_THREADX_KEY, saved_threadx)
+                sys.modules[triton_key] = saved
+
+        self.assertIs(result, mock_quant)
+
+    def test_raises_when_nothing_available(self):
+        """ImportError is raised when neither Triton nor PyTorch backend can be imported."""
+        from eole.modules.autoround_linear import _get_autoround_quant_linear_cls
+
+        triton_key = "auto_round_extension.triton.qlinear_tritonv2"
+        torch_key = "auto_round_extension.torch.qlinear_torch"
+        saved_triton = sys.modules.pop(triton_key, None)
+        saved_torch = sys.modules.pop(torch_key, None)
+        try:
+            with patch("eole.modules.autoround_linear.cuda_is_available", return_value=False):
+                with self.assertRaises(ImportError):
+                    _get_autoround_quant_linear_cls(use_gptq_zp=False)
+        finally:
+            if saved_triton is not None:
+                sys.modules[triton_key] = saved_triton
+            if saved_torch is not None:
+                sys.modules[torch_key] = saved_torch
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
