@@ -49,8 +49,10 @@ def replace_autoround_linear(
     to repack them into the Marlin-optimized layout.
 
     Marlin validates layer dimensions at construction time and raises NotImplementedError
-    for unsupported shapes (e.g. out_features not divisible by 64).  Such layers are
-    silently replaced with the next available backend (Triton or PyTorch).
+    for unsupported shapes (e.g. out_features not divisible by 64).  The Triton backend
+    shares the same CUDA kernel block-size constraints, so it would also fail at runtime
+    with an illegal memory access.  Such layers are therefore replaced with the
+    pure-PyTorch backend, which has no CUDA kernel shape requirements.
 
     module_to_not_convert: list of module names (direct children) whose entire subtree
         should be skipped.  Use this for parent modules that were kept in fp16 during
@@ -65,11 +67,12 @@ def replace_autoround_linear(
 
     def _get_fallback():
         if fallback_cls[0] is None:
-            # sym=False forces _get_autoround_quant_linear_cls to skip the Marlin branch
-            # and return Triton or PyTorch. The sym flag here only controls backend
-            # selection, not quantization arithmetic (Triton/PyTorch constructors don't
-            # take a sym argument).
-            fallback_cls[0], _ = _get_autoround_quant_linear_cls(use_gptq_zp, sym=False)
+            # Triton has the same CUDA kernel block-size alignment requirements as
+            # Marlin (output dim must be divisible by the kernel's thread-block size).
+            # Using Triton for layers that Marlin rejected causes CUDA illegal memory
+            # accesses at inference time (asynchronous CUDA error in triton forward).
+            # Fall back to the pure-PyTorch backend which works for any layer shape.
+            fallback_cls[0], _ = _get_autoround_quant_linear_cls(use_gptq_zp, force_pytorch=True)
         return fallback_cls[0]
 
     for name, module in model.named_children():
@@ -129,7 +132,7 @@ def post_init_autoround_linear(model):
             post_init_autoround_linear(module)
 
 
-def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
+def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True, force_pytorch: bool = False):
     """Return the best available QuantLinear class for AutoRound inference.
 
     Preference order:
@@ -137,11 +140,19 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
     2. Triton kernels (requires CUDA + triton) — fast GPU kernels
     3. PyTorch fallback — works everywhere but dequantizes weights on every forward pass
 
+    Args:
+        use_gptq_zp: use GPTQ-style zero-point packing (affects which variant is imported).
+        sym: when True, try the Marlin (fastest) backend first.
+        force_pytorch: when True, skip all CUDA-kernel backends (Marlin and Triton) and
+            return the pure-PyTorch backend directly.  Use this for layers whose dimensions
+            do not meet the CUDA kernel alignment requirements of both Marlin and Triton
+            (e.g. out_features not divisible by 64).
+
     Returns:
         (QuantLinear class, use_marlin: bool)
             use_marlin=True means the Marlin constructor signature must be used.
     """
-    if cuda_is_available():
+    if not force_pytorch and cuda_is_available():
         # Marlin is fastest but only supports symmetric quantization
         if sym:
             try:

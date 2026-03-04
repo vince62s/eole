@@ -128,12 +128,52 @@ class TestReplaceAutoroundLinear(unittest.TestCase):
         self.assertEqual(marlin_created[0]["in_features"], 2048)
 
     def test_marlin_raises_uses_fallback(self):
-        """When Marlin raises NotImplementedError (e.g. out_features % 64 != 0), fallback is used."""
+        """When Marlin raises NotImplementedError (e.g. out_features % 64 != 0),
+        the pure-PyTorch fallback is used (not Triton, which has the same shape
+        constraints and would also crash at runtime)."""
         marlin_created, fallback_created = self._run_replace(2048, 100, use_marlin=True, marlin_raises=True)
         self.assertEqual(len(marlin_created), 0)
         self.assertEqual(len(fallback_created), 1)
         self.assertIn("infeatures", fallback_created[0])
         self.assertEqual(fallback_created[0]["infeatures"], 2048)
+
+    def test_marlin_fallback_uses_force_pytorch(self):
+        """Fallback for Marlin-rejected layers must call _get_autoround_quant_linear_cls
+        with force_pytorch=True to bypass Triton (which has the same shape constraints).
+        """
+        from eole.modules.autoround_linear import replace_autoround_linear
+
+        linear = nn.Linear(2048, 32, bias=False)  # out_features=32, not divisible by 64
+        container = nn.Module()
+        container.add_module("proj", linear)
+
+        def marlin_factory(**kwargs):
+            raise NotImplementedError("out_features not divisible by 64")
+
+        marlin_cls = MagicMock(side_effect=marlin_factory)
+        fb_cls = MagicMock(return_value=MagicMock())
+
+        with patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls:
+            mock_get_cls.side_effect = [
+                (marlin_cls, True),   # primary call
+                (fb_cls, False),      # fallback call — must use force_pytorch=True
+            ]
+            replace_autoround_linear(
+                container,
+                module_to_convert=["proj"],
+                w_bit=4,
+                group_size=128,
+                packing_format="auto_round:auto_gptq",
+                sym=True,
+            )
+
+        # Verify the fallback call used force_pytorch=True to skip Triton
+        self.assertEqual(mock_get_cls.call_count, 2)
+        _primary_call, fallback_call = mock_get_cls.call_args_list
+        self.assertTrue(
+            fallback_call.kwargs.get("force_pytorch") is True,
+            "fallback must pass force_pytorch=True to _get_autoround_quant_linear_cls",
+        )
 
     def test_non_marlin_backend_replaces_linear(self):
         """When a non-Marlin backend is selected, the layer is replaced without fallback."""
