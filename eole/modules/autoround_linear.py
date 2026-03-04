@@ -8,26 +8,51 @@ from torch.cuda import is_available as cuda_is_available
 
 @contextlib.contextmanager
 def _protect_triton_jit():
-    """Save and restore triton.runtime.jit.JITFunction around gptqmodel imports.
+    """Prevent gptqmodel's nogil_patcher from corrupting triton.runtime.jit.
 
-    gptqmodel's nogil_patcher.py patches triton.runtime.jit.JITFunction methods
-    (e.g. ``run``) to add thread-safety wrappers for Python free-threaded (nogil)
-    mode.  These patches are incompatible with other Triton-based libraries such as
-    fla-core: their Triton kernels crash at runtime (triton/runtime/jit.py, in the
-    JIT-compiled kernel launcher) because the wrapper corrupts the calling convention
-    expected by Triton's own internals.
+    gptqmodel ships ``nogil_patcher.py`` which patches Triton internals at
+    import time (e.g. wrapping ``JITFunction.run`` and possibly other module-
+    level state).  Those patches are incompatible with FLA and any other
+    Triton-based library: their kernels crash at runtime inside the
+    JIT-compiled launcher (``triton/runtime/jit.py``, ``in <lambda>``).
 
-    This context manager takes a snapshot of the JITFunction class dictionary before
-    the guarded block and restores any attribute that gptqmodel's patcher changed, so
-    that FLA (and any other Triton user) continues to work correctly after gptqmodel
-    has been imported.
+    Two complementary defences are applied:
+
+    1. **Import stub** (primary) — before gptqmodel is imported we install a
+       no-op stub for ``gptqmodel.utils.nogil_patcher`` in ``sys.modules``.
+       Because Python only executes a module's code once (subsequent imports
+       hit the cache), the real patcher code is *never* executed.  The stub
+       persists after the context exits so it also protects later imports such
+       as ``auto_round_extension.triton.*`` that may also trigger gptqmodel
+       imports.  A custom ``__getattr__`` ensures any attribute (function,
+       class, …) imported from the stub returns a harmless no-op.
+
+    2. **Class-dict snapshot** (belt-and-suspenders) — we also take a snapshot
+       of ``JITFunction``'s class dict before the block and, on exit, restore
+       any attribute that was changed *and* delete any that were newly added.
+       This handles the case where gptqmodel was already in ``sys.modules``
+       before the stub could be installed (e.g. imported by another code path).
     """
+    import sys
+    import types
+
+    # ── Defence 1: stub out the patcher before gptqmodel is imported ─────────
+    _PATCHER_KEY = "gptqmodel.utils.nogil_patcher"
+    if _PATCHER_KEY not in sys.modules:
+        class _NoOpModule(types.ModuleType):
+            """Module stub whose every attribute is a harmless no-op callable."""
+            def __getattr__(self, name):
+                return lambda *_a, **_kw: None
+
+        # Keep the stub permanently so it also covers later imports that
+        # transitively import gptqmodel (e.g. auto_round_extension.triton.*).
+        sys.modules[_PATCHER_KEY] = _NoOpModule(_PATCHER_KEY)
+
+    # ── Defence 2: snapshot JITFunction class dict ────────────────────────────
     _JITFunction = None
     _saved = {}
     try:
         from triton.runtime.jit import JITFunction as _JITFunction
-        # Shallow copy is sufficient: gptqmodel's patcher replaces attributes
-        # (assigns new function objects) rather than mutating them in-place.
         _saved = dict(vars(_JITFunction))
     except ImportError:
         pass
@@ -35,13 +60,20 @@ def _protect_triton_jit():
         yield
     finally:
         if _JITFunction is not None:
-            current = vars(_JITFunction)
+            current = dict(vars(_JITFunction))
+            # Restore attributes that were changed by the patcher.
             for attr, original_val in _saved.items():
                 if current.get(attr) is not original_val:
                     try:
                         setattr(_JITFunction, attr, original_val)
                     except (AttributeError, TypeError):
                         pass
+            # Delete attributes that were *added* by the patcher.
+            for attr in set(current) - set(_saved):
+                try:
+                    delattr(_JITFunction, attr)
+                except (AttributeError, TypeError):
+                    pass
 
 
 @contextlib.contextmanager
