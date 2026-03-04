@@ -304,7 +304,10 @@ def _w2_int4_reduce_kernel(
 
     weighted = acc * weight
     y_ptrs = Y_ptr + tid * sy_m + offs_n * sy_n
-    tl.atomic_add(y_ptrs, weighted.to(X_ptr.dtype.element_ty), mask=mask_n)
+    # Y_ptr is always float32 (see fused_experts_int4_impl); weighted is already float32.
+    # Avoid casting to bfloat16/float16 here: tl.atomic_add with sub-32-bit floats uses
+    # CAS emulation that is not reliable across all GPU architectures / Triton versions.
+    tl.atomic_add(y_ptrs, weighted, mask=mask_n)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +416,10 @@ def fused_experts_int4_impl(
     )
 
     # ── W2: down projection + weighted reduce → output ────────────────────
-    final_output = torch.zeros((M, H), device=device, dtype=dtype)
+    # Accumulate in float32 to avoid tl.atomic_add with bfloat16/float16 pointers,
+    # which uses CAS emulation and can fail on some Triton/GPU combinations.
+    # Cast back to the original dtype after the kernel.
+    final_output = torch.zeros((M, H), device=device, dtype=torch.float32)
 
     grid_w2 = (num_pairs, triton.cdiv(H, BLOCK_N))
     _w2_int4_reduce_kernel[grid_w2](
@@ -455,4 +461,4 @@ def fused_experts_int4_impl(
         num_pairs=num_pairs,
     )
 
-    return final_output
+    return final_output.to(dtype)
