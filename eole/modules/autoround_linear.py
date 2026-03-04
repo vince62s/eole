@@ -30,10 +30,6 @@ def _suppress_all_output():
         os.close(saved_stderr)
 
 
-_MARLIN_OUT_FEATURES_MULTIPLE = 64  # Marlin kernel requires out_features % 64 == 0
-_MARLIN_IN_FEATURES_MULTIPLE = 128  # Marlin kernel requires in_features % 128 == 0
-
-
 def replace_autoround_linear(
     model, module_to_convert=[], w_bit=4, group_size=128, packing_format="auto_round:auto_gptq", sym=True,
     module_to_not_convert=[]
@@ -52,24 +48,12 @@ def replace_autoround_linear(
     For Marlin layers, call post_init_autoround_linear(model) after loading the weights
     to repack them into the Marlin-optimized layout.
 
-    Marlin alignment constraints: out_features must be divisible by 64 and in_features
-    by 128.  Layers that do not satisfy these constraints are silently replaced with the
-    next available backend (Triton or PyTorch) while the rest of the model still uses
-    the faster Marlin kernels.
-
     module_to_not_convert: list of module names (direct children) whose entire subtree
         should be skipped.  Use this for parent modules that were kept in fp16 during
         quantization (e.g. ``shared_experts`` in MoE models).
     """
     use_gptq_zp = "gptq" in packing_format
     QuantLinear, use_marlin = _get_autoround_quant_linear_cls(use_gptq_zp, sym)
-
-    # Pre-compute a non-Marlin fallback class for layers whose dimensions don't
-    # satisfy Marlin's alignment requirements (out_features % 64 == 0,
-    # in_features % 128 == 0).  This is a no-op when use_marlin is False.
-    fallback_cls = None
-    if use_marlin:
-        fallback_cls, _ = _get_autoround_quant_linear_cls(use_gptq_zp, sym=False)
 
     for name, module in model.named_children():
         if name in module_to_not_convert:
@@ -78,12 +62,7 @@ def replace_autoround_linear(
             replace_autoround_linear(module, module_to_convert, w_bit, group_size, packing_format, sym, module_to_not_convert)
 
         if isinstance(module, nn.Linear) and name in module_to_convert:
-            marlin_ok = (
-                use_marlin
-                and module.out_features % _MARLIN_OUT_FEATURES_MULTIPLE == 0
-                and module.in_features % _MARLIN_IN_FEATURES_MULTIPLE == 0
-            )
-            if marlin_ok:
+            if use_marlin:
                 new_module = QuantLinear(
                     bits=w_bit,
                     group_size=group_size,
@@ -93,81 +72,16 @@ def replace_autoround_linear(
                     out_features=module.out_features,
                     bias=module.bias is not None,
                 )
-                model._modules[name] = new_module
-            elif use_marlin:
-                # Marlin alignment not satisfied — use fallback backend for this layer
-                logging.getLogger(__name__).debug(
-                    "Layer %s (in=%d, out=%d) does not meet Marlin alignment requirements; "
-                    "using fallback backend for this layer.",
-                    name, module.in_features, module.out_features,
-                )
-                model._modules[name] = fallback_cls(
-                    bits=w_bit,
-                    group_size=group_size,
-                    infeatures=module.in_features,
-                    outfeatures=module.out_features,
-                    bias=module.bias is not None,
-                )
             else:
-                model._modules[name] = QuantLinear(
+                new_module = QuantLinear(
                     bits=w_bit,
                     group_size=group_size,
                     infeatures=module.in_features,
                     outfeatures=module.out_features,
                     bias=module.bias is not None,
                 )
+            model._modules[name] = new_module
     return model
-
-
-def _check_marlin_shape_consistency(name, module):
-    """Detect the shape mismatch that triggers gptq_marlin_repack's CUDA assertion.
-
-    The gptq_marlin_repack CUDA kernel (see gptqmodel_ext/marlin/gptq_marlin_repack.cu)
-    checks::
-
-        TORCH_CHECK((size_k / pack_factor) == b_q_weight.size(0),
-                    "Shape mismatch: b_q_weight.size(0) = ", ...)
-
-    where ``size_k = self.in_features`` and ``b_q_weight = self.qweight``.  The
-    check fails when the model config's ``in_features`` is inconsistent with the
-    packed qweight shape actually stored in the checkpoint — i.e. when the Marlin
-    module was constructed for ``in_features=A`` but the loaded qweight implies
-    ``in_features=B`` (because ``qweight.size(0) * pack_factor == B != A``).
-
-    Raising a clear ValueError here lets the user identify the config/checkpoint
-    mismatch before the cryptic CUDA assertion fires inside the kernel.
-    """
-    qweight = getattr(module, "qweight", None)
-    pack_factor = getattr(module, "pack_factor", None)
-    in_features = getattr(module, "in_features", None)
-    if (
-        qweight is not None
-        and pack_factor is not None
-        and in_features is not None
-        and qweight.dim() == 2
-        and qweight.size(0) != in_features // pack_factor
-    ):
-        checkpoint_in_features = qweight.size(0) * pack_factor
-        # Mention GatedDeltaNet-specific fields only for layers that belong to
-        # a linear_attn block (in_proj_* / out_proj), where the mismatch is most
-        # commonly caused by wrong linear_num_*_heads or linear_*_head_dim values.
-        extra = ""
-        if any(pat in name for pat in ("in_proj", "out_proj")):
-            extra = (
-                " For GatedDeltaNet (linear_attn) layers check "
-                "linear_num_key_heads, linear_key_head_dim, "
-                "linear_num_value_heads and linear_value_head_dim."
-            )
-        raise ValueError(
-            f"Marlin shape mismatch for layer '{name}': "
-            f"qweight.size(0)={qweight.size(0)} but "
-            f"in_features // pack_factor = {in_features} // {pack_factor} = "
-            f"{in_features // pack_factor}. "
-            f"The model config implies in_features={in_features} but the loaded "
-            f"checkpoint implies in_features={checkpoint_in_features}. "
-            f"Ensure the model architecture config (hidden_size) matches the "
-            f"quantized checkpoint.{extra}"
-        )
 
 
 def post_init_autoround_linear(model):
@@ -182,7 +96,6 @@ def post_init_autoround_linear(model):
         module_cls = type(module)
         module_pkg = getattr(module_cls, "__module__", "") or ""
         if module_pkg.startswith("auto_round_extension") and hasattr(module, "post_init"):
-            _check_marlin_shape_consistency(name, module)
             module.post_init()
         else:
             # Recurse into containers that are not themselves QuantLinear modules.
@@ -238,3 +151,4 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True):
         return QuantLinear, False
     except ImportError:
         raise ImportError("Install auto-round to use autoround quantized models")
+

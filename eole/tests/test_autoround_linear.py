@@ -3,13 +3,8 @@
 These tests use lightweight mock objects so they run without gptqmodel or
 auto_round_extension installed.  They verify:
 
-1. Marlin alignment checks in replace_autoround_linear
-   (out_features % 64, in_features % 128).
-2. _check_marlin_shape_consistency detects the specific condition that
-   triggers gptq_marlin_repack's "Shape mismatch" CUDA assertion:
-   qweight.size(0) != in_features // pack_factor.
-3. post_init_autoround_linear calls post_init() on each auto_round module
-   and propagates exceptions (including the clear ValueError from step 2).
+1. replace_autoround_linear replaces nn.Linear with the chosen QuantLinear.
+2. post_init_autoround_linear calls post_init() on each auto_round module.
 """
 import math
 import unittest
@@ -78,41 +73,28 @@ def _make_model_with_marlin(bits=4, group_size=128,
 # Test cases
 # ---------------------------------------------------------------------------
 
-class TestMarlinAlignmentCheck(unittest.TestCase):
-    """replace_autoround_linear must use fallback for non-aligned layers."""
+class TestReplaceAutoroundLinear(unittest.TestCase):
+    """replace_autoround_linear replaces nn.Linear with the chosen backend."""
 
-    def _run_replace(self, in_features, out_features):
-        """Call replace_autoround_linear with mocked QuantLinear classes."""
+    def _run_replace(self, in_features, out_features, use_marlin=True):
+        """Call replace_autoround_linear with a mocked QuantLinear class."""
         from eole.modules.autoround_linear import replace_autoround_linear
 
         linear = nn.Linear(in_features, out_features, bias=False)
         container = nn.Module()
         container.add_module("proj", linear)
 
-        marlin_created = []
-        fallback_created = []
+        created = []
 
-        def marlin_factory(**kwargs):
+        def factory(**kwargs):
             m = MagicMock()
-            marlin_created.append(kwargs)
+            created.append(kwargs)
             return m
 
-        def fallback_factory(**kwargs):
-            f = MagicMock()
-            fallback_created.append(kwargs)
-            return f
+        quant_cls = MagicMock(side_effect=factory)
 
-        marlin_cls = MagicMock(side_effect=marlin_factory)
-        fb_cls = MagicMock(side_effect=fallback_factory)
-
-        with (
-            patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls,
-        ):
-            # First call returns Marlin, second returns fallback
-            mock_get_cls.side_effect = [
-                (marlin_cls, True),  # Marlin selection
-                (fb_cls, False),     # fallback selection
-            ]
+        with patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls:
+            mock_get_cls.return_value = (quant_cls, use_marlin)
             replace_autoround_linear(
                 container,
                 module_to_convert=["proj"],
@@ -122,90 +104,50 @@ class TestMarlinAlignmentCheck(unittest.TestCase):
                 sym=True,
             )
 
-        return marlin_created, fallback_created
+        return created
 
-    def test_aligned_layer_uses_marlin(self):
-        """A layer with out_features % 64 == 0 and in_features % 128 == 0 → Marlin."""
-        marlin_created, fallback_created = self._run_replace(2048, 8192)
-        self.assertEqual(len(marlin_created), 1)
-        self.assertEqual(len(fallback_created), 0)
+    def test_marlin_backend_replaces_linear(self):
+        """When Marlin is selected, the layer is replaced with Marlin QuantLinear."""
+        created = self._run_replace(2048, 8192, use_marlin=True)
+        self.assertEqual(len(created), 1)
+        self.assertIn("in_features", created[0])
+        self.assertEqual(created[0]["in_features"], 2048)
 
-    def test_out_features_not_divisible_by_64_uses_fallback(self):
-        """out_features not divisible by 64 → fallback, not Marlin."""
-        marlin_created, fallback_created = self._run_replace(2048, 100)
-        self.assertEqual(len(marlin_created), 0)
-        self.assertEqual(len(fallback_created), 1)
+    def test_non_marlin_backend_replaces_linear(self):
+        """When a non-Marlin backend is selected, the layer is also replaced."""
+        created = self._run_replace(2048, 8192, use_marlin=False)
+        self.assertEqual(len(created), 1)
+        self.assertIn("infeatures", created[0])
+        self.assertEqual(created[0]["infeatures"], 2048)
 
-    def test_in_features_not_divisible_by_128_uses_fallback(self):
-        """in_features not divisible by 128 → fallback."""
-        marlin_created, fallback_created = self._run_replace(100, 8192)
-        self.assertEqual(len(marlin_created), 0)
-        self.assertEqual(len(fallback_created), 1)
+    def test_module_to_not_convert_is_skipped(self):
+        """Modules listed in module_to_not_convert are not replaced."""
+        from eole.modules.autoround_linear import replace_autoround_linear
 
+        linear = nn.Linear(128, 128, bias=False)
+        container = nn.Module()
+        container.add_module("proj", linear)
 
-class TestCheckMarlinShapeConsistency(unittest.TestCase):
-    """_check_marlin_shape_consistency detects the root cause of Marlin 'Shape mismatch'.
+        with patch("eole.modules.autoround_linear._get_autoround_quant_linear_cls") as mock_get_cls:
+            quant_cls = MagicMock(return_value=MagicMock())
+            mock_get_cls.return_value = (quant_cls, False)
+            replace_autoround_linear(
+                container,
+                module_to_convert=["proj"],
+                module_to_not_convert=["proj"],
+            )
 
-    The gptq_marlin_repack CUDA kernel raises:
-        "Shape mismatch: b_q_weight.size(0) = X, size_k = Y, pack_factor = Z"
-    when qweight.size(0) != in_features // pack_factor.  This test verifies that
-    _check_marlin_shape_consistency detects that condition before the kernel fires.
-    """
-
-    def _make_module(self, in_features, out_features, bits=4, qweight_rows=None):
-        """Create a fake Marlin-like module with configurable qweight shape."""
-        mod = nn.Module()
-        pack_factor = 32 // bits
-        rows = qweight_rows if qweight_rows is not None else in_features // pack_factor
-        mod.register_buffer("qweight", torch.zeros(rows, out_features, dtype=torch.int32))
-        mod.in_features = in_features
-        mod.out_features = out_features
-        mod.pack_factor = pack_factor
-        return mod
-
-    def test_consistent_shape_no_error(self):
-        """No exception when qweight.size(0) == in_features // pack_factor."""
-        from eole.modules.autoround_linear import _check_marlin_shape_consistency
-        mod = self._make_module(2048, 8192)
-        # Should not raise
-        _check_marlin_shape_consistency("proj", mod)
-
-    def test_mismatch_raises_value_error(self):
-        """ValueError raised when qweight.size(0) != in_features // pack_factor."""
-        from eole.modules.autoround_linear import _check_marlin_shape_consistency
-        # Model config says in_features=4096 (pack_factor=8 → expected rows=512)
-        # but the checkpoint has qweight with only 256 rows (implying in_features=2048)
-        mod = self._make_module(in_features=4096, out_features=8192, qweight_rows=256)
-        with self.assertRaises(ValueError) as ctx:
-            _check_marlin_shape_consistency("in_proj_qkv", mod)
-        msg = str(ctx.exception)
-        self.assertIn("Marlin shape mismatch", msg)
-        self.assertIn("in_proj_qkv", msg)
-        self.assertIn("in_features=4096", msg)
-        self.assertIn("in_features=2048", msg)  # checkpoint-implied value
-
-    def test_mismatch_error_mentions_config_fields(self):
-        """Error message hints at which config fields to check."""
-        from eole.modules.autoround_linear import _check_marlin_shape_consistency
-        mod = self._make_module(in_features=4096, out_features=8192, qweight_rows=256)
-        with self.assertRaises(ValueError) as ctx:
-            _check_marlin_shape_consistency("in_proj_qkv", mod)
-        msg = str(ctx.exception)
-        self.assertIn("hidden_size", msg)
-        self.assertIn("linear_num_key_heads", msg)
-
-    def test_missing_attributes_no_error(self):
-        """Modules without qweight/pack_factor/in_features are silently skipped."""
-        from eole.modules.autoround_linear import _check_marlin_shape_consistency
-        mod = nn.Module()  # no qweight, no pack_factor, no in_features
-        _check_marlin_shape_consistency("layer", mod)  # must not raise
+        # proj was in both lists — to_not_convert takes precedence at the parent level,
+        # but since the container itself is the parent we pass module_to_not_convert at
+        # that parent level; verify the original nn.Linear is still in place.
+        self.assertIsInstance(container.proj, nn.Linear)
 
 
 class TestPostInitAutoround(unittest.TestCase):
-    """post_init_autoround_linear must call post_init() and propagate exceptions."""
+    """post_init_autoround_linear must call post_init() on auto_round modules."""
 
-    def test_successful_post_init_repacks_in_place(self):
-        """When post_init succeeds, qweight is modified in-place (Marlin format)."""
+    def test_post_init_called_on_auto_round_module(self):
+        """post_init() is called and qweight is modified in-place."""
         from eole.modules.autoround_linear import post_init_autoround_linear
 
         model = _make_model_with_marlin()
@@ -214,25 +156,20 @@ class TestPostInitAutoround(unittest.TestCase):
 
         post_init_autoround_linear(model)
 
-        # After successful post_init, FakeMarlinModule.post_init sets qweight to 42
+        # FakeMarlinModule.post_init sets qweight to 42
         self.assertTrue((model.block.proj.qweight == 42).all())
-        # Module is still the Marlin type (not replaced)
         self.assertIsInstance(model.block.proj, _FakeMarlinModule)
 
-    def test_shape_mismatch_raises_clear_error(self):
-        """A shape mismatch between in_features and qweight raises a clear ValueError."""
+    def test_non_auto_round_modules_are_skipped(self):
+        """Regular nn.Module containers are recursed into but not called."""
         from eole.modules.autoround_linear import post_init_autoround_linear
 
-        model = _make_model_with_marlin(in_features=4096, out_features=8192)
-        proj = model.block.proj
-        # Simulate a checkpoint mismatch: replace qweight with fewer rows
-        # (as if the checkpoint was quantized from a model with in_features=2048)
-        proj.register_buffer("qweight", torch.zeros(256, 8192, dtype=torch.int32))
-
-        with self.assertRaises(ValueError) as ctx:
-            post_init_autoround_linear(model)
-        self.assertIn("Marlin shape mismatch", str(ctx.exception))
+        # A plain container with no auto_round modules — should not raise
+        model = _Container()
+        model.add_module("linear", nn.Linear(16, 16))
+        post_init_autoround_linear(model)  # must not raise
 
 
 if __name__ == "__main__":
     unittest.main()
+
