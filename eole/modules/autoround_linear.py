@@ -16,39 +16,75 @@ def _protect_triton_jit():
     Triton-based library: their kernels crash at runtime inside the
     JIT-compiled launcher (``triton/runtime/jit.py``, ``in <lambda>``).
 
-    Two complementary defences are applied:
+    Three complementary defences are applied:
 
-    1. **Import stub** (primary) — before gptqmodel is imported we install a
-       no-op stub for ``gptqmodel.utils.nogil_patcher`` in ``sys.modules``.
-       Because Python only executes a module's code once (subsequent imports
-       hit the cache), the real patcher code is *never* executed.  The stub
-       persists after the context exits so it also protects later imports such
-       as ``auto_round_extension.triton.*`` that may also trigger gptqmodel
-       imports.  A custom ``__getattr__`` ensures any attribute (function,
-       class, …) imported from the stub returns a harmless no-op.
+    1. **nogil_patcher stub** (primary) — before gptqmodel is imported we
+       install a no-op stub for ``gptqmodel.utils.nogil_patcher`` in
+       ``sys.modules``.  gptqmodel's ``__init__.py`` calls
+       ``patch_triton_autotuner()`` which replaces ``Autotuner.run`` on the
+       Triton ``Autotuner`` CLASS.  FLA creates ``Autotuner`` instances before
+       gptqmodel is imported; the patched ``run()`` then accesses
+       ``self._cache_lock``, which those pre-existing instances do not have,
+       causing an ``AttributeError`` that propagates as a Triton JIT crash.
+       The stub's ``__getattr__`` returns a harmless no-op for every attribute
+       so both ``patch_safetensors_save_file()`` and ``patch_triton_autotuner()``
+       become no-ops.  The stub is kept permanently so later imports of
+       ``auto_round_extension.triton.*`` are also protected.
 
-    2. **Class-dict snapshot** (belt-and-suspenders) — we also take a snapshot
+    2. **threadx stub** — gptqmodel creates a global ``DEVICE_THREAD_POOL``
+       (``DeviceThreadPool``) at import time.  This pool spawns daemon threads
+       for each visible device; each thread's first action is to run a warmup
+       function (``run_torch_linalg_warmup``).  On some systems that warmup
+       raises an exception; gptqmodel's ``_abort_process`` then calls
+       ``os._exit(1)``, killing the entire Python process mid-inference.
+       We pre-install a no-op stub for ``gptqmodel.utils.threadx`` that
+       provides ``DeviceThreadPool`` as a class whose ``__init__`` is a no-op.
+       No daemon threads are ever spawned.  The Marlin layer's ``forward()``
+       calls the CUDA kernel directly without going through the thread pool, so
+       inference correctness is completely unaffected.
+
+    3. **Class-dict snapshot** (belt-and-suspenders) — we also take a snapshot
        of ``JITFunction``'s class dict before the block and, on exit, restore
        any attribute that was changed *and* delete any that were newly added.
        This handles the case where gptqmodel was already in ``sys.modules``
-       before the stub could be installed (e.g. imported by another code path).
+       before the stubs could be installed (e.g. imported by another code path).
     """
     import sys
     import types
 
-    # ── Defence 1: stub out the patcher before gptqmodel is imported ─────────
+    # ── Defence 1: stub out the nogil patcher ────────────────────────────────
     _PATCHER_KEY = "gptqmodel.utils.nogil_patcher"
     if _PATCHER_KEY not in sys.modules:
-        class _NoOpModule(types.ModuleType):
+        class _NoOpPatcherModule(types.ModuleType):
             """Module stub whose every attribute is a harmless no-op callable."""
             def __getattr__(self, name):
                 return lambda *_a, **_kw: None
 
-        # Keep the stub permanently so it also covers later imports that
-        # transitively import gptqmodel (e.g. auto_round_extension.triton.*).
-        sys.modules[_PATCHER_KEY] = _NoOpModule(_PATCHER_KEY)
+        # Keep permanently so later imports (auto_round_extension.triton.*)
+        # that also pull in gptqmodel are also protected.
+        sys.modules[_PATCHER_KEY] = _NoOpPatcherModule(_PATCHER_KEY)
 
-    # ── Defence 2: snapshot JITFunction class dict ────────────────────────────
+    # ── Defence 2: stub out the threadx DeviceThreadPool ─────────────────────
+    _THREADX_KEY = "gptqmodel.utils.threadx"
+    if _THREADX_KEY not in sys.modules:
+        class _NoOpDeviceThreadPool:
+            """No-op stub: accepts any constructor args but spawns no threads."""
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def __getattr__(self, name):
+                return lambda *_a, **_kw: None
+
+        class _ThreadxStub(types.ModuleType):
+            """Module stub for gptqmodel.utils.threadx."""
+            DeviceThreadPool = _NoOpDeviceThreadPool
+
+            def __getattr__(self, name):
+                return lambda *_a, **_kw: None
+
+        sys.modules[_THREADX_KEY] = _ThreadxStub(_THREADX_KEY)
+
+    # ── Defence 3: snapshot JITFunction class dict ────────────────────────────
     _JITFunction = None
     _saved = {}
     try:

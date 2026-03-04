@@ -230,7 +230,7 @@ class TestPostInitAutoround(unittest.TestCase):
 
 
 class TestProtectTritonJit(unittest.TestCase):
-    """_protect_triton_jit prevents gptqmodel's nogil_patcher from patching Triton."""
+    """_protect_triton_jit prevents gptqmodel's side effects from breaking Triton."""
 
     # ------------------------------------------------------------------
     # Helper: inject / remove fake triton modules around a test
@@ -258,10 +258,19 @@ class TestProtectTritonJit(unittest.TestCase):
             else:
                 sys.modules[key] = val
 
+    @staticmethod
+    def _restore_or_remove_module(key, saved):
+        """Restore ``key`` in sys.modules to ``saved``, or pop it if ``saved`` is None."""
+        import sys
+        if saved is not None:
+            sys.modules[key] = saved
+        else:
+            sys.modules.pop(key, None)
+
     # ------------------------------------------------------------------
-    # Defence 1: stub prevents the patcher from running
+    # Defence 1: nogil_patcher stub
     # ------------------------------------------------------------------
-    def test_stub_installed_before_yield(self):
+    def test_nogil_patcher_stub_installed_before_yield(self):
         """A no-op stub for gptqmodel.utils.nogil_patcher is in sys.modules
         inside the block so that any gptqmodel import finds it there."""
         import sys
@@ -281,15 +290,9 @@ class TestProtectTritonJit(unittest.TestCase):
                 self.assertIsNone(noop(),
                                   "stub callables must return None (no-op)")
         finally:
-            # Clean up: restore or remove the key
-            if saved_stub is not None:
-                sys.modules[_KEY] = saved_stub
-            # Note: the stub may still be present — that is intentional
-            # (it protects later imports).  We only clean up for test isolation.
-            else:
-                sys.modules.pop(_KEY, None)
+            self._restore_or_remove_module(_KEY, saved_stub)
 
-    def test_stub_persists_after_context_exit(self):
+    def test_nogil_patcher_stub_persists_after_context_exit(self):
         """The stub remains in sys.modules after the context exits so that
         later imports (e.g. auto_round_extension.triton) are also protected."""
         import sys
@@ -303,13 +306,57 @@ class TestProtectTritonJit(unittest.TestCase):
             self.assertIn(_KEY, sys.modules,
                           "stub must persist after context exit")
         finally:
-            if saved_stub is not None:
-                sys.modules[_KEY] = saved_stub
-            else:
-                sys.modules.pop(_KEY, None)
+            self._restore_or_remove_module(_KEY, saved_stub)
 
     # ------------------------------------------------------------------
-    # Defence 2: save/restore JITFunction class dict (belt-and-suspenders)
+    # Defence 2: threadx DeviceThreadPool stub
+    # ------------------------------------------------------------------
+    def test_threadx_stub_installed_before_yield(self):
+        """A no-op stub for gptqmodel.utils.threadx is in sys.modules
+        inside the block so that gptqmodel finds it before spawning threads."""
+        import sys
+        from eole.modules.autoround_linear import _protect_triton_jit
+
+        _KEY = "gptqmodel.utils.threadx"
+        saved_stub = sys.modules.pop(_KEY, None)
+        try:
+            with _protect_triton_jit():
+                stub = sys.modules.get(_KEY)
+                self.assertIsNotNone(stub,
+                                     "threadx stub must be installed before yield")
+                # DeviceThreadPool must be the no-op class
+                pool_cls = stub.DeviceThreadPool
+                self.assertTrue(callable(pool_cls),
+                                "DeviceThreadPool must be a callable class")
+                # Instantiate: must not spawn any threads
+                import threading
+                before = threading.active_count()
+                pool = pool_cls(workers={"cuda:per": 4}, inference_mode=True)
+                after = threading.active_count()
+                self.assertEqual(
+                    before, after,
+                    "no new threads must be spawned by the stub DeviceThreadPool",
+                )
+        finally:
+            self._restore_or_remove_module(_KEY, saved_stub)
+
+    def test_threadx_stub_persists_after_context_exit(self):
+        """The threadx stub remains in sys.modules after the context exits."""
+        import sys
+        from eole.modules.autoround_linear import _protect_triton_jit
+
+        _KEY = "gptqmodel.utils.threadx"
+        saved_stub = sys.modules.pop(_KEY, None)
+        try:
+            with _protect_triton_jit():
+                pass
+            self.assertIn(_KEY, sys.modules,
+                          "threadx stub must persist after context exit")
+        finally:
+            self._restore_or_remove_module(_KEY, saved_stub)
+
+    # ------------------------------------------------------------------
+    # Defence 3: save/restore JITFunction class dict (belt-and-suspenders)
     # ------------------------------------------------------------------
     def test_changed_attributes_are_restored(self):
         """Attributes changed on JITFunction inside the block are restored."""
@@ -327,9 +374,11 @@ class TestProtectTritonJit(unittest.TestCase):
         original_run = FakeJITFunction.run
         saved_triton = self._install_fake_triton(fake_jit_mod)
 
-        # Ensure stub key is absent so defence-1 installs a fresh stub
+        # Ensure stub keys are absent so the defences install fresh stubs
         _KEY = "gptqmodel.utils.nogil_patcher"
+        _TX_KEY = "gptqmodel.utils.threadx"
         saved_patcher = sys.modules.pop(_KEY, None)
+        saved_threadx = sys.modules.pop(_TX_KEY, None)
         try:
             with _protect_triton_jit():
                 def patched_run(self, *args, **kwargs):
@@ -340,10 +389,8 @@ class TestProtectTritonJit(unittest.TestCase):
                           "run must be restored to its original value")
         finally:
             self._restore_triton(saved_triton)
-            if saved_patcher is not None:
-                sys.modules[_KEY] = saved_patcher
-            else:
-                sys.modules.pop(_KEY, None)
+            self._restore_or_remove_module(_KEY, saved_patcher)
+            self._restore_or_remove_module(_TX_KEY, saved_threadx)
 
     def test_added_attributes_are_deleted(self):
         """Attributes *added* to JITFunction inside the block are deleted."""
@@ -360,7 +407,9 @@ class TestProtectTritonJit(unittest.TestCase):
         saved_triton = self._install_fake_triton(fake_jit_mod)
 
         _KEY = "gptqmodel.utils.nogil_patcher"
+        _TX_KEY = "gptqmodel.utils.threadx"
         saved_patcher = sys.modules.pop(_KEY, None)
+        saved_threadx = sys.modules.pop(_TX_KEY, None)
         try:
             with _protect_triton_jit():
                 # Simulate patcher adding a brand-new attribute
@@ -372,29 +421,27 @@ class TestProtectTritonJit(unittest.TestCase):
             )
         finally:
             self._restore_triton(saved_triton)
-            if saved_patcher is not None:
-                sys.modules[_KEY] = saved_patcher
-            else:
-                sys.modules.pop(_KEY, None)
+            self._restore_or_remove_module(_KEY, saved_patcher)
+            self._restore_or_remove_module(_TX_KEY, saved_threadx)
 
     def test_no_triton_is_noop(self):
-        """_protect_triton_jit is a no-op when triton is not installed."""
+        """_protect_triton_jit is a no-op (JIT snapshot) when triton is not installed."""
         import sys
         from eole.modules.autoround_linear import _protect_triton_jit
 
         saved = sys.modules.pop("triton.runtime.jit", None)
-        _KEY = "gptqmodel.utils.nogil_patcher"
-        saved_patcher = sys.modules.pop(_KEY, None)
+        _PATCHER_KEY = "gptqmodel.utils.nogil_patcher"
+        _THREADX_KEY = "gptqmodel.utils.threadx"
+        saved_patcher = sys.modules.pop(_PATCHER_KEY, None)
+        saved_threadx = sys.modules.pop(_THREADX_KEY, None)
         try:
             with _protect_triton_jit():
                 pass  # must not raise
         finally:
             if saved is not None:
                 sys.modules["triton.runtime.jit"] = saved
-            if saved_patcher is not None:
-                sys.modules[_KEY] = saved_patcher
-            else:
-                sys.modules.pop(_KEY, None)
+            self._restore_or_remove_module(_PATCHER_KEY, saved_patcher)
+            self._restore_or_remove_module(_THREADX_KEY, saved_threadx)
 
 
 if __name__ == "__main__":
