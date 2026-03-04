@@ -224,6 +224,16 @@ class BaseModel(nn.Module):
         """Build a complete model with all components."""
         logger.info("Building model...")
 
+        # When AutoRound quantization is used, gptqmodel must be imported BEFORE
+        # build_blocks() so that gptqmodel's nogil_patcher (which patches the triton
+        # Autotuner class at import time) runs before FLA creates its Autotuner
+        # instances via @triton.autotune decorators.  Calling _preflight_marlin_import()
+        # here mirrors the pattern used by vLLM, which always loads gptqmodel at worker
+        # startup — i.e. before any triton-based attention library is initialised.
+        if getattr(running_config, "quant_type", "") == "autoround":
+            from eole.modules.autoround_linear import _preflight_marlin_import
+            _preflight_marlin_import()
+
         # Build core blocks
         model = cls.build_blocks(model_config, vocabs, running_config=running_config)
         model.share_decoder_embeddings = model_config.share_decoder_embeddings

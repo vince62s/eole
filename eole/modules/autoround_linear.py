@@ -14,15 +14,32 @@ def replace_autoround_linear(
     - Otherwise: qzeros stored directly (direct zero-point).
 
     Backend preference order:
-    1. Triton GPU kernels (requires CUDA + triton) — fast GPU kernels
-    2. PyTorch fallback — works everywhere
+    1. Marlin CUDA kernels (requires CUDA + gptqmodel, sym=True only) — fastest
+    2. Triton GPU kernels (requires CUDA + triton) — fast GPU kernels
+    3. PyTorch fallback — works everywhere
+
+    For Marlin layers, call post_init_autoround_linear(model) after loading the weights
+    to repack them into the Marlin-optimized layout.
+
+    Marlin validates layer dimensions at construction time and raises NotImplementedError
+    for unsupported shapes (e.g. out_features not divisible by 64).  Such layers are
+    replaced with the pure-PyTorch backend, which has no CUDA kernel shape requirements.
 
     module_to_not_convert: list of module names (direct children) whose entire subtree
         should be skipped.  Use this for parent modules that were kept in fp16 during
         quantization (e.g. ``shared_experts`` in MoE models).
     """
     use_gptq_zp = "gptq" in packing_format
-    QuantLinear = _get_autoround_quant_linear_cls(use_gptq_zp)
+    QuantLinear, use_marlin = _get_autoround_quant_linear_cls(use_gptq_zp, sym)
+
+    # Lazily computed fallback class for layers that Marlin rejects.
+    fallback_cls = None
+
+    def _get_fallback():
+        nonlocal fallback_cls
+        if fallback_cls is None:
+            fallback_cls, _ = _get_autoround_quant_linear_cls(use_gptq_zp, force_pytorch=True)
+        return fallback_cls
 
     for name, module in model.named_children():
         if name in module_to_not_convert:
@@ -31,13 +48,34 @@ def replace_autoround_linear(
             replace_autoround_linear(module, module_to_convert, w_bit, group_size, packing_format, sym, module_to_not_convert)
 
         if isinstance(module, nn.Linear) and name in module_to_convert:
-            new_module = QuantLinear(
-                bits=w_bit,
-                group_size=group_size,
-                infeatures=module.in_features,
-                outfeatures=module.out_features,
-                bias=module.bias is not None,
-            )
+            if use_marlin:
+                try:
+                    new_module = QuantLinear(
+                        bits=w_bit,
+                        group_size=group_size,
+                        desc_act=False,
+                        sym=sym,
+                        in_features=module.in_features,
+                        out_features=module.out_features,
+                        bias=module.bias is not None,
+                    )
+                except NotImplementedError:
+                    # Marlin rejected this layer's dimensions — use PyTorch fallback.
+                    new_module = _get_fallback()(
+                        bits=w_bit,
+                        group_size=group_size,
+                        infeatures=module.in_features,
+                        outfeatures=module.out_features,
+                        bias=module.bias is not None,
+                    )
+            else:
+                new_module = QuantLinear(
+                    bits=w_bit,
+                    group_size=group_size,
+                    infeatures=module.in_features,
+                    outfeatures=module.out_features,
+                    bias=module.bias is not None,
+                )
             model._modules[name] = new_module
     return model
 
@@ -45,6 +83,8 @@ def replace_autoround_linear(
 def post_init_autoround_linear(model):
     """Call post_init() on all AutoRound QuantLinear modules in the model.
 
+    Required for Marlin layers: repacks GPTQ-format weights into Marlin's optimized
+    memory layout and pre-allocates the workspace buffer.  No-op for other backends.
     Must be called after weights have been loaded and the model moved to CUDA.
     """
     for name, module in model.named_children():
@@ -57,26 +97,42 @@ def post_init_autoround_linear(model):
             post_init_autoround_linear(module)
 
 
-def _get_autoround_quant_linear_cls(use_gptq_zp: bool):
+def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True, force_pytorch: bool = False):
     """Return the best available QuantLinear class for AutoRound inference.
 
     Preference order:
-    1. Triton kernels (requires CUDA + triton) — fast GPU kernels
-    2. PyTorch fallback — works everywhere
+    1. Marlin CUDA kernels (requires CUDA + gptqmodel, sym=True only) — fastest
+    2. Triton kernels (requires CUDA + triton) — fast GPU kernels
+    3. PyTorch fallback — works everywhere
+
+    IMPORTANT: when Marlin is desired, ensure gptqmodel is imported before any
+    triton-based library (e.g. FLA) creates triton.Autotuner instances.  In eole
+    this is done by calling _preflight_marlin_import() in NNModel.build() before
+    build_blocks() runs.  gptqmodel's nogil_patcher patches Autotuner at import
+    time; if it runs after FLA has already created instances those instances will
+    be missing the _cache_lock attribute the patched run() requires.
 
     Args:
-        use_gptq_zp: use GPTQ-style zero-point packing (affects which variant is imported).
+        use_gptq_zp: use GPTQ-style zero-point packing.
+        sym: when True, try Marlin first.
+        force_pytorch: skip all CUDA-kernel backends; return PyTorch directly.
 
     Returns:
-        QuantLinear class
+        (QuantLinear class, use_marlin: bool)
     """
-    if cuda_is_available():
+    if not force_pytorch and cuda_is_available():
+        if sym:
+            try:
+                from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer
+                return get_marlin_layer(), True
+            except ImportError:
+                pass
         try:
             if use_gptq_zp:
                 from auto_round_extension.triton.qlinear_tritonv2_zp import QuantLinear
             else:
                 from auto_round_extension.triton.qlinear_tritonv2 import QuantLinear
-            return QuantLinear
+            return QuantLinear, False
         except ImportError:
             pass
     # Fallback to pure PyTorch kernels
@@ -85,7 +141,28 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool):
             from auto_round_extension.torch.qlinear_torch_zp import QuantLinear
         else:
             from auto_round_extension.torch.qlinear_torch import QuantLinear
-        return QuantLinear
+        return QuantLinear, False
     except ImportError:
         raise ImportError("Install auto-round to use autoround quantized models")
+
+
+def _preflight_marlin_import():
+    """Import gptqmodel (via auto_round_extension Marlin module) early.
+
+    gptqmodel's __init__.py calls patch_triton_autotuner() at import time, which
+    patches the triton.Autotuner CLASS's run() method to require self._cache_lock.
+    This must happen BEFORE any triton-based library (such as FLA) creates Autotuner
+    instances; otherwise those pre-existing instances will be missing _cache_lock and
+    crash when their run() is called.
+
+    This function is called from NNModel.build() before build_blocks() so that
+    gptqmodel's side effects are applied before FLA's @triton.autotune decorators
+    create Autotuner instances.  It is a no-op when gptqmodel or CUDA are absent.
+    """
+    if not cuda_is_available():
+        return
+    try:
+        from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer  # noqa: F401 — side-effect import: triggers gptqmodel __init__ (and nogil_patcher)
+    except ImportError:
+        pass
 
