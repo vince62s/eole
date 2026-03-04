@@ -1,25 +1,56 @@
+import gc
+import threading
 import torch.nn as nn
 from torch.cuda import is_available as cuda_is_available
 
+_marlin_preflight_done = False
+
 
 def _preflight_marlin_import():
-    """Eagerly import gptqmodel marlin to patch triton.Autotuner before FLA creates instances.
+    """Import gptqmodel marlin and retroactively patch any pre-existing triton.Autotuner instances.
 
-    gptqmodel's nogil_patcher patches triton.Autotuner.run() at import time, adding a
-    _cache_lock attribute.  This must happen before libraries like FLA (used in
-    gated_delta_net.py) create their own triton.Autotuner instances.  Instances created
-    before the patch lack _cache_lock and will crash when the patched run() is called.
+    gptqmodel's nogil_patcher patches triton.Autotuner.__init__ to add a _cache_lock
+    threading.Lock for thread-safe compilation-cache access.  Instances that already exist
+    when gptqmodel is imported (e.g. those created by FLA's @triton.autotune decorators at
+    module-load time, via gated_delta_net.py → fla.modules.convolution) are missing this
+    attribute and will crash when gptqmodel's second thread calls the patched run().
 
-    Call this from NNModel.build() before build_blocks() when quant_type=autoround and
-    autoround_sym=True (the conditions under which the Marlin backend is selected).
-    Safe to call unconditionally: if gptqmodel is not installed it silently does nothing.
+    This function:
+    1. Imports gptqmodel marlin (side effect: patches triton.Autotuner at class level).
+    2. Walks all live Python objects via gc and adds _cache_lock to any Autotuner instance
+       that was created before the patch and is therefore missing the attribute.
+
+    Because retroactive patching is order-independent — it finds and fixes pre-existing
+    instances regardless of when it runs — this function may be called at any point before
+    inference begins, even after triton and FLA have already been imported.
+
+    A module-level flag ensures the gc scan runs at most once per process.
+
+    Safe to call unconditionally: silently returns if gptqmodel is not installed or CUDA
+    is unavailable.
     """
+    global _marlin_preflight_done
+    if _marlin_preflight_done:
+        return
     if not cuda_is_available():
         return
     try:
         from auto_round_extension.cuda.gptqmodel_marlin import get_marlin_layer  # side effect: patches triton.Autotuner
     except ImportError:
+        return
+
+    # Retroactively add _cache_lock to Autotuner instances that predate the patch.
+    # These are typically created by FLA's @triton.autotune decorators at module-load time.
+    try:
+        from triton.runtime.autotuner import Autotuner
+
+        for obj in gc.get_objects():
+            if isinstance(obj, Autotuner) and not hasattr(obj, "_cache_lock"):
+                obj._cache_lock = threading.Lock()
+    except (ImportError, AttributeError):
         pass
+
+    _marlin_preflight_done = True
 
 
 def replace_autoround_linear(
@@ -131,12 +162,11 @@ def _get_autoround_quant_linear_cls(use_gptq_zp: bool, sym: bool = True, force_p
     2. Triton kernels (requires CUDA + triton) — fast GPU kernels
     3. PyTorch fallback — works everywhere
 
-    IMPORTANT: when Marlin is desired, ensure gptqmodel is imported before any
-    triton-based library (e.g. FLA) creates triton.Autotuner instances.  In eole
-    this is done by calling _preflight_marlin_import() in NNModel.build() before
-    build_blocks() runs.  gptqmodel's nogil_patcher patches Autotuner at import
-    time; if it runs after FLA has already created instances those instances will
-    be missing the _cache_lock attribute the patched run() requires.
+    When Marlin is used, gptqmodel's nogil_patcher patches triton.Autotuner with
+    thread-safety locks.  Libraries such as FLA (used in gated_delta_net.py) create
+    Autotuner instances at module-load time and will be missing _cache_lock if
+    gptqmodel was not yet imported.  Call _preflight_marlin_import() before inference
+    to retroactively add _cache_lock to all pre-existing Autotuner instances.
 
     Args:
         use_gptq_zp: use GPTQ-style zero-point packing.
