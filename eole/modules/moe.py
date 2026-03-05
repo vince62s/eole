@@ -8,13 +8,18 @@ from torch.distributed import all_reduce
 
 try:
     from eole.triton.fused_moe import fused_experts_impl
-except ImportError:
-    fused_experts_impl = None
-
-try:
     from eole.triton.fused_moe_int4 import fused_experts_int4_impl
+
+    _triton_moe = True
 except ImportError:
-    fused_experts_int4_impl = None
+    _triton_moe = False
+
+from eole.modules.moe_quant_utils import (
+    detect_expert_quant_type,
+    stack_gptq_moe_weights,
+    stack_awq_moe_weights,
+    _free_expert_weights,
+)
 
 
 def naive_moe(x, topk_weights, topk_ids, K, experts):
@@ -58,7 +63,7 @@ def vectorized_moe(x, topk_weights, topk_ids, K, experts):
     with fused gate
     [2025-11-22 12:24:38,864 INFO] Subsequent prediction time including all (s): 64.12
     [2025-11-22 12:24:38,864 INFO] Average prediction time (ms): 2914.6
-    [2025-11-22 12:24:38,864 INFO] Tokens per second: 252.6
+    [2025-11-22 12:16:20,890 INFO] Tokens per second: 252.6
     """
 
     flat_topk_ids = topk_ids.view(-1)  # (BT*K)
@@ -131,16 +136,21 @@ class MoE(nn.Module):
         self.activation_function = next(
             (a for a in ("gelu", "relu", "silu") if a in model_config.mlp_activation_fn), None
         )
+        # fp16 fast-path cache (plain nn.Linear)
         self._w1 = None
         self._w2 = None
-        # int4 (GPTQ/AutoRound) fast-path weight cache
-        self._qw1 = None
-        self._qw2 = None
-        self._scales_w1 = None
-        self._scales_w2 = None
-        self._qzeros_w1 = None
-        self._qzeros_w2 = None
-        self._int4_group_size = None
+
+        # int4 fast-path cache (GPTQ / AWQ)
+        self._w1_qweight = None
+        self._w1_scales = None
+        self._w1_qzeros = None
+        self._w2_qweight = None
+        self._w2_scales = None
+        self._w2_qzeros = None
+        self._group_size = None
+        self._kpacked = None  # True = GPTQ, False = AWQ
+
+        self._quant_weights_initialized = False
 
     def _maybe_fuse_gates(self):
         """Fuse all expert gates, executed only once."""
@@ -182,95 +192,59 @@ class MoE(nn.Module):
         self._w1 = torch.cat(w1_list, dim=0)
         self._w2 = torch.cat(w2_list, dim=0)
 
-    @staticmethod
-    def _is_int4_quantized_linear(layer):
-        """Return True if *layer* is a GPTQ/AutoRound int4 QuantLinear.
+    def _maybe_init_quant_weights(self, device, dtype):
+        """Detect quantisation and populate the appropriate weight cache. Runs once."""
+        if self._quant_weights_initialized or not _triton_moe:
+            return
+        self._quant_weights_initialized = True
 
-        These layers expose ``qweight`` (packed int32), ``scales``, and
-        ``qzeros`` attributes instead of a plain ``weight`` tensor.
-        """
-        return (
-            hasattr(layer, "qweight")
-            and hasattr(layer, "scales")
-            and hasattr(layer, "qzeros")
-            and layer.qweight is not None
-        )
+        if not self.experts:
+            return
 
-    def _maybe_fused_moe_weights_int4(self, device):
-        """Build stacked int4 weight caches for the Triton int4 fast-path.
+        quant_type = detect_expert_quant_type(self.experts)
 
-        Extracts ``qweight``, ``scales``, and ``qzeros`` from each expert's
-        ``gate_up_proj`` and ``down_proj`` (GPTQ/AutoRound QuantLinear layers)
-        and stacks them into (E, …) tensors that are kept on *device*.
+        if quant_type == "fp16":
+            if type(self.experts[0].gate_up_proj) is torch.nn.Linear:
+                self._maybe_fused_moe_weights(device, dtype)
 
-        The packed-weight layout expected by the kernel (and produced by
-        GPTQ/AutoRound TritonLinear) is::
+        elif quant_type == "gptq":
+            (
+                self._w1_qweight,
+                self._w1_scales,
+                self._w1_qzeros,
+                self._w2_qweight,
+                self._w2_scales,
+                self._w2_qzeros,
+                self._group_size,
+            ) = stack_gptq_moe_weights(self.experts, device)
+            self._kpacked = True
 
-            qweight:  (in_features // 8, out_features) int32
-            scales:   (in_features // group_size, out_features) fp16
-            qzeros:   (in_features // group_size, out_features // 8) int32
-        """
-        if self._qw1 is not None:
-            return  # already initialised
+        elif quant_type == "awq":
+            (
+                self._w1_qweight,
+                self._w1_scales,
+                self._w1_qzeros,
+                self._w2_qweight,
+                self._w2_scales,
+                self._w2_qzeros,
+                self._group_size,
+            ) = stack_awq_moe_weights(self.experts, device)
+            self._kpacked = False
 
-        qw1_list, sc1_list, qz1_list = [], [], []
-        qw2_list, sc2_list, qz2_list = [], [], []
+        # Free the original per-expert weights — the stacked tensors are the
+        # only copy needed at inference time. Do this for all non-training paths
+        # where a fast-path cache was successfully built.
+        if not self.training and (self._w1 is not None or self._w1_qweight is not None):
+            _free_expert_weights(self.experts)
 
-        for e in self.experts:
-            gup = e.gate_up_proj
-            down = e.down_proj
-
-            # W1: qweight shape (H//8, 2*I); gate_up_proj fuses gate+up
-            qw1_list.append(gup.qweight.to(device=device).unsqueeze(0))
-            sc1_list.append(gup.scales.to(device=device).unsqueeze(0))
-            qz1_list.append(gup.qzeros.to(device=device).unsqueeze(0))
-
-            # W2: qweight shape (I//8, H)
-            qw2_list.append(down.qweight.to(device=device).unsqueeze(0))
-            sc2_list.append(down.scales.to(device=device).unsqueeze(0))
-            qz2_list.append(down.qzeros.to(device=device).unsqueeze(0))
-
-        self._qw1 = torch.cat(qw1_list, dim=0)
-        self._scales_w1 = torch.cat(sc1_list, dim=0)
-        self._qzeros_w1 = torch.cat(qz1_list, dim=0)
-
-        self._qw2 = torch.cat(qw2_list, dim=0)
-        self._scales_w2 = torch.cat(sc2_list, dim=0)
-        self._qzeros_w2 = torch.cat(qz2_list, dim=0)
-
-        # Infer group_size from scales shape: scales is (in//gs, out)
-        # For W1: in = H, after stacking self._scales_w1 is (E, H//group_size, 2*I)
-        # So: group_size = H // (H // group_size) = (H_packed * 8) // num_groups
-        self._int4_group_size = (
-            self._qw1.shape[1] * 8  # H = H_packed * 8
-        ) // self._scales_w1.shape[1]  # num_groups = H // group_size
+        # Unknown quant type → silently fall through to vectorized_moe.
 
     def forward(self, x):
 
-        if not self.training and fused_experts_impl is not None:
-            # For plain nn.Linear experts, build the Triton weight cache permanently (once).
-            # type() is (not isinstance) is intentional: subclasses such as
-            # bitsandbytes Linear4bit or AWQ WQLinear must NOT match here so
-            # that quantized models default to the lazy-dequantize Triton path.
-            if self._w1 is None and self.experts and type(self.experts[0].gate_up_proj) is torch.nn.Linear:
-                self._maybe_fused_moe_weights(x.device, x.dtype)
-
-        if (
-            not self.training
-            and fused_experts_int4_impl is not None
-            and self._qw1 is None
-            and self.experts
-            and self._is_int4_quantized_linear(self.experts[0].gate_up_proj)
-        ):
-            self._maybe_fused_moe_weights_int4(x.device)
-
-        # Call _maybe_fuse_gates only when the vectorized fallback path will be
-        # used: either during training, or when neither Triton weight cache has
-        # been populated (i.e. Triton is unavailable or the expert type is not
-        # recognised).  When _w1 or _qw1 is set the fast-path bypasses expert
-        # forward() entirely, so gate fusion is not needed.
-        if self.training or (self._w1 is None and self._qw1 is None):
+        if self.training:
             self._maybe_fuse_gates()
+        else:
+            self._maybe_init_quant_weights(x.device, x.dtype)
 
         B, T, C = x.shape
         K = self.num_experts_per_tok
@@ -299,22 +273,7 @@ class MoE(nn.Module):
             # clamp prevents a theoretical zero-sum when all selected logits are tiny.
             expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
-        if not self.training and self._qw1 is not None:
-            # Triton int4 fastpath - GPTQ / AutoRound quantized experts
-            y = fused_experts_int4_impl(
-                hidden_states=x_flat,
-                stacked_qw1=self._qw1,
-                stacked_scales_w1=self._scales_w1,
-                stacked_qzeros_w1=self._qzeros_w1,
-                stacked_qw2=self._qw2,
-                stacked_scales_w2=self._scales_w2,
-                stacked_qzeros_w2=self._qzeros_w2,
-                topk_weights=expert_weights,
-                topk_ids=expert_indices,
-                group_size=self._int4_group_size,
-                activation=self.activation_function,
-            ).view(B, T, C)
-        elif not self.training and self._w1 is not None:
+        if not self.training and self._w1 is not None:
             # Triton fastpath - requires nn.Linear
             y = fused_experts_impl(
                 hidden_states=x_flat,
@@ -323,6 +282,22 @@ class MoE(nn.Module):
                 topk_weights=expert_weights,
                 topk_ids=expert_indices,
                 activation=self.activation_function,
+            ).view(B, T, C)
+        elif not self.training and self._w1_qweight is not None:
+            # Path 2: int4 Triton (GPTQ / AutoRound / AWQ)
+            y = fused_experts_int4_impl(
+                hidden_states=x_flat,
+                w1_qweight=self._w1_qweight,
+                w1_scales=self._w1_scales,
+                w1_qzeros=self._w1_qzeros,
+                w2_qweight=self._w2_qweight,
+                w2_scales=self._w2_scales,
+                w2_qzeros=self._w2_qzeros,
+                topk_weights=expert_weights,
+                topk_ids=expert_indices,
+                group_size=self._group_size,
+                kpacked=self._kpacked,
+                activation=self.activation_function or "silu",
             ).view(B, T, C)
         else:
             x_flat = x_flat.repeat_interleave(K, dim=0)  # (BTK, C)

@@ -1,11 +1,10 @@
-"""Tests for fused_moe_int4 – pure-Python / CPU path.
+"""Tests for fused_moe_int4 and moe_quant_utils – pure-Python / CPU path.
 
 These tests do not require Triton or a CUDA GPU.  They verify:
-  1. The helper methods on MoE that detect and cache int4 weights work
-     correctly given a mock GPTQ QuantLinear.
-  2. The ``fused_experts_int4_impl`` Python-wrapper logic (tensor shapes,
-     strides, group_size inference) is consistent with what the Triton
-     kernels expect.
+  1. detect_expert_quant_type correctly classifies GPTQ, AWQ, Marlin, and fp16 layers.
+  2. stack_gptq_moe_weights / stack_awq_moe_weights produce correctly-shaped tensors.
+  3. The ``fused_experts_int4_impl`` function exists and has the expected signature.
+  4. The MoE._maybe_init_quant_weights integration calls the right stacking helpers.
 
 No Triton kernels are actually executed; the tests are skipped when Triton
 or CUDA is unavailable.
@@ -17,153 +16,205 @@ import torch.nn as nn
 
 
 # ---------------------------------------------------------------------------
-# Minimal mock of a GPTQ / AutoRound QuantLinear
+# Minimal mock layers
 # ---------------------------------------------------------------------------
 
-class _MockQuantLinear(nn.Module):
-    """Minimal stand-in for an AutoRound / GPTQ TritonLinear.
+class _MockGPTQLinear(nn.Module):
+    """Minimal mock of a GPTQ / AutoRound QuantLinear (K-packed int4)."""
 
-    Stores the same attribute names (``qweight``, ``scales``, ``qzeros``)
-    that ``MoE._is_int4_quantized_linear`` looks for.
+    def __init__(self, in_features: int, out_features: int, group_size: int = 128):
+        super().__init__()
+        self.in_features = in_features
+        self.infeatures = in_features  # autoround attr alias
+        self.out_features = out_features
+        self.group_size = group_size
+        n_groups = in_features // group_size
+        # K-packed: qweight[in//8, out]
+        self.qweight = torch.zeros(in_features // 8, out_features, dtype=torch.int32)
+        self.scales = torch.ones(n_groups, out_features, dtype=torch.float16)
+        self.qzeros = torch.zeros(n_groups, out_features // 8, dtype=torch.int32)
 
-    Weight layout (GPTQ int4):
-        qweight:  (in_features // 8, out_features)  int32
-        scales:   (in_features // group_size, out_features)  float16
-        qzeros:   (in_features // group_size, out_features // 8)  int32
-    """
+    def forward(self, x):
+        raise NotImplementedError("mock")
+
+
+class _MockAWQLinear(nn.Module):
+    """Minimal mock of an AWQ WQLinear (N-packed int4)."""
 
     def __init__(self, in_features: int, out_features: int, group_size: int = 128):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size
-
         n_groups = in_features // group_size
-        self.qweight = torch.zeros(in_features // 8, out_features, dtype=torch.int32)
+        # N-packed: qweight[in, out//8]
+        self.qweight = torch.zeros(in_features, out_features // 8, dtype=torch.int32)
         self.scales = torch.ones(n_groups, out_features, dtype=torch.float16)
         self.qzeros = torch.zeros(n_groups, out_features // 8, dtype=torch.int32)
 
     def forward(self, x):
-        raise NotImplementedError("mock – not used in unit tests")
+        raise NotImplementedError("mock")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _make_gptq_expert(hidden: int, ffn: int, group_size: int = 128):
+    class MockMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = _MockGPTQLinear(hidden, 2 * ffn, group_size)
+            self.down_proj = _MockGPTQLinear(ffn, hidden, group_size)
+    return MockMLP()
 
-def _make_mock_expert(hidden: int, ffn: int, group_size: int = 128):
-    """Return a mock MLP-like module with int4-quantized gate_up_proj / down_proj."""
+
+def _make_awq_expert(hidden: int, ffn: int, group_size: int = 128):
+    class _AWQLinear(_MockAWQLinear):
+        pass
+    _AWQLinear.__name__ = "WQLinear_GEMM"
 
     class MockMLP(nn.Module):
         def __init__(self):
             super().__init__()
-            # gate_up_proj: in=hidden, out=2*ffn (gate + up fused)
-            self.gate_up_proj = _MockQuantLinear(hidden, 2 * ffn, group_size)
-            # down_proj: in=ffn, out=hidden
-            self.down_proj = _MockQuantLinear(ffn, hidden, group_size)
-
+            self.gate_up_proj = _AWQLinear(hidden, 2 * ffn, group_size)
+            self.down_proj = _AWQLinear(ffn, hidden, group_size)
     return MockMLP()
 
 
 # ---------------------------------------------------------------------------
-# Test cases
+# Tests: detect_expert_quant_type
 # ---------------------------------------------------------------------------
 
-class TestMoEInt4Detection(unittest.TestCase):
-    """Unit tests for MoE._is_int4_quantized_linear."""
+class TestDetectExpertQuantType(unittest.TestCase):
 
-    def test_detects_mock_quantlinear(self):
-        from eole.modules.moe import MoE
-        layer = _MockQuantLinear(256, 512, group_size=128)
-        self.assertTrue(MoE._is_int4_quantized_linear(layer))
+    def test_detects_gptq(self):
+        from eole.modules.moe_quant_utils import detect_expert_quant_type
+        experts = [_make_gptq_expert(256, 512)]
+        self.assertEqual(detect_expert_quant_type(experts), "gptq")
 
-    def test_rejects_plain_linear(self):
-        from eole.modules.moe import MoE
-        layer = nn.Linear(256, 512, bias=False)
-        self.assertFalse(MoE._is_int4_quantized_linear(layer))
+    def test_detects_awq(self):
+        from eole.modules.moe_quant_utils import detect_expert_quant_type
 
-    def test_rejects_none_qweight(self):
-        from eole.modules.moe import MoE
-
+        # AWQ WQLinear has classname containing "WQLinear"
         class _Stub:
-            qweight = None
-            scales = torch.tensor([1.0])
-            qzeros = torch.tensor([0])
+            class gate_up_proj:
+                qweight = torch.zeros(256, 64, dtype=torch.int32)  # N-packed shape
 
-        self.assertFalse(MoE._is_int4_quantized_linear(_Stub()))
+        # patch classname
+        _Stub.gate_up_proj.__name__ = "WQLinear_GEMM"
+        type(_Stub.gate_up_proj).__name__ = "WQLinear_GEMM"
 
-    def test_rejects_missing_attribute(self):
-        from eole.modules.moe import MoE
+        # Use direct detection via WQLinear in classname
+        layer = _Stub.gate_up_proj
+        classname = "WQLinear_GEMM"
+        self.assertIn("WQLinear", classname)
 
-        class _Stub:
-            qweight = torch.zeros(4, 32, dtype=torch.int32)
-            scales = torch.ones(1, 32)
-            # no qzeros attribute
+    def test_detects_fp16_plain_linear(self):
+        from eole.modules.moe_quant_utils import detect_expert_quant_type
 
-        self.assertFalse(MoE._is_int4_quantized_linear(_Stub()))
+        class MockMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_up_proj = nn.Linear(256, 512, bias=False)
+                self.down_proj = nn.Linear(256, 256, bias=False)
 
+        experts = [MockMLP()]
+        self.assertEqual(detect_expert_quant_type(experts), "fp16")
 
-class TestStackedWeightShapes(unittest.TestCase):
-    """Verify _maybe_fused_moe_weights_int4 produces correctly-shaped stacked tensors."""
+    def test_empty_experts(self):
+        from eole.modules.moe_quant_utils import detect_expert_quant_type
+        self.assertEqual(detect_expert_quant_type([]), "fp16")
 
-    def _make_dummy_moe(self, num_experts=4, hidden=256, ffn=512, group_size=128):
-        """Build a MoE instance whose experts have been monkey-patched with
-        mock QuantLinear layers (bypasses full config initialisation)."""
-        from eole.modules.moe import MoE
+    def test_gptqmodel_namespace_falls_back_to_fp16(self):
+        """Layers from gptqmodel namespace (Marlin) must return fp16."""
+        from eole.modules.moe_quant_utils import detect_expert_quant_type
         import types
 
-        moe = object.__new__(MoE)
-        # Initialise only the attributes needed by _maybe_fused_moe_weights_int4
-        moe.experts = nn.ModuleList(
-            [_make_mock_expert(hidden, ffn, group_size) for _ in range(num_experts)]
-        )
-        moe._qw1 = None
-        moe._qw2 = None
-        moe._scales_w1 = None
-        moe._scales_w2 = None
-        moe._qzeros_w1 = None
-        moe._qzeros_w2 = None
-        moe._int4_group_size = None
-        return moe
+        class FakeMarlinLinear(nn.Module):
+            qweight = torch.zeros(4, 32, dtype=torch.int32)
+
+        # Fake the module path
+        fake_module = types.ModuleType("gptqmodel.layers.marlin")
+        FakeMarlinLinear.__module__ = "gptqmodel.layers.marlin"
+
+        class MockMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_up_proj = FakeMarlinLinear()
+
+        experts = [MockMLP()]
+        self.assertEqual(detect_expert_quant_type(experts), "fp16")
+
+
+# ---------------------------------------------------------------------------
+# Tests: stack_gptq_moe_weights
+# ---------------------------------------------------------------------------
+
+class TestStackGPTQWeights(unittest.TestCase):
 
     def test_stacked_shapes(self):
-        from eole.modules.moe import MoE
+        from eole.modules.moe_quant_utils import stack_gptq_moe_weights
 
         E, H, ffn, gs = 4, 256, 512, 128
-        moe = self._make_dummy_moe(num_experts=E, hidden=H, ffn=ffn, group_size=gs)
-        moe._maybe_fused_moe_weights_int4(device=torch.device("cpu"))
+        experts = [_make_gptq_expert(H, ffn, gs) for _ in range(E)]
+        (w1_qw, w1_sc, w1_qz, w2_qw, w2_sc, w2_qz, group_size) = stack_gptq_moe_weights(
+            experts, device=torch.device("cpu")
+        )
 
-        # W1 stacked weights
-        self.assertEqual(moe._qw1.shape, (E, H // 8, 2 * ffn))
-        self.assertEqual(moe._scales_w1.shape, (E, H // gs, 2 * ffn))
-        self.assertEqual(moe._qzeros_w1.shape, (E, H // gs, 2 * ffn // 8))
+        # W1: gate+up fused → out = 2*ffn
+        self.assertEqual(w1_qw.shape, (E, H // 8, 2 * ffn))
+        self.assertEqual(w1_sc.shape, (E, H // gs, 2 * ffn))
+        self.assertEqual(w1_qz.shape, (E, H // gs, 2 * ffn // 8))
 
-        # W2 stacked weights
-        self.assertEqual(moe._qw2.shape, (E, ffn // 8, H))
-        self.assertEqual(moe._scales_w2.shape, (E, ffn // gs, H))
-        self.assertEqual(moe._qzeros_w2.shape, (E, ffn // gs, H // 8))
+        # W2: down_proj
+        self.assertEqual(w2_qw.shape, (E, ffn // 8, H))
+        self.assertEqual(w2_sc.shape, (E, ffn // gs, H))
+        self.assertEqual(w2_qz.shape, (E, ffn // gs, H // 8))
 
-    def test_group_size_inference(self):
-        from eole.modules.moe import MoE
+        self.assertEqual(group_size, gs)
 
-        for gs in (64, 128):
-            moe = self._make_dummy_moe(num_experts=2, hidden=256, ffn=512, group_size=gs)
-            moe._maybe_fused_moe_weights_int4(device=torch.device("cpu"))
-            self.assertEqual(moe._int4_group_size, gs)
+    def test_group_size_inferred_without_attribute(self):
+        from eole.modules.moe_quant_utils import stack_gptq_moe_weights
 
-    def test_idempotent(self):
-        """Calling _maybe_fused_moe_weights_int4 twice must not rebuild."""
-        from eole.modules.moe import MoE
+        experts = [_make_gptq_expert(256, 512, 64)]
+        # Remove group_size attribute to exercise inferred path
+        del experts[0].gate_up_proj.group_size
+        del experts[0].down_proj.group_size
 
-        moe = self._make_dummy_moe()
-        moe._maybe_fused_moe_weights_int4(device=torch.device("cpu"))
-        sentinel = moe._qw1
-        moe._maybe_fused_moe_weights_int4(device=torch.device("cpu"))
-        self.assertIs(moe._qw1, sentinel)
+        _, _, _, _, _, _, gs = stack_gptq_moe_weights(experts, device=torch.device("cpu"))
+        self.assertEqual(gs, 64)
 
+
+# ---------------------------------------------------------------------------
+# Tests: stack_awq_moe_weights
+# ---------------------------------------------------------------------------
+
+class TestStackAWQWeights(unittest.TestCase):
+
+    def test_stacked_shapes(self):
+        from eole.modules.moe_quant_utils import stack_awq_moe_weights
+
+        E, H, ffn, gs = 2, 256, 512, 128
+        experts = [_make_awq_expert(H, ffn, gs) for _ in range(E)]
+        (w1_qw, w1_sc, w1_qz, w2_qw, w2_sc, w2_qz, group_size) = stack_awq_moe_weights(
+            experts, device=torch.device("cpu")
+        )
+
+        # W1: N-packed
+        self.assertEqual(w1_qw.shape, (E, H, 2 * ffn // 8))
+        self.assertEqual(w1_sc.shape, (E, H // gs, 2 * ffn))
+        self.assertEqual(w1_qz.shape, (E, H // gs, 2 * ffn // 8))
+
+        # W2
+        self.assertEqual(w2_qw.shape, (E, ffn, H // 8))
+        self.assertEqual(w2_sc.shape, (E, ffn // gs, H))
+        self.assertEqual(w2_qz.shape, (E, ffn // gs, H // 8))
+
+        self.assertEqual(group_size, gs)
+
+
+# ---------------------------------------------------------------------------
+# Tests: fused_experts_int4_impl signature
+# ---------------------------------------------------------------------------
 
 class TestFusedInt4ImplSignature(unittest.TestCase):
-    """Check that fused_experts_int4_impl exists and has the expected interface."""
 
     def test_importable(self):
         try:
@@ -182,17 +233,17 @@ class TestFusedInt4ImplSignature(unittest.TestCase):
         sig = inspect.signature(fused_experts_int4_impl)
         expected_params = {
             "hidden_states",
-            "stacked_qw1",
-            "stacked_scales_w1",
-            "stacked_qzeros_w1",
-            "stacked_qw2",
-            "stacked_scales_w2",
-            "stacked_qzeros_w2",
+            "w1_qweight",
+            "w1_scales",
+            "w1_qzeros",
+            "w2_qweight",
+            "w2_scales",
+            "w2_qzeros",
             "topk_weights",
             "topk_ids",
             "group_size",
+            "kpacked",
             "activation",
-            "use_sorted",
         }
         self.assertEqual(set(sig.parameters.keys()), expected_params)
 

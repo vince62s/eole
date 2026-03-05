@@ -1,32 +1,26 @@
-"""Triton kernels for int4-quantized Mixture of Experts (MoE).
+"""
+Int4 MoE Triton kernels supporting GPTQ/AutoRound (K-packed) and AWQ (N-packed) formats.
 
-Weight format: GPTQ / AutoRound int4
-  - qweight:  (in_features // 8, out_features) int32
-              Each int32 packs 8 int4 values along the input-feature (K) dimension.
-              Bit layout: bits[3:0] = int4[0], bits[7:4] = int4[1], ...,
-                          bits[31:28] = int4[7]
-  - scales:   (in_features // group_size, out_features) fp16
-  - qzeros:   (in_features // group_size, out_features // 8) int32
-              Same packing scheme as qweight, but along the out_features dimension.
-              Zero-point for output channel n in group g:
-                zero = (qzeros[g, n // 8] >> ((n % 8) * 4)) & 0xF
+Layout conventions
+------------------
+GPTQ / AutoRound (KPACKED=True)
+  qweight : (E, K//8,          N)  int32  – 8 int4 values packed along K (input) dim
+  scales  : (E, K//group_size, N)  fp16
+  qzeros  : (E, K//group_size, N//8) int32 – 8 int4 zero-points packed along N dim
 
-Stacked (MoE) format – built once and cached by MoE.forward:
-  - stacked_qw1:       (E, H // 8, 2*I) int32      W1 for all E experts
-  - stacked_scales_w1: (E, H // group_size, 2*I) fp16
-  - stacked_qzeros_w1: (E, H // group_size, 2*I // 8) int32
-  - stacked_qw2:       (E, I // 8, H) int32         W2 for all E experts
-  - stacked_scales_w2: (E, I // group_size, H) fp16
-  - stacked_qzeros_w2: (E, I // group_size, H // 8) int32
+AWQ (KPACKED=False)
+  qweight : (E, K,             N//8) int32 – 8 int4 values packed along N (output) dim
+  scales  : (E, K//group_size, N)   fp16
+  qzeros  : (E, K//group_size, N//8) int32 – same as GPTQ zeros
 
-Key efficiency gains over per-expert TritonLinear calls:
-  - Single fused kernel per pass instead of 2 × num_experts × num_calls launches
-  - On-the-fly int4 → fp32 dequantization inside each Triton CTA, so the full
-    fp16 weight tensor is never materialised
-  - Gated activation (gate × silu(gate) or gate × gelu(gate) / relu(gate))
-    is fused with the W1 matmul
-  - W2 result is atomically accumulated into the output buffer, so there is no
-    intermediate (num_pairs, H) tensor
+where  K = in_features (H for W1, I for W2)
+       N = out_features (2*I for W1, H for W2)
+
+For W1 (gate_up projection) the kernel simultaneously computes
+gate = W_gate @ x  and  up = W_up @ x,
+then applies gated SiLU/GELU/ReLU in-kernel.
+For W2 (down projection) the kernel applies a weighted atomic-add reduce
+directly into the output buffer.
 """
 
 import torch
@@ -35,434 +29,430 @@ import triton.language as tl
 
 
 # ---------------------------------------------------------------------------
-# W1 KERNEL  (int4 matmul + gated activation → intermediate)
+# W1 kernel: int4 matmul + gated activation (gate and up in one pass)
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def fused_w1_int4_activation_kernel(
-    X_ptr,           # [M, H]             fp16/bf16 – input activations
-    qW_ptr,          # [E, H//8, 2*I]     int32     – packed W1 weights
-    scales_ptr,      # [E, H//gs, 2*I]   fp16      – per-group scales
-    qzeros_ptr,      # [E, H//gs, 2*I//8] int32     – packed per-group zeros
-    Y_ptr,           # [num_pairs, I]     fp16/bf16 – output after activation
-    expert_ids_ptr,  # [num_pairs]        int32
-    token_ids_ptr,   # [num_pairs]        int32
-    stride_xm,       # stride of X along M (token) dim
-    stride_xk,       # stride of X along K (hidden) dim  (==1 for contiguous)
-    stride_we,       # stride of qW along E (expert) dim
-    stride_wk,       # stride of qW along K_packed dim
-    stride_wn,       # stride of qW along N (output channel) dim
-    stride_se,       # stride of scales along E dim
-    stride_sg,       # stride of scales along group dim
-    stride_sn,       # stride of scales along N dim
-    stride_ze,       # stride of qzeros along E dim
-    stride_zg,       # stride of qzeros along group dim
-    stride_zn,       # stride of qzeros along N_packed dim
-    stride_ym,       # stride of Y along num_pairs dim
-    stride_yn,       # stride of Y along I dim
-    num_pairs: tl.constexpr,
-    H: tl.constexpr,          # hidden (input) dimension
-    I: tl.constexpr,          # half of W1 output = intermediate size per expert
-    group_size: tl.constexpr,
-    BLOCK_N: tl.constexpr,    # output channels per tile  (must be ≥ 8 and power-of-2)
-    BLOCK_K_PACKED: tl.constexpr,  # packed int32s per K-tile  (= group_size // 8)
-    activation: tl.constexpr, # 0 = silu, 1 = gelu, 2 = relu
+def _w1_int4_act_kernel(
+    # ── inputs ──────────────────────────────────────────────────────────────
+    X_ptr,  # (M, H)         fp16/bf16  – input tokens
+    Qw_ptr,  # see layout doc above
+    Sc_ptr,  # (E, K//gs, 2I) fp16       – scales
+    Qz_ptr,  # (E, K//gs, 2I//8) int32   – packed zeros
+    Y_ptr,  # (num_pairs, I) fp16/bf16  – intermediate output
+    expert_ids_ptr,  # (num_pairs,)   int32
+    token_ids_ptr,  # (num_pairs,)   int32
+    # ── strides ─────────────────────────────────────────────────────────────
+    sx_m,
+    sx_k,  # X
+    sq_e,
+    sq_r,
+    sq_c,  # Qw  (e / row / col)
+    ss_e,
+    ss_r,
+    ss_c,  # Sc
+    sz_e,
+    sz_r,
+    sz_c,  # Qz
+    sy_m,
+    sy_n,  # Y
+    # ── problem dims (constexpr → compiled-in, no recompile per batch) ──────
+    H: tl.constexpr,  # input hidden size
+    I: tl.constexpr,  # intermediate size (gate OR up, so W1 width = 2*I)
+    group_size: tl.constexpr,  # quantisation group size (e.g. 128)
+    # ── layout / activation flags ───────────────────────────────────────────
+    KPACKED: tl.constexpr,  # True = GPTQ/AutoRound, False = AWQ
+    ACTIVATION: tl.constexpr,  # 0 = SiLU (default), 1 = GELU approx, 2 = ReLU
+    # ── tile sizes ──────────────────────────────────────────────────────────
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    # ── packing constants ────────────────────────────────────────────────────
+    KPACK: tl.constexpr,  # 8  (int4: 8 values per int32)
+    NPACK: tl.constexpr,  # 8  (zero-points also packed ×8 along N)
+    # ── dynamic scalar ───────────────────────────────────────────────────────
+    num_pairs,  # NOT constexpr – avoids recompile per batch size
 ):
-    """Fused W1 int4-GEMM + gated activation.
-
-    Computes  Y[pair, :] = act(gate) * up
-    where     gate = X[token, :] @ W1_gate[expert, :, :].T   (output channels [0,   I))
-              up   = X[token, :] @ W1_up  [expert, :, :].T   (output channels [I, 2*I))
-    and W1 is stored in GPTQ int4 format as qW of shape (E, H//8, 2*I).
-    """
     pid_pair = tl.program_id(0)
     pid_n = tl.program_id(1)
 
     if pid_pair >= num_pairs:
         return
 
-    expert_id = tl.load(expert_ids_ptr + pid_pair)
-    token_id = tl.load(token_ids_ptr + pid_pair)
+    eid = tl.load(expert_ids_ptr + pid_pair).to(tl.int64)
+    tid = tl.load(token_ids_ptr + pid_pair).to(tl.int64)
 
-    # Output channel indices for the gate half [0, I)
+    # Output indices for the gate (first I outputs); up uses offs_n + I
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < I
 
     acc_gate = tl.zeros((BLOCK_N,), dtype=tl.float32)
     acc_up = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    H_packed = H // 8  # number of int32 rows in qweight
+    x_base = X_ptr + tid * sx_m
 
-    for k_packed_start in range(0, H_packed, BLOCK_K_PACKED):
-        # ---- load packed weights for gate and up ----
-        offs_k_packed = k_packed_start + tl.arange(0, BLOCK_K_PACKED)
-        mask_kp = offs_k_packed < H_packed
+    for k0 in range(0, H, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < H
 
-        # qW shape: (E, H_packed, 2*I)
-        #   gate output: columns offs_n        [0, I)
-        #   up   output: columns offs_n + I    [I, 2*I)
-        qw_gate_ptrs = (
-            qW_ptr
-            + expert_id * stride_we
-            + offs_k_packed[:, None] * stride_wk
-            + offs_n[None, :] * stride_wn
+        x = tl.load(x_base + offs_k * sx_k, mask=mask_k, other=0.0).to(tl.float32)
+
+        sc_row = offs_k // group_size  # (BLOCK_K,) – which scale row
+
+        # ── load & unpack int4 weights ───────────────────────────────────────
+        if KPACKED:
+            # GPTQ: qweight[e, k//8, n] – packed along K
+            qw_row = offs_k // KPACK  # (BLOCK_K,)
+            k_shift = ((offs_k % KPACK) * 4).to(tl.int32)  # (BLOCK_K,)
+
+            # Load (BLOCK_K, BLOCK_N) int32 for gate outputs
+            qw_gate = tl.load(
+                Qw_ptr + eid * sq_e + qw_row[:, None] * sq_r + offs_n[None, :] * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0,
+            )
+            # Load (BLOCK_K, BLOCK_N) int32 for up outputs (starts at column I)
+            qw_up = tl.load(
+                Qw_ptr + eid * sq_e + qw_row[:, None] * sq_r + (offs_n[None, :] + I) * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0,
+            )
+
+            gate_nib = ((qw_gate >> k_shift[:, None]) & 0xF).to(tl.float32)
+            up_nib = ((qw_up >> k_shift[:, None]) & 0xF).to(tl.float32)
+
+        else:
+            # AWQ: qweight[e, k, n//8] – packed along N
+            qw_col_g = offs_n // NPACK  # (BLOCK_N,)
+            qw_col_u = (offs_n + I) // NPACK
+            n_shift = ((offs_n % NPACK) * 4).to(tl.int32)  # (BLOCK_N,)
+
+            qw_gate = tl.load(
+                Qw_ptr + eid * sq_e + offs_k[:, None] * sq_r + qw_col_g[None, :] * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0,
+            )
+            qw_up = tl.load(
+                Qw_ptr + eid * sq_e + offs_k[:, None] * sq_r + qw_col_u[None, :] * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0,
+            )
+
+            gate_nib = ((qw_gate >> n_shift[None, :]) & 0xF).to(tl.float32)
+            up_nib = ((qw_up >> n_shift[None, :]) & 0xF).to(tl.float32)
+
+        # ── scales (BLOCK_K, BLOCK_N) ────────────────────────────────────────
+        sc_gate = tl.load(
+            Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + offs_n[None, :] * ss_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        sc_up = tl.load(
+            Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + (offs_n[None, :] + I) * ss_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        # ── zero-points (always N-packed, both layouts share this convention) ──
+        z_col = offs_n // NPACK  # (BLOCK_N,)
+        z_shft = ((offs_n % NPACK) * 4).to(tl.int32)  # (BLOCK_N,)
+        z_col_u = (offs_n + I) // NPACK
+
+        qz_gate = tl.load(
+            Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col[None, :] * sz_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
         )
-        qw_gate = tl.load(qw_gate_ptrs, mask=mask_kp[:, None] & mask_n[None, :], other=0)
-
-        qw_up_ptrs = (
-            qW_ptr
-            + expert_id * stride_we
-            + offs_k_packed[:, None] * stride_wk
-            + (offs_n[None, :] + I) * stride_wn
+        qz_up = tl.load(
+            Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col_u[None, :] * sz_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
         )
-        qw_up = tl.load(qw_up_ptrs, mask=mask_kp[:, None] & mask_n[None, :], other=0)
 
-        # ---- load scales and zeros (constant for the whole K-tile when
-        #      BLOCK_K_PACKED * 8 == group_size) ----
-        group_id = (k_packed_start * 8) // group_size
+        z_gate = ((qz_gate >> z_shft[None, :]) & 0xF).to(tl.float32)
+        z_up = ((qz_up >> z_shft[None, :]) & 0xF).to(tl.float32)
 
-        scale_gate_ptrs = (
-            scales_ptr
-            + expert_id * stride_se
-            + group_id * stride_sg
-            + offs_n * stride_sn
-        )
-        scale_gate = tl.load(scale_gate_ptrs, mask=mask_n, other=1.0).to(tl.float32)
+        # ── dequantize and accumulate ─────────────────────────────────────────
+        w_gate = (gate_nib - z_gate) * sc_gate  # (BLOCK_K, BLOCK_N)
+        w_up = (up_nib - z_up) * sc_up
 
-        scale_up_ptrs = (
-            scales_ptr
-            + expert_id * stride_se
-            + group_id * stride_sg
-            + (offs_n + I) * stride_sn
-        )
-        scale_up = tl.load(scale_up_ptrs, mask=mask_n, other=1.0).to(tl.float32)
+        acc_gate += tl.sum(x[:, None] * w_gate, axis=0)
+        acc_up += tl.sum(x[:, None] * w_up, axis=0)
 
-        # zeros are packed: qzeros[e, group, n // 8]
-        zero_gate_ptrs = (
-            qzeros_ptr
-            + expert_id * stride_ze
-            + group_id * stride_zg
-            + (offs_n // 8) * stride_zn
-        )
-        zero_gate_packed = tl.load(zero_gate_ptrs, mask=mask_n, other=0)
-        zero_gate_shift = (offs_n % 8) * 4
-        zero_gate = ((zero_gate_packed >> zero_gate_shift) & 0xF).to(tl.float32)
-
-        # up zeros at output channel (offs_n + I)
-        zero_up_ptrs = (
-            qzeros_ptr
-            + expert_id * stride_ze
-            + group_id * stride_zg
-            + ((offs_n + I) // 8) * stride_zn
-        )
-        zero_up_packed = tl.load(zero_up_ptrs, mask=mask_n, other=0)
-        zero_up_shift = ((offs_n + I) % 8) * 4
-        zero_up = ((zero_up_packed >> zero_up_shift) & 0xF).to(tl.float32)
-
-        # ---- unpack int4, dequantize, and accumulate over 8 bit positions ----
-        # For bit position b, the corresponding input channels are:
-        #   k_packed_start * 8 + b,  k_packed_start * 8 + b + 8,  ...
-        # We load x at those channels for each packed slot.
-        for bit_pos in tl.static_range(8):
-            shift = bit_pos * 4
-            # Extract int4 values: (BLOCK_K_PACKED, BLOCK_N)
-            w_gate_int4 = (qw_gate >> shift) & 0xF
-            w_up_int4 = (qw_up >> shift) & 0xF
-
-            # Dequantize: w_fp = (w_int4 - zero) * scale
-            w_gate_fp = (w_gate_int4.to(tl.float32) - zero_gate[None, :]) * scale_gate[None, :]
-            w_up_fp = (w_up_int4.to(tl.float32) - zero_up[None, :]) * scale_up[None, :]
-
-            # Load x at the K positions corresponding to this bit position.
-            # The channels are: k_packed_start*8 + bit_pos + k_packed_idx*8
-            # for k_packed_idx in [0, BLOCK_K_PACKED).
-            offs_k_bit = k_packed_start * 8 + bit_pos + tl.arange(0, BLOCK_K_PACKED) * 8
-            mask_k_bit = offs_k_bit < H
-            x_bit = tl.load(
-                X_ptr + token_id * stride_xm + offs_k_bit * stride_xk,
-                mask=mask_k_bit,
-                other=0.0,
-            ).to(tl.float32)
-
-            # Accumulate: (BLOCK_K_PACKED,) × (BLOCK_K_PACKED, BLOCK_N) → (BLOCK_N,)
-            acc_gate += tl.sum(w_gate_fp * x_bit[:, None], axis=0)
-            acc_up += tl.sum(w_up_fp * x_bit[:, None], axis=0)
-
-    # ---- Gated activation ----
-    if activation == 0:  # silu
-        activated = acc_gate * tl.sigmoid(acc_gate) * acc_up
-    elif activation == 1:  # gelu (tanh approximation)
+    # ── gated activation ─────────────────────────────────────────────────────
+    if ACTIVATION == 0:  # SiLU (default for most MoE models)
+        act = acc_gate * tl.sigmoid(acc_gate) * acc_up
+    elif ACTIVATION == 1:  # GELU approximation
         sqrt_2_over_pi = 0.7978845608028654
-        gate_cubed = acc_gate * acc_gate * acc_gate
-        tanh_arg = sqrt_2_over_pi * (acc_gate + 0.044715 * gate_cubed)
-        activated = 0.5 * acc_gate * (1.0 + tl.math.tanh(tanh_arg)) * acc_up
-    elif activation == 2:  # relu
-        activated = tl.where(acc_gate > 0.0, acc_gate, 0.0) * acc_up
-    else:  # default silu
-        activated = acc_gate * tl.sigmoid(acc_gate) * acc_up
+        g3 = acc_gate * acc_gate * acc_gate
+        tanh_arg = sqrt_2_over_pi * (acc_gate + 0.044715 * g3)
+        act = 0.5 * acc_gate * (1.0 + tl.math.tanh(tanh_arg)) * acc_up
+    else:  # ReLU
+        act = tl.where(acc_gate > 0, acc_gate, 0.0) * acc_up
 
-    y_ptrs = Y_ptr + pid_pair * stride_ym + offs_n * stride_yn
-    tl.store(y_ptrs, activated.to(X_ptr.dtype.element_ty), mask=mask_n)
+    tl.store(
+        Y_ptr + pid_pair * sy_m + offs_n * sy_n,
+        act.to(X_ptr.dtype.element_ty),
+        mask=mask_n,
+    )
 
 
 # ---------------------------------------------------------------------------
-# W2 KERNEL  (int4 matmul + weighted atomic-add reduce → final output)
+# W2 kernel: int4 matmul + weighted atomic-add reduce into output
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def w2_int4_reduce_kernel(
-    X_ptr,           # [num_pairs, I]     fp16/bf16 – intermediate activations
-    qW_ptr,          # [E, I//8, H]       int32     – packed W2 weights
-    scales_ptr,      # [E, I//gs, H]      fp16      – per-group scales
-    qzeros_ptr,      # [E, I//gs, H//8]   int32     – packed per-group zeros
-    Y_ptr,           # [M, H]             fp16/bf16 – output (accumulated)
-    expert_ids_ptr,  # [num_pairs]        int32
-    token_ids_ptr,   # [num_pairs]        int32
-    weights_ptr,     # [num_pairs]        fp32      – routing weights
-    stride_xm,       # stride of X (intermediate) along pairs dim
-    stride_xk,       # stride of X along I dim
-    stride_we,       # stride of qW along E dim
-    stride_wk,       # stride of qW along K_packed dim   (K = I here)
-    stride_wn,       # stride of qW along N dim           (N = H here)
-    stride_se,
-    stride_sg,
-    stride_sn,
-    stride_ze,
-    stride_zg,
-    stride_zn,
-    stride_ym,       # stride of Y along M (token) dim
-    stride_yn,       # stride of Y along H dim
-    num_pairs: tl.constexpr,
-    H: tl.constexpr,          # output (hidden) dimension
-    I: tl.constexpr,          # input (intermediate) dimension
+def _w2_int4_reduce_kernel(
+    X_ptr,  # (num_pairs, I) fp16/bf16  – intermediate (from W1 kernel)
+    Qw_ptr,  # GPTQ: (E, I//8, H)  AWQ: (E, I, H//8)  int32
+    Sc_ptr,  # (E, I//group_size, H)  fp16
+    Qz_ptr,  # (E, I//group_size, H//8) int32
+    Y_ptr,  # (M, H)         fp16/bf16  – output (atomic accumulation)
+    expert_ids_ptr,
+    token_ids_ptr,
+    weights_ptr,  # (num_pairs,)   fp16/bf16  – routing weights
+    sx_m,
+    sx_k,
+    sq_e,
+    sq_r,
+    sq_c,
+    ss_e,
+    ss_r,
+    ss_c,
+    sz_e,
+    sz_r,
+    sz_c,
+    sy_m,
+    sy_n,
+    H: tl.constexpr,
+    I: tl.constexpr,
     group_size: tl.constexpr,
-    BLOCK_N: tl.constexpr,    # output (H) channels per tile
-    BLOCK_K_PACKED: tl.constexpr,  # packed int32s per K-tile (= group_size // 8)
+    KPACKED: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    KPACK: tl.constexpr,
+    NPACK: tl.constexpr,
+    num_pairs,
 ):
-    """W2 int4-GEMM + routing-weight scale + atomic-add reduce.
-
-    Computes  Y[token, :] += routing_weight * X[pair, :] @ W2[expert, :, :].T
-    where W2 has shape (E, H, I) logically, stored as (E, I//8, H) in GPTQ int4.
-    """
     pid_pair = tl.program_id(0)
     pid_n = tl.program_id(1)
 
     if pid_pair >= num_pairs:
         return
 
-    expert_id = tl.load(expert_ids_ptr + pid_pair)
-    token_id = tl.load(token_ids_ptr + pid_pair)
-    weight = tl.load(weights_ptr + pid_pair)
+    eid = tl.load(expert_ids_ptr + pid_pair).to(tl.int64)
+    tid = tl.load(token_ids_ptr + pid_pair).to(tl.int64)
+    weight = tl.load(weights_ptr + pid_pair).to(tl.float32)
 
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # output (hidden) indices
     mask_n = offs_n < H
 
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    x_base = X_ptr + pid_pair * sx_m
 
-    I_packed = I // 8
+    for k0 in range(0, I, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < I
 
-    for k_packed_start in range(0, I_packed, BLOCK_K_PACKED):
-        offs_k_packed = k_packed_start + tl.arange(0, BLOCK_K_PACKED)
-        mask_kp = offs_k_packed < I_packed
+        x = tl.load(x_base + offs_k * sx_k, mask=mask_k, other=0.0).to(tl.float32)
 
-        qw_ptrs = (
-            qW_ptr
-            + expert_id * stride_we
-            + offs_k_packed[:, None] * stride_wk
-            + offs_n[None, :] * stride_wn
+        sc_row = offs_k // group_size
+
+        if KPACKED:
+            # GPTQ: qweight[e, k//8, n]  shape (E, I//8, H)
+            qw_row = offs_k // KPACK
+            k_shift = ((offs_k % KPACK) * 4).to(tl.int32)
+
+            qw = tl.load(
+                Qw_ptr + eid * sq_e + qw_row[:, None] * sq_r + offs_n[None, :] * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0,
+            )
+            nib = ((qw >> k_shift[:, None]) & 0xF).to(tl.float32)
+
+        else:
+            # AWQ: qweight[e, k, n//8]  shape (E, I, H//8)
+            qw_col = offs_n // NPACK
+            n_shift = ((offs_n % NPACK) * 4).to(tl.int32)
+
+            qw = tl.load(
+                Qw_ptr + eid * sq_e + offs_k[:, None] * sq_r + qw_col[None, :] * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0,
+            )
+            nib = ((qw >> n_shift[None, :]) & 0xF).to(tl.float32)
+
+        sc = tl.load(
+            Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + offs_n[None, :] * ss_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        z_col = offs_n // NPACK
+        z_shft = ((offs_n % NPACK) * 4).to(tl.int32)
+        qz = tl.load(
+            Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col[None, :] * sz_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
         )
-        qw = tl.load(qw_ptrs, mask=mask_kp[:, None] & mask_n[None, :], other=0)
+        z = ((qz >> z_shft[None, :]) & 0xF).to(tl.float32)
 
-        group_id = (k_packed_start * 8) // group_size
+        w = (nib - z) * sc
+        acc += tl.sum(x[:, None] * w, axis=0)
 
-        scale_ptrs = (
-            scales_ptr
-            + expert_id * stride_se
-            + group_id * stride_sg
-            + offs_n * stride_sn
-        )
-        scale = tl.load(scale_ptrs, mask=mask_n, other=1.0).to(tl.float32)
-
-        zero_ptrs = (
-            qzeros_ptr
-            + expert_id * stride_ze
-            + group_id * stride_zg
-            + (offs_n // 8) * stride_zn
-        )
-        zero_packed = tl.load(zero_ptrs, mask=mask_n, other=0)
-        zero_shift = (offs_n % 8) * 4
-        zero = ((zero_packed >> zero_shift) & 0xF).to(tl.float32)
-
-        for bit_pos in tl.static_range(8):
-            shift = bit_pos * 4
-            w_int4 = (qw >> shift) & 0xF
-            w_fp = (w_int4.to(tl.float32) - zero[None, :]) * scale[None, :]
-
-            offs_k_bit = k_packed_start * 8 + bit_pos + tl.arange(0, BLOCK_K_PACKED) * 8
-            mask_k_bit = offs_k_bit < I
-            x_bit = tl.load(
-                X_ptr + pid_pair * stride_xm + offs_k_bit * stride_xk,
-                mask=mask_k_bit,
-                other=0.0,
-            ).to(tl.float32)
-
-            acc += tl.sum(w_fp * x_bit[:, None], axis=0)
-
-    weighted_result = acc * weight
-    y_ptrs = Y_ptr + token_id * stride_ym + offs_n * stride_yn
-    tl.atomic_add(y_ptrs, weighted_result.to(X_ptr.dtype.element_ty), mask=mask_n)
+    weighted = acc * weight
+    y_ptrs = Y_ptr + tid * sy_m + offs_n * sy_n
+    tl.atomic_add(y_ptrs, weighted.to(X_ptr.dtype.element_ty), mask=mask_n)
 
 
 # ---------------------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------------------
 
+_ACTIVATION_MAP = {"silu": 0, "gelu": 1, "relu": 2}
+
 
 def fused_experts_int4_impl(
     hidden_states: torch.Tensor,
-    stacked_qw1: torch.Tensor,
-    stacked_scales_w1: torch.Tensor,
-    stacked_qzeros_w1: torch.Tensor,
-    stacked_qw2: torch.Tensor,
-    stacked_scales_w2: torch.Tensor,
-    stacked_qzeros_w2: torch.Tensor,
+    w1_qweight: torch.Tensor,
+    w1_scales: torch.Tensor,
+    w1_qzeros: torch.Tensor,
+    w2_qweight: torch.Tensor,
+    w2_scales: torch.Tensor,
+    w2_qzeros: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     group_size: int = 128,
+    kpacked: bool = True,
     activation: str = "silu",
-    use_sorted: bool = False,
 ) -> torch.Tensor:
-    """Fused MoE forward pass for int4-quantized expert weights.
+    """
+    MoE forward pass with int4-quantised weights.
 
-    Uses on-the-fly dequantization inside Triton kernels so the full fp16
-    weight tensor is never materialised.  All token–expert pairs are processed
-    in a single kernel launch, reducing kernel-launch overhead compared to
-    calling a per-expert QuantLinear.
-
-    Args:
-        hidden_states:      (M, H) fp16/bf16 input tokens.
-        stacked_qw1:        (E, H//8, 2*I) int32  – packed W1 for all experts.
-        stacked_scales_w1:  (E, H//group_size, 2*I) fp16 – W1 scales.
-        stacked_qzeros_w1:  (E, H//group_size, 2*I//8) int32 – W1 packed zeros.
-        stacked_qw2:        (E, I//8, H) int32    – packed W2 for all experts.
-        stacked_scales_w2:  (E, I//group_size, H) fp16 – W2 scales.
-        stacked_qzeros_w2:  (E, I//group_size, H//8) int32 – W2 packed zeros.
-        topk_weights:       (M, K) routing weights.
-        topk_ids:           (M, K) expert indices.
-        group_size:         Quantization group size (default 128).
-        activation:         "silu", "gelu", or "relu".
-        use_sorted:         Sort tokens by expert before processing (better for
-                            large batches; small overhead for tiny batches).
-
-    Returns:
-        torch.Tensor: (M, H) output in the same dtype as hidden_states.
+    Parameters
+    ----------
+    hidden_states : (M, H)
+    w1_qweight    : (E, H//8, 2I) if kpacked else (E, H, 2I//8)  – int32
+    w1_scales     : (E, H//group_size, 2I)                         – fp16/bf16
+    w1_qzeros     : (E, H//group_size, 2I//8)                      – int32
+    w2_qweight    : (E, I//8, H)  if kpacked else (E, I, H//8)    – int32
+    w2_scales     : (E, I//group_size, H)                          – fp16/bf16
+    w2_qzeros     : (E, I//group_size, H//8)                       – int32
+    topk_weights  : (M, K)
+    topk_ids      : (M, K)
+    group_size    : quantisation group size (default 128)
+    kpacked       : True = GPTQ/AutoRound layout, False = AWQ layout
+    activation    : "silu" | "gelu" | "relu"
     """
     M, H = hidden_states.shape
-    _, H_packed, double_I = stacked_qw1.shape
-    I = double_I // 2  # noqa: E741
     K = topk_ids.shape[1]
+
+    # Derive I (intermediate size) from stacked weight shape
+    if kpacked:
+        double_I = w1_qweight.shape[2]  # (E, H//8, 2I)  → col dim = 2I
+    else:
+        double_I = w1_qweight.shape[2] * 8  # (E, H, 2I//8)  → col dim = 2I//8
+
+    I = double_I // 2  # noqa: E741
+
     device = hidden_states.device
     dtype = hidden_states.dtype
-
     num_pairs = M * K
 
-    # ---- build token–expert index arrays ----
-    if use_sorted:
-        flat_topk_ids = topk_ids.flatten()
-        sorted_indices = torch.argsort(flat_topk_ids, stable=True)
-        expert_ids = flat_topk_ids[sorted_indices]
-        token_ids = (
-            torch.arange(M, device=device, dtype=torch.int32)
-            .repeat_interleave(K)[sorted_indices]
-        )
-        weights = topk_weights.flatten()[sorted_indices]
-    else:
-        expert_ids = topk_ids.flatten()
-        token_ids = torch.arange(M, device=device, dtype=torch.int32).repeat_interleave(K)
-        weights = topk_weights.flatten()
+    expert_ids = topk_ids.flatten().to(torch.int32)
+    token_ids = torch.arange(M, device=device, dtype=torch.int32).repeat_interleave(K)
+    weights = topk_weights.flatten()
 
-    # ---- tune block sizes ----
-    # BLOCK_K_PACKED = group_size // 8  ensures each K-tile covers exactly one
-    # quantisation group, so scales/zeros can be loaded once per tile.
-    BLOCK_K_PACKED = group_size // 8  # e.g. 16 for group_size=128
-    BLOCK_N = 64
+    act_code = _ACTIVATION_MAP.get(activation.lower(), 0)
 
-    activation_type = {"silu": 0, "gelu": 1, "relu": 2}.get(
-        (activation or "silu").lower(), 0
-    )
+    BLOCK_N, BLOCK_K = 64, 64
 
-    # ---- W1 + activation ----
+    # ── W1: gate+up projection + activation → intermediate ────────────────
     intermediate = torch.empty((num_pairs, I), device=device, dtype=dtype)
 
     grid_w1 = (num_pairs, triton.cdiv(I, BLOCK_N))
-    fused_w1_int4_activation_kernel[grid_w1](
+    _w1_int4_act_kernel[grid_w1](
         hidden_states,
-        stacked_qw1,
-        stacked_scales_w1,
-        stacked_qzeros_w1,
+        w1_qweight,
+        w1_scales,
+        w1_qzeros,
         intermediate,
         expert_ids,
         token_ids,
+        # X strides
         hidden_states.stride(0),
         hidden_states.stride(1),
-        stacked_qw1.stride(0),
-        stacked_qw1.stride(1),
-        stacked_qw1.stride(2),
-        stacked_scales_w1.stride(0),
-        stacked_scales_w1.stride(1),
-        stacked_scales_w1.stride(2),
-        stacked_qzeros_w1.stride(0),
-        stacked_qzeros_w1.stride(1),
-        stacked_qzeros_w1.stride(2),
+        # Qw strides
+        w1_qweight.stride(0),
+        w1_qweight.stride(1),
+        w1_qweight.stride(2),
+        # Sc strides
+        w1_scales.stride(0),
+        w1_scales.stride(1),
+        w1_scales.stride(2),
+        # Qz strides
+        w1_qzeros.stride(0),
+        w1_qzeros.stride(1),
+        w1_qzeros.stride(2),
+        # Y strides
         intermediate.stride(0),
         intermediate.stride(1),
-        num_pairs=num_pairs,
+        # dims
         H=H,
         I=I,
         group_size=group_size,
+        KPACKED=kpacked,
+        ACTIVATION=act_code,
         BLOCK_N=BLOCK_N,
-        BLOCK_K_PACKED=BLOCK_K_PACKED,
-        activation=activation_type,
+        BLOCK_K=BLOCK_K,
+        KPACK=8,
+        NPACK=8,
+        num_pairs=num_pairs,
     )
 
-    # ---- W2 + weighted reduce ----
+    # ── W2: down projection + weighted reduce → output ────────────────────
     final_output = torch.zeros((M, H), device=device, dtype=dtype)
 
-    # For W2: in_features = I, out_features = H
-    # BLOCK_K_PACKED_W2 = group_size // 8 (same as W1 in most configs)
-    BLOCK_K_PACKED_W2 = group_size // 8
-
     grid_w2 = (num_pairs, triton.cdiv(H, BLOCK_N))
-    w2_int4_reduce_kernel[grid_w2](
+    _w2_int4_reduce_kernel[grid_w2](
         intermediate,
-        stacked_qw2,
-        stacked_scales_w2,
-        stacked_qzeros_w2,
+        w2_qweight,
+        w2_scales,
+        w2_qzeros,
         final_output,
         expert_ids,
         token_ids,
         weights,
+        # intermediate strides
         intermediate.stride(0),
         intermediate.stride(1),
-        stacked_qw2.stride(0),
-        stacked_qw2.stride(1),
-        stacked_qw2.stride(2),
-        stacked_scales_w2.stride(0),
-        stacked_scales_w2.stride(1),
-        stacked_scales_w2.stride(2),
-        stacked_qzeros_w2.stride(0),
-        stacked_qzeros_w2.stride(1),
-        stacked_qzeros_w2.stride(2),
+        # Qw strides
+        w2_qweight.stride(0),
+        w2_qweight.stride(1),
+        w2_qweight.stride(2),
+        # Sc strides
+        w2_scales.stride(0),
+        w2_scales.stride(1),
+        w2_scales.stride(2),
+        # Qz strides
+        w2_qzeros.stride(0),
+        w2_qzeros.stride(1),
+        w2_qzeros.stride(2),
+        # output strides
         final_output.stride(0),
         final_output.stride(1),
-        num_pairs=num_pairs,
+        # dims
         H=H,
         I=I,
         group_size=group_size,
+        KPACKED=kpacked,
         BLOCK_N=BLOCK_N,
-        BLOCK_K_PACKED=BLOCK_K_PACKED_W2,
+        BLOCK_K=BLOCK_K,
+        KPACK=8,
+        NPACK=8,
+        num_pairs=num_pairs,
     )
 
     return final_output
