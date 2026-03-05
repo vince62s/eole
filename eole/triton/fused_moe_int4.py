@@ -16,52 +16,27 @@ AWQ (KPACKED=False)
 where  K = in_features (H for W1, I for W2)
        N = out_features (2*I for W1, H for W2)
 
-Key optimizations over the naive logical-K loop
-------------------------------------------------
-KPACKED (GPTQ/AutoRound) path
-  A naive loop ``for k0 in range(0, K, BLOCK_K)`` over logical K with BLOCK_K=64
-  computes ``qw_row = k // KPACK``.  Because KPACK=8, every 8 consecutive logical-K
-  elements share the same packed row, so a (BLOCK_K=64, BLOCK_N) weight load fetches
-  only (BLOCK_K/KPACK=8) unique rows – loading each row 8 times redundantly.  The
-  same applies to scales: when BLOCK_K < group_size the tile belongs to one group
-  yet a (BLOCK_K, BLOCK_N) load replicates the same scale row BLOCK_K times.
+For W1 (gate_up projection) the kernel simultaneously computes
+gate = W_gate @ x  and  up = W_up @ x,
+then applies gated SiLU/GELU/ReLU in-kernel.
+For W2 (down projection) the kernel applies a weighted atomic-add reduce
+directly into the output buffer.
 
-  The fix iterates directly over the PACKED K dimension (H//KPACK rows) with
-  BLOCK_KP packed rows per tile.  Each packed row is loaded exactly ONCE.  Scales
-  and zero-points are loaded as (BLOCK_N,) vectors (one per group tile).  The eight
-  nibbles per packed row are extracted via a statically-unrolled
-  ``tl.static_range(KPACK)`` inner loop; for each bit-position b the corresponding
-  activation slice (BLOCK_KP elements at stride KPACK in x) is fetched with a small
-  strided load – this avoids tl.reshape which is not available in Triton ≤2.1.
-
-  Constraint: BLOCK_KP * KPACK must not exceed group_size so that every element in
-  a tile belongs to the same quantisation group.  With the default BLOCK_KP=8 and
-  KPACK=8, this requires group_size >= 64 (typical minimum is 128, so fine).
-
-AWQ (N-packed) path
-  The N-packed layout already accesses each (k, n//8) weight element once; no
-  structural redundancy exists.  The logical-K loop is kept as-is.  Scales are
-  loaded per-element because different logical-K values in a tile may belong to
-  different groups.
-
-Both paths
-  * BLOCK_N (output channels per CTA tile) and BLOCK_KP (packed-K rows per tile)
-    are explicit constexpr parameters – callers can tune them.  The defaults
-    (BLOCK_N=64, BLOCK_KP=8) are chosen to fit typical GPU register files.
-  * Token-expert pairs are pre-sorted by expert ID in the Python wrapper so that
-    consecutive CTAs access the same expert's weights, improving L2 cache reuse.
+Step-decode optimisation (M=1)
+-------------------------------
+When decoding a single token (M=1), the two kernels are launched with
+``num_warps=4, num_stages=2`` instead of the prefill defaults.  Fewer warps
+per CTA raises SM occupancy (more CTAs fit per SM when the grid is small),
+and ``num_stages=2`` enables double-buffered memory pipelining that hides
+global-memory latency in the serial K-reduction loop.  Pairs are also sorted
+by expert ID so that consecutive CTAs access the same expert's weight tiles,
+improving L2 cache reuse in batched-decode scenarios (M > 1).
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# ---------------------------------------------------------------------------
-# Default tile sizes  (must satisfy BLOCK_KP * KPACK <= group_size)
-# ---------------------------------------------------------------------------
-
-_DEFAULT_BLOCK_N = 64  # output channels per CTA tile (power of 2)
-_DEFAULT_BLOCK_KP = 8  # packed-K rows per tile; 8 * KPACK(=8) = 64 logical K
 
 # ---------------------------------------------------------------------------
 # W1 kernel: int4 matmul + gated activation (gate and up in one pass)
@@ -92,21 +67,21 @@ def _w1_int4_act_kernel(
     sz_c,  # Qz
     sy_m,
     sy_n,  # Y
-    # ── problem dims ────────────────────────────────────────────────────────
+    # ── problem dims (constexpr → compiled-in, no recompile per batch) ──────
     H: tl.constexpr,  # input hidden size
-    I: tl.constexpr,  # intermediate size (gate OR up; W1 width = 2*I)
+    I: tl.constexpr,  # intermediate size (gate OR up, so W1 width = 2*I)
     group_size: tl.constexpr,  # quantisation group size (e.g. 128)
     # ── layout / activation flags ───────────────────────────────────────────
     KPACKED: tl.constexpr,  # True = GPTQ/AutoRound, False = AWQ
-    ACTIVATION: tl.constexpr,  # 0 = SiLU, 1 = GELU approx, 2 = ReLU
+    ACTIVATION: tl.constexpr,  # 0 = SiLU (default), 1 = GELU approx, 2 = ReLU
     # ── tile sizes ──────────────────────────────────────────────────────────
-    BLOCK_N: tl.constexpr,  # output channels per CTA tile
-    BLOCK_KP: tl.constexpr,  # packed-K rows per tile (KPACKED) / logical-K per tile (AWQ)
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     # ── packing constants ────────────────────────────────────────────────────
-    KPACK: tl.constexpr,  # 8  (int4: 8 values per int32, packed along K or N)
-    NPACK: tl.constexpr,  # 8  (zero-points packed ×8 along N)
+    KPACK: tl.constexpr,  # 8  (int4: 8 values per int32)
+    NPACK: tl.constexpr,  # 8  (zero-points also packed ×8 along N)
     # ── dynamic scalar ───────────────────────────────────────────────────────
-    num_pairs,  # NOT constexpr – avoids kernel recompile when batch size changes
+    num_pairs,  # NOT constexpr – avoids recompile per batch size
 ):
     pid_pair = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -117,6 +92,7 @@ def _w1_int4_act_kernel(
     eid = tl.load(expert_ids_ptr + pid_pair).to(tl.int64)
     tid = tl.load(token_ids_ptr + pid_pair).to(tl.int64)
 
+    # Output indices for the gate (first I outputs); up uses offs_n + I
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < I
 
@@ -125,96 +101,41 @@ def _w1_int4_act_kernel(
 
     x_base = X_ptr + tid * sx_m
 
-    if KPACKED:
-        # ── GPTQ / AutoRound: iterate over the PACKED K dimension ─────────────
-        #
-        # Each outer tile covers BLOCK_KP packed rows = BLOCK_KP * KPACK logical K
-        # elements.  Packed weights and scales are loaded ONCE per tile; the
-        # tl.static_range(KPACK) inner loop is unrolled at compile time so there
-        # is zero runtime loop overhead.
-        #
-        # Tile constraint: BLOCK_KP * KPACK <= group_size  (all elements share
-        # one scale group; guaranteed by default values and documented above).
+    for k0 in range(0, H, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < H
 
-        for kp0 in range(0, H // KPACK, BLOCK_KP):
-            offs_kp = kp0 + tl.arange(0, BLOCK_KP)  # (BLOCK_KP,) packed-row indices
-            mask_kp = offs_kp < H // KPACK
+        x = tl.load(x_base + offs_k * sx_k, mask=mask_k, other=0.0).to(tl.float32)
 
-            # ── Load each packed weight row ONCE (BLOCK_KP rows, not BLOCK_K) ──
+        sc_row = offs_k // group_size  # (BLOCK_K,) – which scale row
+
+        # ── load & unpack int4 weights ───────────────────────────────────────
+        if KPACKED:
+            # GPTQ: qweight[e, k//8, n] – packed along K
+            qw_row = offs_k // KPACK  # (BLOCK_K,)
+            k_shift = ((offs_k % KPACK) * 4).to(tl.int32)  # (BLOCK_K,)
+
+            # Load (BLOCK_K, BLOCK_N) int32 for gate outputs
             qw_gate = tl.load(
-                Qw_ptr + eid * sq_e + offs_kp[:, None] * sq_r + offs_n[None, :] * sq_c,
-                mask=mask_kp[:, None] & mask_n[None, :],
+                Qw_ptr + eid * sq_e + qw_row[:, None] * sq_r + offs_n[None, :] * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
                 other=0,
-            )  # (BLOCK_KP, BLOCK_N) int32
+            )
+            # Load (BLOCK_K, BLOCK_N) int32 for up outputs (starts at column I)
             qw_up = tl.load(
-                Qw_ptr + eid * sq_e + offs_kp[:, None] * sq_r + (offs_n[None, :] + I) * sq_c,
-                mask=mask_kp[:, None] & mask_n[None, :],
+                Qw_ptr + eid * sq_e + qw_row[:, None] * sq_r + (offs_n[None, :] + I) * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
                 other=0,
-            )  # (BLOCK_KP, BLOCK_N) int32
+            )
 
-            # ── Scales & zeros: one (BLOCK_N,) vector per group tile ───────────
-            # All BLOCK_KP * KPACK logical K elements share the same scale group
-            # (guaranteed by the BLOCK_KP * KPACK <= group_size constraint).
-            sc_row = (kp0 * KPACK) // group_size  # scalar
-            sc_gate = tl.load(
-                Sc_ptr + eid * ss_e + sc_row * ss_r + offs_n * ss_c,
-                mask=mask_n,
-                other=1.0,
-            ).to(tl.float32)  # (BLOCK_N,)
-            sc_up = tl.load(
-                Sc_ptr + eid * ss_e + sc_row * ss_r + (offs_n + I) * ss_c,
-                mask=mask_n,
-                other=1.0,
-            ).to(tl.float32)  # (BLOCK_N,)
+            gate_nib = ((qw_gate >> k_shift[:, None]) & 0xF).to(tl.float32)
+            up_nib = ((qw_up >> k_shift[:, None]) & 0xF).to(tl.float32)
 
-            z_col = offs_n // NPACK
-            z_shft = ((offs_n % NPACK) * 4).to(tl.int32)
-            z_col_u = (offs_n + I) // NPACK
-            qz_gate = tl.load(
-                Qz_ptr + eid * sz_e + sc_row * sz_r + z_col * sz_c,
-                mask=mask_n,
-                other=0,
-            )  # (BLOCK_N,)
-            qz_up = tl.load(
-                Qz_ptr + eid * sz_e + sc_row * sz_r + z_col_u * sz_c,
-                mask=mask_n,
-                other=0,
-            )  # (BLOCK_N,)
-            z_gate = ((qz_gate >> z_shft) & 0xF).to(tl.float32)  # (BLOCK_N,)
-            z_up = ((qz_up >> z_shft) & 0xF).to(tl.float32)  # (BLOCK_N,)
-
-            # ── Statically-unrolled nibble extraction and accumulation ─────────
-            # For each bit-position b, load the BLOCK_KP activation values
-            # x[kp * KPACK + b] for kp in 0..BLOCK_KP-1 (strided by KPACK in x).
-            # This avoids tl.reshape which is unavailable in Triton ≤2.1.
-            for b in tl.static_range(KPACK):
-                offs_kb = (kp0 + tl.arange(0, BLOCK_KP)) * KPACK + b
-                x_b = tl.load(
-                    x_base + offs_kb * sx_k, mask=offs_kb < H, other=0.0
-                ).to(tl.float32)  # (BLOCK_KP,)
-                gate_nib = ((qw_gate >> (b * 4)) & 0xF).to(tl.float32)  # (BLOCK_KP, BLOCK_N)
-                up_nib = ((qw_up >> (b * 4)) & 0xF).to(tl.float32)
-                w_gate = (gate_nib - z_gate[None, :]) * sc_gate[None, :]
-                w_up = (up_nib - z_up[None, :]) * sc_up[None, :]
-                acc_gate += tl.sum(x_b[:, None] * w_gate, axis=0)
-                acc_up += tl.sum(x_b[:, None] * w_up, axis=0)
-
-    else:
-        # ── AWQ: iterate over logical K dimension (N-packed weights) ──────────
-        # Each (k, n//8) weight element is already unique in this layout so no
-        # structural redundancy exists.  Scales span multiple K values within a
-        # group; they are loaded per-element as a (BLOCK_KP, BLOCK_N) tile.
-        for k0 in range(0, H, BLOCK_KP):
-            offs_k = k0 + tl.arange(0, BLOCK_KP)
-            mask_k = offs_k < H
-
-            x = tl.load(x_base + offs_k * sx_k, mask=mask_k, other=0.0).to(tl.float32)
-
-            sc_row = offs_k // group_size  # (BLOCK_KP,)
-
-            qw_col_g = offs_n // NPACK
+        else:
+            # AWQ: qweight[e, k, n//8] – packed along N
+            qw_col_g = offs_n // NPACK  # (BLOCK_N,)
             qw_col_u = (offs_n + I) // NPACK
-            n_shift = ((offs_n % NPACK) * 4).to(tl.int32)
+            n_shift = ((offs_n % NPACK) * 4).to(tl.int32)  # (BLOCK_N,)
 
             qw_gate = tl.load(
                 Qw_ptr + eid * sq_e + offs_k[:, None] * sq_r + qw_col_g[None, :] * sq_c,
@@ -230,42 +151,50 @@ def _w1_int4_act_kernel(
             gate_nib = ((qw_gate >> n_shift[None, :]) & 0xF).to(tl.float32)
             up_nib = ((qw_up >> n_shift[None, :]) & 0xF).to(tl.float32)
 
-            sc_gate = tl.load(
-                Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + offs_n[None, :] * ss_c,
-                mask=mask_k[:, None] & mask_n[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            sc_up = tl.load(
-                Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + (offs_n[None, :] + I) * ss_c,
-                mask=mask_k[:, None] & mask_n[None, :],
-                other=0.0,
-            ).to(tl.float32)
+        # ── scales (BLOCK_K, BLOCK_N) ────────────────────────────────────────
+        sc_gate = tl.load(
+            Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + offs_n[None, :] * ss_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(tl.float32)
 
-            z_col = offs_n // NPACK
-            z_shft = ((offs_n % NPACK) * 4).to(tl.int32)
-            z_col_u = (offs_n + I) // NPACK
-            qz_gate = tl.load(
-                Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col[None, :] * sz_c,
-                mask=mask_k[:, None] & mask_n[None, :],
-                other=0,
-            )
-            qz_up = tl.load(
-                Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col_u[None, :] * sz_c,
-                mask=mask_k[:, None] & mask_n[None, :],
-                other=0,
-            )
+        sc_up = tl.load(
+            Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + (offs_n[None, :] + I) * ss_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(tl.float32)
 
-            z_gate = ((qz_gate >> z_shft[None, :]) & 0xF).to(tl.float32)
-            z_up = ((qz_up >> z_shft[None, :]) & 0xF).to(tl.float32)
+        # ── zero-points (always N-packed, both layouts share this convention) ──
+        z_col = offs_n // NPACK  # (BLOCK_N,)
+        z_shft = ((offs_n % NPACK) * 4).to(tl.int32)  # (BLOCK_N,)
+        z_col_u = (offs_n + I) // NPACK
 
-            acc_gate += tl.sum(x[:, None] * (gate_nib - z_gate) * sc_gate, axis=0)
-            acc_up += tl.sum(x[:, None] * (up_nib - z_up) * sc_up, axis=0)
+        qz_gate = tl.load(
+            Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col[None, :] * sz_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
+        )
+        qz_up = tl.load(
+            Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col_u[None, :] * sz_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
+        )
+
+        z_gate = ((qz_gate >> z_shft[None, :]) & 0xF).to(tl.float32)
+        z_up = ((qz_up >> z_shft[None, :]) & 0xF).to(tl.float32)
+
+        # ── dequantize and accumulate ─────────────────────────────────────────
+        w_gate = (gate_nib - z_gate) * sc_gate  # (BLOCK_K, BLOCK_N)
+        w_up = (up_nib - z_up) * sc_up
+
+        acc_gate += tl.sum(x[:, None] * w_gate, axis=0)
+        acc_up += tl.sum(x[:, None] * w_up, axis=0)
 
     # ── gated activation ─────────────────────────────────────────────────────
     if ACTIVATION == 0:  # SiLU (default for most MoE models)
         act = acc_gate * tl.sigmoid(acc_gate) * acc_up
     elif ACTIVATION == 1:  # GELU approximation
-        sqrt_2_over_pi = 0.7978845608028654
+        sqrt_2_over_pi: tl.constexpr = 0.7978845608028654
         g3 = acc_gate * acc_gate * acc_gate
         tanh_arg = sqrt_2_over_pi * (acc_gate + 0.044715 * g3)
         act = 0.5 * acc_gate * (1.0 + tl.math.tanh(tanh_arg)) * acc_up
@@ -312,7 +241,7 @@ def _w2_int4_reduce_kernel(
     group_size: tl.constexpr,
     KPACKED: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_KP: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     KPACK: tl.constexpr,
     NPACK: tl.constexpr,
     num_pairs,
@@ -327,61 +256,34 @@ def _w2_int4_reduce_kernel(
     tid = tl.load(token_ids_ptr + pid_pair).to(tl.int64)
     weight = tl.load(weights_ptr + pid_pair).to(tl.float32)
 
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # output (hidden) indices
     mask_n = offs_n < H
 
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     x_base = X_ptr + pid_pair * sx_m
 
-    if KPACKED:
-        # ── GPTQ / AutoRound: iterate over packed I dimension ─────────────────
-        for kp0 in range(0, I // KPACK, BLOCK_KP):
-            offs_kp = kp0 + tl.arange(0, BLOCK_KP)
-            mask_kp = offs_kp < I // KPACK
+    for k0 in range(0, I, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < I
 
-            # Load each packed weight row exactly once
+        x = tl.load(x_base + offs_k * sx_k, mask=mask_k, other=0.0).to(tl.float32)
+
+        sc_row = offs_k // group_size
+
+        if KPACKED:
+            # GPTQ: qweight[e, k//8, n]  shape (E, I//8, H)
+            qw_row = offs_k // KPACK
+            k_shift = ((offs_k % KPACK) * 4).to(tl.int32)
+
             qw = tl.load(
-                Qw_ptr + eid * sq_e + offs_kp[:, None] * sq_r + offs_n[None, :] * sq_c,
-                mask=mask_kp[:, None] & mask_n[None, :],
+                Qw_ptr + eid * sq_e + qw_row[:, None] * sq_r + offs_n[None, :] * sq_c,
+                mask=mask_k[:, None] & mask_n[None, :],
                 other=0,
-            )  # (BLOCK_KP, BLOCK_N) int32
+            )
+            nib = ((qw >> k_shift[:, None]) & 0xF).to(tl.float32)
 
-            # Scales & zeros: one (BLOCK_N,) vector per group tile
-            sc_row = (kp0 * KPACK) // group_size
-            sc = tl.load(
-                Sc_ptr + eid * ss_e + sc_row * ss_r + offs_n * ss_c,
-                mask=mask_n,
-                other=1.0,
-            ).to(tl.float32)  # (BLOCK_N,)
-
-            z_col = offs_n // NPACK
-            z_shft = ((offs_n % NPACK) * 4).to(tl.int32)
-            qz = tl.load(
-                Qz_ptr + eid * sz_e + sc_row * sz_r + z_col * sz_c,
-                mask=mask_n,
-                other=0,
-            )  # (BLOCK_N,)
-            z = ((qz >> z_shft) & 0xF).to(tl.float32)  # (BLOCK_N,)
-
-            # Statically-unrolled nibble extraction and accumulation
-            for b in tl.static_range(KPACK):
-                offs_kb = (kp0 + tl.arange(0, BLOCK_KP)) * KPACK + b
-                x_b = tl.load(
-                    x_base + offs_kb * sx_k, mask=offs_kb < I, other=0.0
-                ).to(tl.float32)  # (BLOCK_KP,)
-                nib = ((qw >> (b * 4)) & 0xF).to(tl.float32)  # (BLOCK_KP, BLOCK_N)
-                w = (nib - z[None, :]) * sc[None, :]
-                acc += tl.sum(x_b[:, None] * w, axis=0)
-
-    else:
-        # ── AWQ: iterate over logical I dimension ─────────────────────────────
-        for k0 in range(0, I, BLOCK_KP):
-            offs_k = k0 + tl.arange(0, BLOCK_KP)
-            mask_k = offs_k < I
-
-            x = tl.load(x_base + offs_k * sx_k, mask=mask_k, other=0.0).to(tl.float32)
-
-            sc_row = offs_k // group_size
+        else:
+            # AWQ: qweight[e, k, n//8]  shape (E, I, H//8)
             qw_col = offs_n // NPACK
             n_shift = ((offs_n % NPACK) * 4).to(tl.int32)
 
@@ -392,22 +294,23 @@ def _w2_int4_reduce_kernel(
             )
             nib = ((qw >> n_shift[None, :]) & 0xF).to(tl.float32)
 
-            sc = tl.load(
-                Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + offs_n[None, :] * ss_c,
-                mask=mask_k[:, None] & mask_n[None, :],
-                other=0.0,
-            ).to(tl.float32)
+        sc = tl.load(
+            Sc_ptr + eid * ss_e + sc_row[:, None] * ss_r + offs_n[None, :] * ss_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        ).to(tl.float32)
 
-            z_col = offs_n // NPACK
-            z_shft = ((offs_n % NPACK) * 4).to(tl.int32)
-            qz = tl.load(
-                Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col[None, :] * sz_c,
-                mask=mask_k[:, None] & mask_n[None, :],
-                other=0,
-            )
-            z = ((qz >> z_shft[None, :]) & 0xF).to(tl.float32)
+        z_col = offs_n // NPACK
+        z_shft = ((offs_n % NPACK) * 4).to(tl.int32)
+        qz = tl.load(
+            Qz_ptr + eid * sz_e + sc_row[:, None] * sz_r + z_col[None, :] * sz_c,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
+        )
+        z = ((qz >> z_shft[None, :]) & 0xF).to(tl.float32)
 
-            acc += tl.sum(x[:, None] * (nib - z) * sc, axis=0)
+        w = (nib - z) * sc
+        acc += tl.sum(x[:, None] * w, axis=0)
 
     weighted = acc * weight
     y_ptrs = Y_ptr + tid * sy_m + offs_n * sy_n
@@ -419,6 +322,15 @@ def _w2_int4_reduce_kernel(
 # ---------------------------------------------------------------------------
 
 _ACTIVATION_MAP = {"silu": 0, "gelu": 1, "relu": 2}
+
+# Kernel launch parameters for prefill (M > 1) and step-decode (M == 1).
+# For decode, fewer warps raise SM occupancy when the grid is small (only
+# K × I//BLOCK_N CTAs), and num_stages=2 enables double-buffered memory
+# pipelining to hide latency in the serial K-reduction loop.
+_PREFILL_NUM_WARPS = 8
+_PREFILL_NUM_STAGES = 3
+_DECODE_NUM_WARPS = 4
+_DECODE_NUM_STAGES = 2
 
 
 def fused_experts_int4_impl(
@@ -468,13 +380,12 @@ def fused_experts_int4_impl(
     dtype = hidden_states.dtype
     num_pairs = M * K
 
-    # ── Build token–expert index arrays ────────────────────────────────────
     expert_ids = topk_ids.flatten().to(torch.int32)
     token_ids = torch.arange(M, device=device, dtype=torch.int32).repeat_interleave(K)
     weights = topk_weights.flatten()
 
     # Sort pairs by expert ID so that consecutive CTAs access the same expert's
-    # weight tensors, improving L2 cache reuse when multiple tokens share an expert.
+    # weight tensors, improving L2 cache reuse when multiple tokens are batched.
     sort_idx = torch.argsort(expert_ids, stable=True)
     expert_ids = expert_ids[sort_idx]
     token_ids = token_ids[sort_idx]
@@ -482,8 +393,14 @@ def fused_experts_int4_impl(
 
     act_code = _ACTIVATION_MAP.get(activation.lower(), 0)
 
-    BLOCK_N = _DEFAULT_BLOCK_N
-    BLOCK_KP = _DEFAULT_BLOCK_KP
+    BLOCK_N, BLOCK_K = 64, 64
+
+    # For step-decode (M=1) use GEMV-tuned launch parameters: fewer warps per
+    # CTA raises SM occupancy (the grid is small: only K × I//BLOCK_N CTAs),
+    # and num_stages=2 enables double-buffered pipelining for the K-loop.
+    is_decode = M == 1
+    num_warps = _DECODE_NUM_WARPS if is_decode else _PREFILL_NUM_WARPS
+    num_stages = _DECODE_NUM_STAGES if is_decode else _PREFILL_NUM_STAGES
 
     # ── W1: gate+up projection + activation → intermediate ────────────────
     intermediate = torch.empty((num_pairs, I), device=device, dtype=dtype)
@@ -497,29 +414,37 @@ def fused_experts_int4_impl(
         intermediate,
         expert_ids,
         token_ids,
+        # X strides
         hidden_states.stride(0),
         hidden_states.stride(1),
+        # Qw strides
         w1_qweight.stride(0),
         w1_qweight.stride(1),
         w1_qweight.stride(2),
+        # Sc strides
         w1_scales.stride(0),
         w1_scales.stride(1),
         w1_scales.stride(2),
+        # Qz strides
         w1_qzeros.stride(0),
         w1_qzeros.stride(1),
         w1_qzeros.stride(2),
+        # Y strides
         intermediate.stride(0),
         intermediate.stride(1),
+        # dims
         H=H,
         I=I,
         group_size=group_size,
         KPACKED=kpacked,
         ACTIVATION=act_code,
         BLOCK_N=BLOCK_N,
-        BLOCK_KP=BLOCK_KP,
+        BLOCK_K=BLOCK_K,
         KPACK=8,
         NPACK=8,
         num_pairs=num_pairs,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     # ── W2: down projection + weighted reduce → output ────────────────────
@@ -535,28 +460,36 @@ def fused_experts_int4_impl(
         expert_ids,
         token_ids,
         weights,
+        # intermediate strides
         intermediate.stride(0),
         intermediate.stride(1),
+        # Qw strides
         w2_qweight.stride(0),
         w2_qweight.stride(1),
         w2_qweight.stride(2),
+        # Sc strides
         w2_scales.stride(0),
         w2_scales.stride(1),
         w2_scales.stride(2),
+        # Qz strides
         w2_qzeros.stride(0),
         w2_qzeros.stride(1),
         w2_qzeros.stride(2),
+        # output strides
         final_output.stride(0),
         final_output.stride(1),
+        # dims
         H=H,
         I=I,
         group_size=group_size,
         KPACKED=kpacked,
         BLOCK_N=BLOCK_N,
-        BLOCK_KP=BLOCK_KP,
+        BLOCK_K=BLOCK_K,
         KPACK=8,
         NPACK=8,
         num_pairs=num_pairs,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     return final_output

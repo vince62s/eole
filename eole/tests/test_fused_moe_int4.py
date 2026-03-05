@@ -4,8 +4,7 @@ These tests do not require Triton or a CUDA GPU.  They verify:
   1. detect_expert_quant_type correctly classifies GPTQ, AWQ, Marlin, and fp16 layers.
   2. stack_gptq_moe_weights / stack_awq_moe_weights produce correctly-shaped tensors.
   3. The ``fused_experts_int4_impl`` function exists and has the expected signature.
-  4. The default BLOCK_KP and BLOCK_N values satisfy the group-size constraint and
-     are powers of two as required by tl.arange.
+  4. The decode-path constants (_DECODE_NUM_WARPS, _DECODE_NUM_STAGES) are valid.
   5. The wrapper sorts token-expert pairs by expert ID before launching kernels.
 
 No Triton kernels are actually executed; the tests are skipped when Triton
@@ -243,43 +242,40 @@ class TestFusedInt4ImplSignature(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: block size constraints
+# Tests: decode-path launch parameters
 # ---------------------------------------------------------------------------
 
-class TestBlockSizeConstraints(unittest.TestCase):
-    """The KPACKED path requires BLOCK_KP * KPACK <= group_size so every element
-    in a packed tile belongs to the same quantisation group.  This test confirms
-    that the module-level default block sizes satisfy that constraint for the minimum
-    common group_size of 128, and that both sizes are powers of two as required
-    by tl.arange."""
+class TestDecodeParameters(unittest.TestCase):
+    """The step-decode path (M=1) uses different kernel launch parameters from
+    prefill to maximise SM occupancy on small grids.  This test checks that the
+    module exports sensible constants and that they differ from the prefill values."""
 
-    def _get_defaults(self):
+    def _get_constants(self):
         try:
-            from eole.triton.fused_moe_int4 import _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP
-            return _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP
+            from eole.triton.fused_moe_int4 import (
+                _DECODE_NUM_WARPS,
+                _DECODE_NUM_STAGES,
+                _PREFILL_NUM_WARPS,
+                _PREFILL_NUM_STAGES,
+            )
+            return _DECODE_NUM_WARPS, _DECODE_NUM_STAGES, _PREFILL_NUM_WARPS, _PREFILL_NUM_STAGES
         except ImportError:
             self.skipTest("Triton not installed")
 
-    def test_kpacked_tile_fits_within_group(self):
-        _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP = self._get_defaults()
-        KPACK = 8
-        MIN_GROUP_SIZE = 128
-        logical_k = _DEFAULT_BLOCK_KP * KPACK
-        self.assertLessEqual(
-            logical_k,
-            MIN_GROUP_SIZE,
-            f"_DEFAULT_BLOCK_KP={_DEFAULT_BLOCK_KP} → {logical_k} logical K > group_size={MIN_GROUP_SIZE}",
-        )
+    def test_decode_warps_less_than_prefill(self):
+        """Fewer warps per CTA raises SM occupancy when the grid is small (M=1)."""
+        dw, ds, pw, ps = self._get_constants()
+        self.assertLess(dw, pw, "decode num_warps should be less than prefill num_warps")
 
-    def test_block_sizes_are_powers_of_two(self):
-        """tl.arange requires power-of-2 extents."""
-        _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP = self._get_defaults()
-
-        def is_pow2(n):
-            return n > 0 and (n & (n - 1)) == 0
-
-        self.assertTrue(is_pow2(_DEFAULT_BLOCK_N), f"_DEFAULT_BLOCK_N={_DEFAULT_BLOCK_N} is not a power of 2")
-        self.assertTrue(is_pow2(_DEFAULT_BLOCK_KP), f"_DEFAULT_BLOCK_KP={_DEFAULT_BLOCK_KP} is not a power of 2")
+    def test_all_values_positive(self):
+        dw, ds, pw, ps = self._get_constants()
+        for name, val in [
+            ("_DECODE_NUM_WARPS", dw),
+            ("_DECODE_NUM_STAGES", ds),
+            ("_PREFILL_NUM_WARPS", pw),
+            ("_PREFILL_NUM_STAGES", ps),
+        ]:
+            self.assertGreater(val, 0, f"{name} must be positive")
 
 
 # ---------------------------------------------------------------------------
