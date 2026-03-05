@@ -6,6 +6,9 @@ These tests do not require Triton or a CUDA GPU.  They verify:
   3. The ``fused_experts_int4_impl`` function exists and has the expected signature.
   4. The decode-path constants (_DECODE_NUM_WARPS, _DECODE_NUM_STAGES) are valid.
   5. The wrapper sorts token-expert pairs by expert ID before launching kernels.
+  6. Both ``fused_experts_int4_impl`` and ``fused_experts_impl`` carry
+     ``@torch.compiler.disable`` so ``torch.compile(fullgraph=True)`` on a MoE
+     layer degrades gracefully (graph break) rather than crashing at runtime.
 
 No Triton kernels are actually executed; the tests are skipped when Triton
 or CUDA is unavailable.
@@ -342,6 +345,49 @@ class TestWrapperSortsPairsByExpert(unittest.TestCase):
         if "expert_ids" in captured:
             ids = captured["expert_ids"]
             self.assertEqual(ids, sorted(ids), "expert_ids passed to W1 kernel must be sorted")
+
+
+
+# ---------------------------------------------------------------------------
+# Tests: torch.compile compatibility
+# ---------------------------------------------------------------------------
+
+class TestTorchCompileCompatibility(unittest.TestCase):
+    """fused_experts_int4_impl must be decorated with @torch.compiler.disable so
+    that torch.compile(fullgraph=True) raises a clear graph-break error rather
+    than a cryptic Triton-kernel tracing crash, and so that torch.compile with
+    fullgraph=False runs the function eagerly without errors."""
+
+    def test_impl_has_compiler_disable(self):
+        """fused_experts_int4_impl must carry the @torch.compiler.disable marker."""
+        try:
+            from eole.triton.fused_moe_int4 import fused_experts_int4_impl
+        except ImportError:
+            self.skipTest("Triton not installed")
+
+        # torch.compiler.disable wraps the function; the wrapper exposes
+        # ._torchdynamo_disable = True on the decorated callable.
+        import torch
+        disabled = getattr(fused_experts_int4_impl, "_torchdynamo_disable", False)
+        self.assertTrue(
+            disabled,
+            "fused_experts_int4_impl must be decorated with @torch.compiler.disable "
+            "so torch.compile(fullgraph=True) on a MoE layer doesn't crash at runtime",
+        )
+
+    def test_fp16_impl_has_compiler_disable(self):
+        """fused_experts_impl (fp16 path) must also carry the @torch.compiler.disable marker."""
+        try:
+            from eole.triton.fused_moe import fused_experts_impl
+        except ImportError:
+            self.skipTest("Triton not installed")
+
+        disabled = getattr(fused_experts_impl, "_torchdynamo_disable", False)
+        self.assertTrue(
+            disabled,
+            "fused_experts_impl must be decorated with @torch.compiler.disable "
+            "so torch.compile(fullgraph=True) on a MoE layer doesn't crash at runtime",
+        )
 
 
 if __name__ == "__main__":

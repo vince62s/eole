@@ -333,6 +333,7 @@ _DECODE_NUM_WARPS = 4
 _DECODE_NUM_STAGES = 2
 
 
+@torch.compiler.disable
 def fused_experts_int4_impl(
     hidden_states: torch.Tensor,
     w1_qweight: torch.Tensor,

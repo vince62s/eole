@@ -253,6 +253,7 @@ def w2_reduce_kernel(
 # ===========================
 
 
+@torch.compiler.disable
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
