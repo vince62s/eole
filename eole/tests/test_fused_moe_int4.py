@@ -4,7 +4,8 @@ These tests do not require Triton or a CUDA GPU.  They verify:
   1. detect_expert_quant_type correctly classifies GPTQ, AWQ, Marlin, and fp16 layers.
   2. stack_gptq_moe_weights / stack_awq_moe_weights produce correctly-shaped tensors.
   3. The ``fused_experts_int4_impl`` function exists and has the expected signature.
-  4. The autotune configs satisfy the group-size constraint (BLOCK_KP * KPACK <= gs).
+  4. The default BLOCK_KP and BLOCK_N values satisfy the group-size constraint and
+     are powers of two as required by tl.arange.
   5. The wrapper sorts token-expert pairs by expert ID before launching kernels.
 
 No Triton kernels are actually executed; the tests are skipped when Triton
@@ -242,48 +243,43 @@ class TestFusedInt4ImplSignature(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: autotune config validity (group-size constraint)
+# Tests: block size constraints
 # ---------------------------------------------------------------------------
 
-class TestAutotuneConfigs(unittest.TestCase):
+class TestBlockSizeConstraints(unittest.TestCase):
     """The KPACKED path requires BLOCK_KP * KPACK <= group_size so every element
     in a packed tile belongs to the same quantisation group.  This test confirms
-    that all bundled autotune configs satisfy that constraint for the minimum
-    common group_size of 128."""
+    that the module-level default block sizes satisfy that constraint for the minimum
+    common group_size of 128, and that both sizes are powers of two as required
+    by tl.arange."""
+
+    def _get_defaults(self):
+        try:
+            from eole.triton.fused_moe_int4 import _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP
+            return _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP
+        except ImportError:
+            self.skipTest("Triton not installed")
 
     def test_kpacked_tile_fits_within_group(self):
-        try:
-            from eole.triton.fused_moe_int4 import _AUTOTUNE_CONFIGS
-        except ImportError:
-            self.skipTest("Triton not installed")
-
+        _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP = self._get_defaults()
         KPACK = 8
         MIN_GROUP_SIZE = 128
+        logical_k = _DEFAULT_BLOCK_KP * KPACK
+        self.assertLessEqual(
+            logical_k,
+            MIN_GROUP_SIZE,
+            f"_DEFAULT_BLOCK_KP={_DEFAULT_BLOCK_KP} → {logical_k} logical K > group_size={MIN_GROUP_SIZE}",
+        )
 
-        for cfg in _AUTOTUNE_CONFIGS:
-            block_kp = cfg.kwargs["BLOCK_KP"]  # all configs must have BLOCK_KP
-            logical_k = block_kp * KPACK
-            self.assertLessEqual(
-                logical_k,
-                MIN_GROUP_SIZE,
-                f"Config BLOCK_KP={block_kp} → {logical_k} logical K > group_size={MIN_GROUP_SIZE}",
-            )
-
-    def test_all_block_sizes_are_powers_of_two(self):
+    def test_block_sizes_are_powers_of_two(self):
         """tl.arange requires power-of-2 extents."""
-        try:
-            from eole.triton.fused_moe_int4 import _AUTOTUNE_CONFIGS
-        except ImportError:
-            self.skipTest("Triton not installed")
+        _DEFAULT_BLOCK_N, _DEFAULT_BLOCK_KP = self._get_defaults()
 
         def is_pow2(n):
             return n > 0 and (n & (n - 1)) == 0
 
-        for cfg in _AUTOTUNE_CONFIGS:
-            for key in ("BLOCK_N", "BLOCK_KP"):
-                val = cfg.kwargs.get(key)
-                if val is not None:
-                    self.assertTrue(is_pow2(val), f"{key}={val} is not a power of 2")
+        self.assertTrue(is_pow2(_DEFAULT_BLOCK_N), f"_DEFAULT_BLOCK_N={_DEFAULT_BLOCK_N} is not a power of 2")
+        self.assertTrue(is_pow2(_DEFAULT_BLOCK_KP), f"_DEFAULT_BLOCK_KP={_DEFAULT_BLOCK_KP} is not a power of 2")
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +289,8 @@ class TestAutotuneConfigs(unittest.TestCase):
 class TestWrapperSortsPairsByExpert(unittest.TestCase):
     """fused_experts_int4_impl must sort (expert_ids, token_ids, weights) by
     expert_id before launching kernels.  We verify the sort is applied by
-    monkeypatching the kernel and inspecting the expert_ids tensor it receives."""
+    monkeypatching the plain @triton.jit kernel and inspecting the expert_ids
+    tensor it receives."""
 
     def test_pairs_arrive_sorted(self):
         try:
@@ -307,7 +304,7 @@ class TestWrapperSortsPairsByExpert(unittest.TestCase):
         original_w1 = mod._w1_int4_act_kernel
 
         class _CapturingKernel:
-            """Wraps the autotuned kernel to capture the expert_ids argument."""
+            """Intercepts the plain @triton.jit kernel to capture expert_ids."""
             def __getitem__(self, grid):
                 def _call(*args, **kwargs):
                     # expert_ids is the 6th positional tensor arg (index 5):
@@ -323,7 +320,6 @@ class TestWrapperSortsPairsByExpert(unittest.TestCase):
 
         mod._w1_int4_act_kernel = _CapturingKernel()
         try:
-            import torch
             M, H, K = 4, 64, 2
             E, I, gs = 4, 64, 64
             # Construct unsorted topk_ids that need sorting
