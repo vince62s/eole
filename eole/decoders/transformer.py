@@ -123,20 +123,13 @@ class TransformerDecoderLayer(nn.Module):
         cache_seqlens=None,
     ):
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
-            # MoE layers call fused_experts_int4_impl / fused_experts_impl which
-            # launch Triton kernels directly (kernel[grid](args) syntax).
-            # torch.compile cannot trace through those kernel launches in
-            # fullgraph=True mode, so for MoE layers we use fullgraph=False
-            # (graph breaks allowed) and disable CUDA-graph capture (which
-            # requires a single contiguous op sequence).
-            is_moe_layer = isinstance(self.mlp, MoE)
             self._forward_compile = torch.compile(
                 self._forward_eager,
-                fullgraph=not is_moe_layer,
+                fullgraph=True,
                 dynamic=False,
                 options={
                     "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
-                    "triton.cudagraphs": EOLE_COMPILE_MODE == "2" and not is_moe_layer,
+                    "triton.cudagraphs": EOLE_COMPILE_MODE == "2",
                 },
             )
         if layer_in is not None:

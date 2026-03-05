@@ -390,13 +390,28 @@ class GatedDeltaNet(nn.Module):
         a = self.in_proj_a(hidden_states)  # (B, S, num_v_heads)
 
         if use_precomputed:
-            mixed_qkv = self._causal_conv1d_update(
-                mixed_qkv,
-                self.conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                "silu",
-            )
+            # Decode path (seq_len == 1).
+            # When running under torch.compile(fullgraph=True) the C-extension
+            # causal_conv1d_update and FLA fused_recurrent_gated_delta_rule may not
+            # be fully traceable.  Use the pure-PyTorch fallbacks instead: they are
+            # composed entirely of standard torch ops, so torch.compile can fuse and
+            # CUDA-graph-capture them without any graph breaks.
+            if torch.compiler.is_compiling():
+                mixed_qkv = _torch_causal_conv1d_update(
+                    mixed_qkv,
+                    self.conv_state,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    "silu",
+                )
+            else:
+                mixed_qkv = self._causal_conv1d_update(
+                    mixed_qkv,
+                    self.conv_state,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    "silu",
+                )
         else:
             if self.conv_state is not None:
                 # save state for next step
@@ -449,16 +464,29 @@ class GatedDeltaNet(nn.Module):
 
         # Compute linear attention
         if use_precomputed:
-            output, new_recurrent_state = self._recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                initial_state=self.recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if torch.compiler.is_compiling():
+                # Pure-PyTorch fallback: fully traceable by torch.compile.
+                output, new_recurrent_state = _torch_recurrent_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state=self.recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            else:
+                output, new_recurrent_state = self._recurrent_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state=self.recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
             if new_recurrent_state is not None:
                 self.recurrent_state.copy_(new_recurrent_state.to(self.recurrent_state.dtype))
         else:

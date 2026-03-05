@@ -22,15 +22,9 @@ then applies gated SiLU/GELU/ReLU in-kernel.
 For W2 (down projection) the kernel applies a weighted atomic-add reduce
 directly into the output buffer.
 
-Step-decode optimisation (M=1)
--------------------------------
-When decoding a single token (M=1), the two kernels are launched with
-``num_warps=4, num_stages=2`` instead of the prefill defaults.  Fewer warps
-per CTA raises SM occupancy (more CTAs fit per SM when the grid is small),
-and ``num_stages=2`` enables double-buffered memory pipelining that hides
-global-memory latency in the serial K-reduction loop.  Pairs are also sorted
-by expert ID so that consecutive CTAs access the same expert's weight tiles,
-improving L2 cache reuse in batched-decode scenarios (M > 1).
+Pairs are sorted by expert ID so that consecutive CTAs access the same
+expert's weight tiles, improving L2 cache reuse when processing multiple
+tokens (M > 1).
 """
 
 import torch
@@ -323,17 +317,7 @@ def _w2_int4_reduce_kernel(
 
 _ACTIVATION_MAP = {"silu": 0, "gelu": 1, "relu": 2}
 
-# Kernel launch parameters for prefill (M > 1) and step-decode (M == 1).
-# For decode, fewer warps raise SM occupancy when the grid is small (only
-# K × I//BLOCK_N CTAs), and num_stages=2 enables double-buffered memory
-# pipelining to hide latency in the serial K-reduction loop.
-_PREFILL_NUM_WARPS = 8
-_PREFILL_NUM_STAGES = 3
-_DECODE_NUM_WARPS = 4
-_DECODE_NUM_STAGES = 2
 
-
-@torch.compiler.disable
 def fused_experts_int4_impl(
     hidden_states: torch.Tensor,
     w1_qweight: torch.Tensor,
@@ -396,13 +380,6 @@ def fused_experts_int4_impl(
 
     BLOCK_N, BLOCK_K = 64, 64
 
-    # For step-decode (M=1) use GEMV-tuned launch parameters: fewer warps per
-    # CTA raises SM occupancy (the grid is small: only K × I//BLOCK_N CTAs),
-    # and num_stages=2 enables double-buffered pipelining for the K-loop.
-    is_decode = M == 1
-    num_warps = _DECODE_NUM_WARPS if is_decode else _PREFILL_NUM_WARPS
-    num_stages = _DECODE_NUM_STAGES if is_decode else _PREFILL_NUM_STAGES
-
     # ── W1: gate+up projection + activation → intermediate ────────────────
     intermediate = torch.empty((num_pairs, I), device=device, dtype=dtype)
 
@@ -444,8 +421,6 @@ def fused_experts_int4_impl(
         KPACK=8,
         NPACK=8,
         num_pairs=num_pairs,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
 
     # ── W2: down projection + weighted reduce → output ────────────────────
@@ -489,8 +464,6 @@ def fused_experts_int4_impl(
         KPACK=8,
         NPACK=8,
         num_pairs=num_pairs,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
 
     return final_output

@@ -4,11 +4,16 @@ These tests do not require Triton or a CUDA GPU.  They verify:
   1. detect_expert_quant_type correctly classifies GPTQ, AWQ, Marlin, and fp16 layers.
   2. stack_gptq_moe_weights / stack_awq_moe_weights produce correctly-shaped tensors.
   3. The ``fused_experts_int4_impl`` function exists and has the expected signature.
-  4. The decode-path constants (_DECODE_NUM_WARPS, _DECODE_NUM_STAGES) are valid.
-  5. The wrapper sorts token-expert pairs by expert ID before launching kernels.
-  6. Both ``fused_experts_int4_impl`` and ``fused_experts_impl`` carry
-     ``@torch.compiler.disable`` so ``torch.compile(fullgraph=True)`` on a MoE
-     layer degrades gracefully (graph break) rather than crashing at runtime.
+  4. The wrapper sorts token-expert pairs by expert ID before launching kernels.
+  5. torch.compile compatibility:
+     - ``fused_experts_int4_impl`` and ``fused_experts_impl`` must NOT carry
+       ``@torch.compiler.disable`` – they should be directly traceable by
+       ``torch.compile(fullgraph=True)``.
+     - ``fused_experts_int4_impl`` must not pass ``num_warps``/``num_stages`` as
+       runtime kernel args (this was the incompatibility with fullgraph=True).
+     - ``GatedDeltaNet.forward`` must use ``torch.compiler.is_compiling()`` in the
+       decode path to select pure-PyTorch fallbacks (external C-ext / FLA kernels
+       may not be fully traceable by torch.compile).
 
 No Triton kernels are actually executed; the tests are skipped when Triton
 or CUDA is unavailable.
@@ -245,44 +250,7 @@ class TestFusedInt4ImplSignature(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: decode-path launch parameters
-# ---------------------------------------------------------------------------
-
-class TestDecodeParameters(unittest.TestCase):
-    """The step-decode path (M=1) uses different kernel launch parameters from
-    prefill to maximise SM occupancy on small grids.  This test checks that the
-    module exports sensible constants and that they differ from the prefill values."""
-
-    def _get_constants(self):
-        try:
-            from eole.triton.fused_moe_int4 import (
-                _DECODE_NUM_WARPS,
-                _DECODE_NUM_STAGES,
-                _PREFILL_NUM_WARPS,
-                _PREFILL_NUM_STAGES,
-            )
-            return _DECODE_NUM_WARPS, _DECODE_NUM_STAGES, _PREFILL_NUM_WARPS, _PREFILL_NUM_STAGES
-        except ImportError:
-            self.skipTest("Triton not installed")
-
-    def test_decode_warps_less_than_prefill(self):
-        """Fewer warps per CTA raises SM occupancy when the grid is small (M=1)."""
-        dw, ds, pw, ps = self._get_constants()
-        self.assertLess(dw, pw, "decode num_warps should be less than prefill num_warps")
-
-    def test_all_values_positive(self):
-        dw, ds, pw, ps = self._get_constants()
-        for name, val in [
-            ("_DECODE_NUM_WARPS", dw),
-            ("_DECODE_NUM_STAGES", ds),
-            ("_PREFILL_NUM_WARPS", pw),
-            ("_PREFILL_NUM_STAGES", ps),
-        ]:
-            self.assertGreater(val, 0, f"{name} must be positive")
-
-
-# ---------------------------------------------------------------------------
-# Tests: pair sorting in the Python wrapper
+# Tests: wrapper correctness
 # ---------------------------------------------------------------------------
 
 class TestWrapperSortsPairsByExpert(unittest.TestCase):
@@ -353,40 +321,107 @@ class TestWrapperSortsPairsByExpert(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestTorchCompileCompatibility(unittest.TestCase):
-    """fused_experts_int4_impl must be decorated with @torch.compiler.disable so
-    that torch.compile(fullgraph=True) raises a clear graph-break error rather
-    than a cryptic Triton-kernel tracing crash, and so that torch.compile with
-    fullgraph=False runs the function eagerly without errors."""
+    """Verify that the torch.compile-compatible design is in place.
 
-    def test_impl_has_compiler_disable(self):
-        """fused_experts_int4_impl must carry the @torch.compiler.disable marker."""
+    fused_experts_int4_impl must NOT carry @torch.compiler.disable; instead it
+    must be directly traceable by fullgraph=True compilation (Triton @triton.jit
+    kernels are supported by torch.compile; only runtime num_warps/num_stages
+    meta-args were the previous obstacle).
+
+    GatedDeltaNet must use torch.compiler.is_compiling() to select pure-PyTorch
+    fallbacks in its decode path so that external C-extension / FLA kernels
+    don't break fullgraph=True tracing.
+    """
+
+    def test_impl_has_no_compiler_disable(self):
+        """fused_experts_int4_impl must NOT carry @torch.compiler.disable.
+
+        The fp16 fused_moe.py path works with torch.compile(fullgraph=True)
+        without any disable marker.  The int4 path must follow the same approach:
+        be directly traceable (Triton @triton.jit kernels are supported).
+        """
         try:
             from eole.triton.fused_moe_int4 import fused_experts_int4_impl
         except ImportError:
             self.skipTest("Triton not installed")
 
-        # torch.compiler.disable wraps the function; the wrapper exposes
-        # ._torchdynamo_disable = True on the decorated callable.
-        import torch
         disabled = getattr(fused_experts_int4_impl, "_torchdynamo_disable", False)
-        self.assertTrue(
+        self.assertFalse(
             disabled,
-            "fused_experts_int4_impl must be decorated with @torch.compiler.disable "
-            "so torch.compile(fullgraph=True) on a MoE layer doesn't crash at runtime",
+            "fused_experts_int4_impl must NOT be decorated with @torch.compiler.disable – "
+            "it should be directly traceable by torch.compile(fullgraph=True)",
         )
 
-    def test_fp16_impl_has_compiler_disable(self):
-        """fused_experts_impl (fp16 path) must also carry the @torch.compiler.disable marker."""
+    def test_fp16_impl_has_no_compiler_disable(self):
+        """fused_experts_impl (fp16) must not carry @torch.compiler.disable either."""
         try:
             from eole.triton.fused_moe import fused_experts_impl
         except ImportError:
             self.skipTest("Triton not installed")
 
         disabled = getattr(fused_experts_impl, "_torchdynamo_disable", False)
-        self.assertTrue(
+        self.assertFalse(
             disabled,
-            "fused_experts_impl must be decorated with @torch.compiler.disable "
-            "so torch.compile(fullgraph=True) on a MoE layer doesn't crash at runtime",
+            "fused_experts_impl must NOT be decorated with @torch.compiler.disable – "
+            "the fp16 path is known to work with torch.compile(fullgraph=True)",
+        )
+
+    def test_no_runtime_num_warps_in_kernel_calls(self):
+        """fused_experts_int4_impl must not pass num_warps/num_stages as runtime
+        args to Triton kernels.
+
+        Passing meta-parameters as runtime Python kwargs was the original
+        incompatibility with torch.compile(fullgraph=True) for the int4 path.
+        The fp16 fused_moe path never passes them and works fine; the int4
+        path must follow the same convention.
+        """
+        import inspect
+        try:
+            from eole.triton import fused_moe_int4 as mod
+        except ImportError:
+            self.skipTest("Triton not installed")
+
+        src = inspect.getsource(mod.fused_experts_int4_impl)
+        self.assertNotIn(
+            "num_warps=",
+            src,
+            "fused_experts_int4_impl must not pass num_warps= as a runtime kernel arg "
+            "(this breaks torch.compile(fullgraph=True)); use Triton defaults instead",
+        )
+        self.assertNotIn(
+            "num_stages=",
+            src,
+            "fused_experts_int4_impl must not pass num_stages= as a runtime kernel arg "
+            "(this breaks torch.compile(fullgraph=True)); use Triton defaults instead",
+        )
+
+    def test_gated_delta_net_uses_is_compiling_for_decode(self):
+        """GatedDeltaNet.forward must call torch.compiler.is_compiling() in the
+        decode path to select fully-traceable pure-PyTorch fallbacks.
+
+        External libraries (causal_conv1d C extension, FLA kernels) may not be
+        fullgraph=True-compatible; the is_compiling() guard ensures the compiled
+        graph only contains standard torch ops.
+        """
+        import inspect
+        from eole.modules import gated_delta_net as mod
+        src = inspect.getsource(mod.GatedDeltaNet.forward)
+        self.assertIn(
+            "is_compiling",
+            src,
+            "GatedDeltaNet.forward must use torch.compiler.is_compiling() to select "
+            "pure-PyTorch fallbacks in the decode path for torch.compile compatibility",
+        )
+        # Also verify the fallback functions are referenced directly (not just self._*)
+        self.assertIn(
+            "_torch_causal_conv1d_update",
+            src,
+            "GatedDeltaNet.forward must call _torch_causal_conv1d_update when compiling",
+        )
+        self.assertIn(
+            "_torch_recurrent_gated_delta_rule",
+            src,
+            "GatedDeltaNet.forward must call _torch_recurrent_gated_delta_rule when compiling",
         )
 
 
