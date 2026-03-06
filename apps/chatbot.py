@@ -28,8 +28,8 @@ import requests
 LATEX_DELIMITERS = [
     {"left": "$$", "right": "$$", "display": True},
     {"left": "$", "right": "$", "display": False},
-    {"left": r"\(", "right": r"\)", "display": True},
-    {"left": r"\[", "right": r"\]", "display": False},
+    {"left": r"\(", "right": r"\)", "display": False},
+    {"left": r"\[", "right": r"\]", "display": True},
 ]
 
 
@@ -104,7 +104,7 @@ def get_models(api_url: str) -> list[str]:
         data = response.json()
         models = [m.get("id", str(m)) for m in data.get("models", [])]
         return models or ["No models found"]
-    except Exception as exc:  # noqa: BLE001
+    except (requests.RequestException, ValueError) as exc:
         return [f"Error: {exc}"]
 
 
@@ -141,7 +141,7 @@ def build_app(default_api_url: str, default_model: str) -> gr.Blocks:
             for chunk in stream_chat_completions(api_url=api_url, model=model, messages=messages):
                 accumulated += chunk
                 yield accumulated
-        except Exception as exc:  # noqa: BLE001
+        except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
             yield f"[Error communicating with server: {exc}]"
 
     with gr.Blocks(title="Eole Chatbot") as app:
