@@ -6,14 +6,14 @@ import gc
 import yaml
 import json
 import uuid
-from typing import List, Union, Optional, Literal
+from typing import Any, List, Union, Optional, Literal
 
 import torch
 import uvicorn
 
 from fastapi import FastAPI, Request, Body
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from jinja2.exceptions import TemplateError
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
@@ -109,11 +109,22 @@ class ChatRequest(DecodingConfig):
 
 
 class OpenAIMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    # Allow any extra fields (e.g. name, tool_call_id, tool_calls) sent by
+    # OpenAI-compatible clients without triggering a 422.
+    model_config = ConfigDict(extra="ignore")
+
+    role: Literal["system", "user", "assistant", "tool"]
+    # Per the OpenAI API spec, content can be a string, an array of content
+    # parts (multimodal), or null (when the message only carries tool_calls).
+    content: Optional[Union[str, List[Any]]] = None
 
 
 class OpenAIChatRequest(BaseModel):
+    # Silently drop any OpenAI-compatible fields not explicitly declared here
+    # (e.g. top_k, tools, tool_choice, response_format, seed, …) so that
+    # clients that send them don't receive a 422.
+    model_config = ConfigDict(extra="ignore")
+
     model: str
     messages: List[OpenAIMessage]
     temperature: Optional[float] = 1.0
@@ -834,7 +845,18 @@ def create_app(config_file):
             )
 
             # Calculate token usage (rough estimation)
-            prompt_text = " ".join([msg.content for msg in request.messages])
+            # content can be None (tool-call-only message) or a list (multipart);
+            # normalise to plain text for token counting.
+            def _content_as_str(c):
+                if c is None:
+                    return ""
+                if isinstance(c, list):
+                    return " ".join(
+                        p.get("text", "") if isinstance(p, dict) else str(p) for p in c
+                    )
+                return str(c)
+
+            prompt_text = " ".join([_content_as_str(msg.content) for msg in request.messages])
             prompt_tokens = estimate_tokens(prompt_text)
             completion_text = preds[0][0] if preds and preds[0] else ""
             completion_tokens = estimate_tokens(completion_text)
