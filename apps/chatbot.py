@@ -115,7 +115,7 @@ def refresh_models(api_url: str) -> dict:
 
 def vote(data: gr.LikeData) -> None:
     action = "upvoted" if data.liked else "downvoted"
-    print(f"User {action}: {data.value['value']!r}")
+    print(f"User {action}: {data.value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +167,6 @@ def build_app(default_api_url: str, default_model: str) -> gr.Blocks:
             elem_id="chatbot",
             latex_delimiters=LATEX_DELIMITERS,
             height=700,
-            type="messages",
         )
         chatbot_widget.like(vote, None, None)
 
@@ -175,7 +174,6 @@ def build_app(default_api_url: str, default_model: str) -> gr.Blocks:
             fn=chat_fn,
             chatbot=chatbot_widget,
             additional_inputs=[api_url_input, model_dropdown],
-            type="messages",
         )
 
         refresh_btn.click(fn=refresh_models, inputs=[api_url_input], outputs=[model_dropdown])
