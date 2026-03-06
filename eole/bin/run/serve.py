@@ -12,7 +12,7 @@ import torch
 import uvicorn
 
 from fastapi import FastAPI, Request, Body
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from jinja2.exceptions import TemplateError
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -178,6 +178,36 @@ class OpenAIChatResponse(BaseModel):
                 "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
             }
         }
+
+
+# ---------------------------------------------------------------------------
+# SSE streaming models (OpenAI chat.completion.chunk format)
+# ---------------------------------------------------------------------------
+
+
+class OpenAIStreamDelta(BaseModel):
+    """Delta object inside a streaming chunk choice."""
+
+    role: Optional[Literal["assistant"]] = None
+    content: Optional[str] = None
+
+
+class OpenAIStreamChoice(BaseModel):
+    """Choice object inside a streaming chunk."""
+
+    index: int
+    delta: OpenAIStreamDelta
+    finish_reason: Optional[Literal["stop", "length"]] = None
+
+
+class OpenAIStreamChunk(BaseModel):
+    """A single Server-Sent Events chunk in OpenAI streaming format."""
+
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[OpenAIStreamChoice]
 
 
 def map_openai_to_eole_settings(openai_request: OpenAIChatRequest) -> dict:
@@ -613,21 +643,6 @@ def create_app(config_file):
         for OpenAI or other LLM APIs.
         """
         try:
-            # Check if streaming is requested (not supported yet)
-            if request.stream:
-                from fastapi.responses import JSONResponse
-
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": {
-                            "message": "Streaming is not yet supported",
-                            "type": "invalid_request_error",
-                            "code": "streaming_not_supported",
-                        }
-                    },
-                )
-
             # Check if n > 1 (multiple completions not supported in simple implementation)
             if request.n > 1:
                 from fastapi.responses import JSONResponse
@@ -667,6 +682,107 @@ def create_app(config_file):
 
             await server.maybe_load_model(model_id)
 
+            # ----------------------------------------------------------------
+            # Streaming path
+            # ----------------------------------------------------------------
+            if request.stream:
+                model_obj = server.models[model_id]
+                if not model_obj.loaded:
+                    model_obj.load()
+
+                chat_input = model_obj.apply_chat_template(messages)
+                completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+                created_ts = int(time.time())
+
+                async def _stream_sse():
+                    """Async generator that yields SSE-formatted data lines."""
+                    loop = asyncio.get_event_loop()
+
+                    # Run the synchronous streaming generator in a thread-pool
+                    # executor so it doesn't block the event loop.
+                    import concurrent.futures
+
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+                    # The engine's infer_list_stream is a synchronous generator.
+                    # We iterate it inside run_in_executor via a queue-bridging
+                    # pattern to keep the event loop responsive.
+                    chunk_queue: asyncio.Queue = asyncio.Queue()
+
+                    def _produce():
+                        try:
+                            for chunk in model_obj.engine.infer_list_stream(
+                                chat_input, settings=settings
+                            ):
+                                loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
+                        except Exception as exc:  # noqa: BLE001
+                            loop.call_soon_threadsafe(chunk_queue.put_nowait, exc)
+                        finally:
+                            loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
+
+                    executor.submit(_produce)
+
+                    # First chunk: role announcement
+                    first_chunk = OpenAIStreamChunk(
+                        id=completion_id,
+                        created=created_ts,
+                        model=model_id,
+                        choices=[
+                            OpenAIStreamChoice(
+                                index=0,
+                                delta=OpenAIStreamDelta(role="assistant"),
+                            )
+                        ],
+                    )
+                    yield f"data: {first_chunk.model_dump_json()}\n\n"
+
+                    while True:
+                        item = await chunk_queue.get()
+                        if item is None:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        content_chunk = OpenAIStreamChunk(
+                            id=completion_id,
+                            created=created_ts,
+                            model=model_id,
+                            choices=[
+                                OpenAIStreamChoice(
+                                    index=0,
+                                    delta=OpenAIStreamDelta(content=item),
+                                )
+                            ],
+                        )
+                        yield f"data: {content_chunk.model_dump_json()}\n\n"
+
+                    # Final chunk with finish_reason
+                    final_chunk = OpenAIStreamChunk(
+                        id=completion_id,
+                        created=created_ts,
+                        model=model_id,
+                        choices=[
+                            OpenAIStreamChoice(
+                                index=0,
+                                delta=OpenAIStreamDelta(),
+                                finish_reason="stop",
+                            )
+                        ],
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    _stream_sse(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+
+            # ----------------------------------------------------------------
+            # Non-streaming path
+            # ----------------------------------------------------------------
             # Run inference using chat mode
             scores, preds = await server.models[model_id].infer_async(
                 inputs=messages,
