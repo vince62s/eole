@@ -500,7 +500,7 @@ class TestSampleWithTemperatureNanInf(unittest.TestCase):
     With torch.compile (especially max-autotune mode), compiled CUDA kernels
     can emit NaN or Inf values in the logit tensor due to BF16 overflow or
     numerical instability in fused attention kernels.  If these are not
-    sanitised before sampling, torch.distributions.Categorical internally
+    sanitized before sampling, torch.distributions.Categorical internally
     calls torch.multinomial with an all-NaN probability tensor which triggers
     a CUDA device-side assertion:
         "probability tensor contains either `inf`, `nan` or element < 0".
@@ -518,8 +518,8 @@ class TestSampleWithTemperatureNanInf(unittest.TestCase):
         self.assertGreaterEqual(topk_ids[1, 0].item(), 50)
 
     def test_posinf_in_logits_chooses_that_token(self):
-        """+Inf logits are replaced with a large positive value so that they
-        still dominate the distribution."""
+        """+Inf logits are sanitized to a large positive finite value, so the
+        token that had +Inf still dominates and is always sampled."""
         logits = torch.full((2, 100), -1e9)
         logits[0, 42] = float("inf")
         logits[1, 7] = float("inf")
@@ -527,7 +527,7 @@ class TestSampleWithTemperatureNanInf(unittest.TestCase):
         self.assertEqual(topk_ids[0, 0].item(), 42)
         self.assertEqual(topk_ids[1, 0].item(), 7)
 
-    def test_neginf_logits_still_sample_from_valid_token(self):
+    def test_neginf_logits_still_samples_from_valid_token(self):
         """-Inf logits (legitimate masking) are replaced with a large negative
         value, preserving the intent: the one valid token should win."""
         logits = torch.full((1, 100), float("-inf"))
