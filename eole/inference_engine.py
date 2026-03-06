@@ -1,11 +1,9 @@
-import contextlib
 import os
 import json
 from typing import List, Tuple, Optional, Dict, Any
 from time import time
 import torch
 
-from eole import EOLE_TORCH_COMPILE
 from eole.constants import CorpusTask, DefaultTokens, ModelType, InferenceConstants
 from eole.inputters.dynamic_iterator import build_dynamic_dataset_iter
 from eole.utils.logging import init_logger
@@ -195,18 +193,6 @@ class InferenceEnginePY(InferenceEngine):
         self.logger = init_logger(config.log_file)
         t0 = time()
 
-        # When torch.compile is used with CUDA graphs (EOLE_COMPILE_MODE=2/3),
-        # CUDA graphs must be captured and replayed on the **same** CUDA stream.
-        # In server mode every streaming request is dispatched to a fresh
-        # ThreadPoolExecutor worker, which owns a different default CUDA stream.
-        # Without stream pinning, the compiled graphs are re-captured for every
-        # new stream, spinning the GPU at 100% and potentially deadlocking.
-        # Using a single, engine-lifetime stream for all _predict calls ensures
-        # consistent stream identity across requests.
-        self._cuda_stream = (
-            torch.cuda.Stream() if EOLE_TORCH_COMPILE and torch.cuda.is_available() else None
-        )
-
         if config.world_size > 1:
             self.logger.info("Init multi-process mode")
             self._initialize_multiprocessing()
@@ -277,27 +263,13 @@ class InferenceEnginePY(InferenceEngine):
         settings = settings or {}
         self.predictor.update_settings(**settings)
 
-        # Pin all GPU work to the engine's dedicated stream so that CUDA graphs
-        # (used by torch.compile with EOLE_COMPILE_MODE=2/3) are always
-        # captured and replayed on the same stream, regardless of which OS
-        # thread called _predict.  Without this, every new server-request
-        # thread brings a fresh default CUDA stream, forcing the compiled
-        # graphs to be re-captured, which can spin the GPU at 100 % and
-        # deadlock.  When EOLE_TORCH_COMPILE is not set, _cuda_stream is None
-        # and the contextlib.nullcontext() is a no-op.
-        stream_ctx = (
-            torch.cuda.stream(self._cuda_stream)
-            if self._cuda_stream is not None
-            else contextlib.nullcontext()
+        scores, estims, preds = self.predictor._predict(
+            infer_iter,
+            infer_iter.transforms,
+            self.config.attn_debug,
+            self.config.align_debug,
+            streamer=streamer,
         )
-        with stream_ctx:
-            scores, estims, preds = self.predictor._predict(
-                infer_iter,
-                infer_iter.transforms,
-                self.config.attn_debug,
-                self.config.align_debug,
-                streamer=streamer,
-            )
 
         return scores, estims, preds
 
