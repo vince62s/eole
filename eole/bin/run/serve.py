@@ -510,10 +510,19 @@ class Model(object):
 
         chat_template = self.config.chat_template
         if chat_template is None:
-            raise TemplateError(
-                f"Model '{self.model_id}' has no chat_template configured. "
-                "Set chat_template in the model's inference config."
-            )
+            # Fall back to a standalone chat_template.jinja file in the model
+            # directory (used by some modern HF models that don't embed the
+            # template in tokenizer_config.json or config.json).
+            jinja_file = os.path.join(self.local_path, "chat_template.jinja")
+            if os.path.exists(jinja_file):
+                with open(jinja_file, encoding="utf-8") as f:
+                    chat_template = f.read()
+            else:
+                raise TemplateError(
+                    f"Model '{self.model_id}' has no chat_template configured. "
+                    "Set chat_template in the model's inference config or provide "
+                    "a chat_template.jinja file in the model directory."
+                )
         # Modern HuggingFace models store chat_template as a list of named
         # templates, e.g. [{"name": "default", "template": "..."}, ...].
         # Extract the "default" entry, or fall back to the first entry.
