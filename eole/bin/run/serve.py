@@ -527,17 +527,29 @@ class Model(object):
         # templates, e.g. [{"name": "default", "template": "..."}, ...].
         # Extract the "default" entry, or fall back to the first entry.
         if isinstance(chat_template, list):
+            # Use .get() to safely handle list items that may lack a "template" key.
             template_str = next(
-                (t["template"] for t in chat_template if t.get("name") == "default"),
+                (t.get("template") for t in chat_template if isinstance(t, dict) and t.get("name") == "default"),
                 None,
             )
             if template_str is None and chat_template:
-                template_str = chat_template[0].get("template")
-            if template_str is None:
+                first = chat_template[0]
+                template_str = first.get("template") if isinstance(first, dict) else (first if isinstance(first, str) else None)
+            if not isinstance(template_str, str):
                 raise TemplateError(
                     f"Model '{self.model_id}': chat_template list contains no usable template string."
                 )
             chat_template = template_str
+
+        # Guard against any remaining non-string value (e.g. dict or bytes from
+        # unexpected config formats) to give a clear error instead of a cryptic
+        # "Can't compile non template nodes" TypeError from Jinja2.
+        if not isinstance(chat_template, str):
+            raise TemplateError(
+                f"Model '{self.model_id}': chat_template has unexpected type "
+                f"'{type(chat_template).__name__}' — expected a string. "
+                "Check the model's config.json or chat_template.jinja file."
+            )
 
         jinja_env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
         jinja_env.globals["raise_exception"] = raise_exception
