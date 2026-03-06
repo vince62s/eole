@@ -156,6 +156,7 @@ class GeneratorLM(Inference):
             else:
                 emb = self.model.tgt_emb(src, step=0)
             tgt_pad_mask = src.eq(self._tgt_pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
+            self.model.decoder.max_length = self.max_length
             self.model.decoder._init_cache(emb, tgt_pad_mask)
             self.model.decoder.map_state(fn_tile)
             if EOLE_COMPILE_MODE in ["0", "1"]:
