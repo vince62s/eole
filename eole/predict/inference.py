@@ -173,6 +173,26 @@ class Inference(object):
         for k, v in kwargs.items():
             if hasattr(self, k):
                 setattr(self, k, v)
+        # When max_length is increased (e.g. by a per-request max_tokens
+        # override sent by the client), the decoder's KV-cache capacity must
+        # keep pace.  Without this sync, a long second-turn conversation whose
+        # accumulated token count exceeds the originally configured max_length
+        # would crash at prefill with
+        #   "If key is supplied, it must have seqlen <= the seqlen of the KV cache"
+        # because the decode loop would still run (predictor.max_length >=
+        # input_len) while the cache was too small (decoder.max_length <
+        # input_len).
+        new_max_length = kwargs.get("max_length")
+        if new_max_length is not None and hasattr(self, "model") and hasattr(self.model, "decoder"):
+            decoder = self.model.decoder
+            if new_max_length > decoder.max_length:
+                decoder.max_length = new_max_length
+                # Invalidate compiled shapes so torch.compile CUDA graphs are
+                # re-captured at the new (larger) cache size on the next request.
+                if hasattr(decoder, "transformer_layers"):
+                    for layer in decoder.transformer_layers:
+                        if hasattr(layer, "compiled_shapes"):
+                            layer.compiled_shapes.clear()
 
     def _predict(
         self,

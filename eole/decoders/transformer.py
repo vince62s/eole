@@ -122,16 +122,21 @@ class TransformerDecoderLayer(nn.Module):
         position_embeddings=None,
         cache_seqlens=None,
     ):
+        # Only create the compiled wrapper once.  Re-calling torch.compile()
+        # on every warmup invocation (i.e., every request) discards the
+        # previously traced graph and forces an expensive lazy re-trace on the
+        # first decode step of each new request.
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
-            self._forward_compile = torch.compile(
-                self._forward_eager,
-                fullgraph=True,
-                dynamic=False,
-                options={
-                    "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
-                    "triton.cudagraphs": EOLE_COMPILE_MODE == "2",
-                },
-            )
+            if not hasattr(self, "_forward_compile") or self._forward_compile is None:
+                self._forward_compile = torch.compile(
+                    self._forward_eager,
+                    fullgraph=True,
+                    dynamic=False,
+                    options={
+                        "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
+                        "triton.cudagraphs": EOLE_COMPILE_MODE == "2",
+                    },
+                )
         if layer_in is not None:
             # assumes that _init_cache was before warmup and tiling along beam_size
             B = cache_seqlens.size(0)
@@ -358,15 +363,20 @@ class TransformerDecoder(DecoderBase):
             self._compile_decoder()
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
-        self._forward_compile = torch.compile(
-            self._forward_eager,
-            fullgraph=True,
-            dynamic=False,
-            options={
-                "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
-                "triton.cudagraphs": EOLE_COMPILE_MODE == "0",
-            },
-        )
+        # Only create the compiled wrapper once.  Re-calling torch.compile()
+        # on every warmup invocation (i.e., every request) discards the
+        # previously traced graph and forces an expensive lazy re-trace on the
+        # first decode step of each new request.
+        if not hasattr(self, "_forward_compile") or self._forward_compile is None:
+            self._forward_compile = torch.compile(
+                self._forward_eager,
+                fullgraph=True,
+                dynamic=False,
+                options={
+                    "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
+                    "triton.cudagraphs": EOLE_COMPILE_MODE == "0",
+                },
+            )
 
         if emb is not None and tgt_pad_mask is not None:
             B = self.cache_seqlens.size(0)
@@ -645,7 +655,13 @@ class TransformerDecoder(DecoderBase):
         if self.dynamic_shapes:
             self.cache_len_tgt = l  # kv cache starts at target length and grows
         else:
-            self.cache_len_tgt = self.max_length  # kv cache is set to max and remains static
+            # Static (torch.compile) mode: use max(max_length, l) so the cache
+            # always covers the full input.  Normally decoder.max_length is synced
+            # upward by Inference.update_settings() before each request, but this
+            # provides a defensive fallback for misconfigured max_length or direct
+            # API usage (e.g., accumulated chat history exceeding the configured
+            # context window).
+            self.cache_len_tgt = max(self.max_length, l)  # kv cache is set to max and remains static
 
         # We find the index of the first non-pad token (the first '0' or 'False')
         # If the first token is NOT a pad, this returns 0.
@@ -680,8 +696,23 @@ class TransformerDecoder(DecoderBase):
             else:
                 heads_kv = layer.self_attn.heads_kv
                 dph = layer.self_attn.dim_per_head
-                layer.self_attn.kcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
-                layer.self_attn.vcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
+                cache_shape = (b, self.cache_len_tgt, heads_kv, dph)
+                # Reuse existing cache tensors (zero them in-place) when the
+                # shape matches.  This keeps the same CUDA-memory addresses
+                # across consecutive requests, so torch.compile CUDA graphs
+                # captured during the warmup trace remain valid on every
+                # subsequent request without triggering an expensive guard
+                # failure and re-capture.
+                if (
+                    layer.self_attn.kcache is not None
+                    and layer.self_attn.kcache.shape == cache_shape
+                    and layer.self_attn.kcache.dtype == dtype
+                ):
+                    layer.self_attn.kcache.zero_()
+                    layer.self_attn.vcache.zero_()
+                else:
+                    layer.self_attn.kcache = torch.zeros(cache_shape, dtype=dtype, device=device)
+                    layer.self_attn.vcache = torch.zeros(cache_shape, dtype=dtype, device=device)
                 layer.self_attn.cache_leftpad = cache_leftpad
                 layer.self_attn.causal = True
                 if layer.context_attn:
@@ -714,7 +745,14 @@ class TransformerDecoder(DecoderBase):
                 layer.linear_attn.conv_state = None
                 layer.linear_attn.recurrent_state = None
             else:
-                layer.self_attn.kcache, layer.self_attn.vcache = None, None
+                # When torch.compile is active, keep the kcache/vcache tensors
+                # allocated between requests.  Their contents will be zeroed at
+                # the start of the next _init_cache() call.  Preserving the
+                # tensor addresses ensures that CUDA graphs captured during the
+                # warmup trace remain valid across consecutive requests without
+                # triggering an address-mismatch guard failure and re-capture.
+                if not EOLE_TORCH_COMPILE:
+                    layer.self_attn.kcache, layer.self_attn.vcache = None, None
                 layer.self_attn.cache_leftpad = None
                 if layer.context_attn:
                     layer.context_attn.kcache, layer.context_attn.vcache = None, None
