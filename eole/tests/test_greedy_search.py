@@ -1,5 +1,5 @@
 import unittest
-from eole.predict.greedy_search import GreedySearch
+from eole.predict.greedy_search import GreedySearch, sample_with_temperature
 
 import torch
 
@@ -492,3 +492,52 @@ class TestGreedySearch(unittest.TestCase):
                     )
 
                 self.assertTrue(samp.done)
+
+
+class TestSampleWithTemperatureNanInf(unittest.TestCase):
+    """Test that sample_with_temperature handles NaN/Inf logits gracefully.
+
+    With torch.compile (especially max-autotune mode), compiled CUDA kernels
+    can emit NaN or Inf values in the logit tensor due to BF16 overflow or
+    numerical instability in fused attention kernels.  If these are not
+    sanitised before sampling, torch.distributions.Categorical internally
+    calls torch.multinomial with an all-NaN probability tensor which triggers
+    a CUDA device-side assertion:
+        "probability tensor contains either `inf`, `nan` or element < 0".
+    """
+
+    def test_nan_in_logits_does_not_crash(self):
+        """NaN logits are replaced with a large negative value so that the
+        corresponding tokens are excluded from sampling."""
+        logits = torch.randn(2, 100)
+        logits[0, 5] = float("nan")
+        logits[1, :50] = float("nan")  # half the vocab is NaN for row 1
+        topk_ids, topk_scores = sample_with_temperature(logits, 1.0, 0, 0.9)
+        self.assertEqual(topk_ids.shape, (2, 1))
+        # Row 1: must choose from the valid half (indices 50-99)
+        self.assertGreaterEqual(topk_ids[1, 0].item(), 50)
+
+    def test_posinf_in_logits_chooses_that_token(self):
+        """+Inf logits are replaced with a large positive value so that they
+        still dominate the distribution."""
+        logits = torch.full((2, 100), -1e9)
+        logits[0, 42] = float("inf")
+        logits[1, 7] = float("inf")
+        topk_ids, _ = sample_with_temperature(logits, 1.0, 0, 1.0)
+        self.assertEqual(topk_ids[0, 0].item(), 42)
+        self.assertEqual(topk_ids[1, 0].item(), 7)
+
+    def test_neginf_logits_still_sample_from_valid_token(self):
+        """-Inf logits (legitimate masking) are replaced with a large negative
+        value, preserving the intent: the one valid token should win."""
+        logits = torch.full((1, 100), float("-inf"))
+        logits[0, 33] = 0.0  # sole valid token
+        topk_ids, _ = sample_with_temperature(logits, 1.0, 0, 0.9)
+        self.assertEqual(topk_ids[0, 0].item(), 33)
+
+    def test_greedy_argmax_unaffected_by_fix(self):
+        """temperature=0 (argmax) branch does NOT apply nan_to_num and
+        should behave exactly as before."""
+        logits = torch.tensor([[1.0, 3.0, 2.0]])
+        topk_ids, _ = sample_with_temperature(logits, 0.0, 0, 0.9)
+        self.assertEqual(topk_ids[0, 0].item(), 1)  # argmax = index 1

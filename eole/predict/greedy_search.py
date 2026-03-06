@@ -73,6 +73,14 @@ def sample_with_temperature(logits, temperature, top_k, top_p):
         if temperature > 0:
             topk_scores /= temperature
     else:
+        # Sanitize logits before any filtering or sampling: compiled or
+        # mixed-precision models can produce NaN/Inf (e.g. with
+        # torch.compile max-autotune or BF16 overflow).  NaN in the
+        # logits tensor would propagate through sample_topp's sort and
+        # into torch.distributions.Categorical, ultimately triggering a
+        # CUDA device-side assertion in torch.multinomial
+        # ("probability tensor contains either inf, nan or element < 0").
+        logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
         logits = torch.div(logits, temperature)
         if top_p > 0:
             logits = sample_topp(logits, top_p)
