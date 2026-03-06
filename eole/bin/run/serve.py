@@ -123,7 +123,20 @@ class OpenAIChatRequest(BaseModel):
     # Silently drop any OpenAI-compatible fields not explicitly declared here
     # (e.g. top_k, tools, tool_choice, response_format, seed, …) so that
     # clients that send them don't receive a 422.
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(
+        extra="ignore",
+        json_schema_extra={
+            "example": {
+                "model": "llama3-8b-instruct",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Hello!"},
+                ],
+                "temperature": 0.7,
+                "max_tokens": 100,
+            }
+        },
+    )
 
     model: str
     messages: List[OpenAIMessage]
@@ -137,19 +150,6 @@ class OpenAIChatRequest(BaseModel):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict] = None
     user: Optional[str] = None
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "model": "llama3-8b-instruct",
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": "Hello!"},
-                ],
-                "temperature": 0.7,
-                "max_tokens": 100,
-            }
-        }
 
 
 class OpenAIUsage(BaseModel):
