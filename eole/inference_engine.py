@@ -269,6 +269,19 @@ class InferenceEnginePY(InferenceEngine):
         # serialises the actual GPU forward pass and protects shared predictor state
         # (e.g. update_settings) from concurrent mutation.
         #
+        # Historical context – what happened *before* this design was introduced:
+        #   • infer_list called _predict directly on the HTTP handler thread with NO
+        #     lock.  Two concurrent requests therefore raced on update_settings (which
+        #     writes fields such as beam_size and temperature onto the shared predictor
+        #     object) and the settings of one request could silently overwrite those of
+        #     the other before the forward pass read them.
+        #   • infer_list_stream spawned a new daemon thread per call (also with NO
+        #     lock), so the same Python-level data race applied.
+        #   • CUDA itself serialises kernel execution on its default stream, so the GPU
+        #     did NOT execute two forward passes literally in parallel — the kernels
+        #     were queued one after the other by CUDA's stream scheduler.  However the
+        #     Python predictor state was still corrupted, producing wrong results.
+        #
         # NOTE – GPU-level throughput is always single-threaded (eager AND compiled):
         # _predict_lock is held unconditionally during every forward pass, regardless
         # of whether torch.compile / CUDA graphs are active.  Two concurrent requests
