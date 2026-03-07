@@ -1,5 +1,7 @@
 import os
 import json
+import queue
+import threading
 from typing import List, Tuple, Optional, Dict, Any
 from time import time
 import torch
@@ -181,6 +183,10 @@ class InferenceEngine:
         pass
 
 
+# Seconds to wait when joining the inference thread during terminate().
+_INFERENCE_THREAD_SHUTDOWN_TIMEOUT_SECS = 5
+
+
 class InferenceEnginePY(InferenceEngine):
     """Inference engine subclass to run inference with `predict.py`.
 
@@ -255,11 +261,79 @@ class InferenceEnginePY(InferenceEngine):
         self.transforms = make_transforms(self.config, self.transforms_cls, self.vocabs)
         self.transform_pipe = TransformPipe.build_from(self.transforms.values())
 
+        # Single dedicated inference thread to serialize all prediction calls.
+        # This prevents concurrent access to the shared predictor / KV cache
+        # and is required for torch.compile CUDA-graph compatibility (graphs
+        # must be replayed on the same OS thread they were captured on).
+        # The queue is intentionally unbounded: the server already throttles
+        # concurrency via its own batch processor, and blocking callers here
+        # would stall asyncio tasks rather than providing useful backpressure.
+        self._infer_queue: queue.Queue = queue.Queue()
+        self._infer_thread = threading.Thread(
+            target=self._inference_loop,
+            daemon=True,
+            name="eole-inference",
+        )
+        self._infer_thread.start()
+
+    def _inference_loop(self):
+        """Main loop of the dedicated inference thread.
+
+        Reads tasks submitted via :meth:`_submit_to_infer_thread` or
+        :meth:`infer_list_stream` from the internal queue and executes them
+        one at a time, guaranteeing that the underlying model and KV cache
+        are never accessed concurrently.  A ``None`` sentinel stops the loop
+        (sent by :meth:`terminate`).
+        """
+        while True:
+            task = self._infer_queue.get()
+            if task is None:
+                # Shutdown sentinel received – exit the loop cleanly.
+                break
+            func, done_event, result_holder = task
+            try:
+                result = func()
+                result_holder.append(result)
+            except Exception as exc:  # noqa: BLE001
+                # Broad catch is intentional: we must capture *any* exception
+                # so it can be re-raised in the calling thread by
+                # _submit_to_infer_thread (or, for streaming, via
+                # exception_holder in infer_list_stream).
+                result_holder.append(exc)
+            finally:
+                done_event.set()
+
+    def _submit_to_infer_thread(self, func) -> Any:
+        """Submit *func* to the inference thread and block until it finishes.
+
+        Args:
+            func: A zero-argument callable to execute on the inference thread.
+
+        Returns:
+            The return value of *func*.
+
+        Raises:
+            Exception: Any exception raised by *func* is re-raised in the
+                calling thread.
+        """
+        done_event = threading.Event()
+        result_holder: List[Any] = []
+        self._infer_queue.put((func, done_event, result_holder))
+        done_event.wait()
+        if result_holder and isinstance(result_holder[0], Exception):
+            raise result_holder[0]
+        return result_holder[0] if result_holder else None
+
     @torch.inference_mode()
-    def _predict(
+    def _predict_impl(
         self, infer_iter, settings: Optional[Dict[str, Any]] = None, streamer=None
     ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
-        """Run prediction on inference iterator."""
+        """Run prediction on the inference iterator.
+
+        Must be called on the dedicated inference thread (via
+        :meth:`_submit_to_infer_thread` or from within the
+        :meth:`infer_list_stream` task closure).
+        """
         settings = settings or {}
         self.predictor.update_settings(**settings)
 
@@ -273,8 +347,24 @@ class InferenceEnginePY(InferenceEngine):
 
         return scores, estims, preds
 
-    def _score(self, infer_iter, settings: Optional[Dict[str, Any]] = None):
-        """Run scoring on inference iterator."""
+    def _predict(
+        self, infer_iter, settings: Optional[Dict[str, Any]] = None, streamer=None
+    ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
+        """Submit a prediction task to the inference thread and wait for the result.
+
+        All callers (``infer_list``, ``infer_file``, …) route through here so
+        that the underlying model is never accessed from more than one thread
+        at a time.
+        """
+        return self._submit_to_infer_thread(
+            lambda: self._predict_impl(infer_iter, settings=settings, streamer=streamer)
+        )
+
+    def _score_impl(self, infer_iter, settings: Optional[Dict[str, Any]] = None):
+        """Run scoring on the inference iterator.
+
+        Must be called on the dedicated inference thread.
+        """
         settings = settings or {}
         self.predictor.update_settings(**settings)
 
@@ -283,16 +373,26 @@ class InferenceEnginePY(InferenceEngine):
 
         return self.predictor._score(infer_iter)
 
+    def _score(self, infer_iter, settings: Optional[Dict[str, Any]] = None):
+        """Submit a scoring task to the inference thread and wait for the result."""
+        return self._submit_to_infer_thread(lambda: self._score_impl(infer_iter, settings=settings))
+
     def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None):
         """Stream inference results for a single input string.
 
-        Runs inference in a background thread and yields decoded text
-        chunks as they are produced token by token. This is the
-        recommended API for interactive / chatbot-style use cases.
+        Enqueues a generation task on the dedicated inference thread and
+        yields decoded text chunks as they are produced token by token.
+        Requests are processed in FIFO order; if another request is already
+        being generated the caller will wait (without blocking the event loop
+        when invoked from an ``async`` context via a thread-pool executor)
+        until it reaches the front of the queue.
+
+        The ``started`` event ensures the streamer's per-token timeout only
+        begins once the inference thread actually starts processing this
+        request, preventing spurious timeouts when many requests are queued.
 
         Only supported for single-process mode (``world_size <= 1``) and
-        decoder-only (LM) models. Encoder-decoder models are not supported
-        for streaming.
+        decoder-only (LM) models.
 
         Args:
             src (str): A single input string.
@@ -312,7 +412,6 @@ class InferenceEnginePY(InferenceEngine):
                 print(chunk, end="", flush=True)
             print()
         """
-        import threading
         from eole.predict.streamer import GenerationStreamer
 
         if self.config.world_size > 1:
@@ -325,23 +424,38 @@ class InferenceEnginePY(InferenceEngine):
             transform_pipe=self.transform_pipe,
         )
 
-        exception_holder = []
+        # Event set by the inference thread as soon as it starts this task,
+        # so the streamer's per-token timeout doesn't count time spent waiting
+        # in the queue behind other requests.
+        started = threading.Event()
+        exception_holder: List[Exception] = []
 
-        def _run_inference():
+        def _run():
+            # Signal that we have dequeued this task and are about to generate.
+            started.set()
             try:
                 infer_iter = self._build_inference_iterator(src=[src])
-                self._predict(infer_iter, settings=settings, streamer=streamer)
+                self._predict_impl(infer_iter, settings=settings, streamer=streamer)
             except Exception as exc:  # noqa: BLE001
+                # Broad catch is intentional: end the streamer so the consumer
+                # is unblocked, then surface the error via exception_holder
+                # after yield-from completes.
                 self.logger.error(f"Streaming inference failed: {exc}")
                 exception_holder.append(exc)
                 streamer.end()
 
-        thread = threading.Thread(target=_run_inference, daemon=True)
-        thread.start()
+        done_event = threading.Event()
+        self._infer_queue.put((_run, done_event, []))
+
+        # Wait until the inference thread actually starts our task before
+        # entering the streamer iterator (avoids premature timeout).
+        started.wait()
 
         yield from streamer
 
-        thread.join()
+        # Ensure the inference thread has fully finished before returning so
+        # that callers can rely on the generator being exhausted when done.
+        done_event.wait()
 
         if exception_holder:
             raise exception_holder[0]
@@ -454,8 +568,13 @@ class InferenceEnginePY(InferenceEngine):
         return self._aggregate_inference_results(scores, estims, preds)
 
     def terminate(self):
-        """Terminate all worker processes."""
+        """Terminate the inference thread and all worker processes."""
         if self.config.world_size <= 1:
+            # Signal the single inference thread to stop and wait for it.
+            if hasattr(self, "_infer_queue"):
+                self._infer_queue.put(None)
+            if hasattr(self, "_infer_thread"):
+                self._infer_thread.join(timeout=_INFERENCE_THREAD_SHUTDOWN_TIMEOUT_SECS)
             return
 
         # Ask workers to stop
