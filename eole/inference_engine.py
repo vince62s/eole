@@ -1,5 +1,7 @@
 import os
 import json
+import queue
+import threading
 from typing import List, Tuple, Optional, Dict, Any
 from time import time
 import torch
@@ -255,6 +257,59 @@ class InferenceEnginePY(InferenceEngine):
         self.transforms = make_transforms(self.config, self.transforms_cls, self.vocabs)
         self.transform_pipe = TransformPipe.build_from(self.transforms.values())
 
+        # --- Persistent inference thread (torch.compile / CUDA-graph TLS fix) ---
+        # torch.compile with CUDA graphs stores its tree-manager in thread-local
+        # storage (TLS) that is tied to the OS thread that first captures the
+        # graph.  Creating a fresh thread for every streaming request triggers
+        #   assert torch._C._is_key_in_tls("tree_manager_containers")
+        # because the new thread has no TLS.  Routing ALL _predict calls through
+        # a single long-lived thread guarantees that the same TLS context is
+        # used for every inference, whether streaming or non-streaming.
+        self._infer_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._infer_thread = threading.Thread(
+            target=self._inference_thread_worker,
+            name="eole-inference",
+            daemon=True,
+        )
+        self._infer_thread.start()
+
+    def _inference_thread_worker(self):
+        """Process inference tasks sequentially on the persistent OS thread.
+
+        Each task is a zero-argument callable pushed onto ``self._infer_queue``.
+        Sending ``None`` signals a clean shutdown.
+        """
+        while True:
+            task = self._infer_queue.get()
+            if task is None:
+                break
+            task()
+
+    def _run_on_infer_thread(self, fn) -> None:
+        """Submit *fn* to the persistent inference thread and block until done.
+
+        Raises any exception raised by *fn* in the calling thread.
+
+        The broad ``except Exception`` is intentional: *fn* can raise anything
+        (model errors, CUDA errors, etc.) and we must propagate it faithfully
+        to the caller regardless of the exception type.
+        """
+        done = threading.Event()
+        exc_holder: list = []
+
+        def _wrapper():
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 – intentional catch-all for re-raise
+                exc_holder.append(exc)
+            finally:
+                done.set()
+
+        self._infer_queue.put(_wrapper)
+        done.wait()
+        if exc_holder:
+            raise exc_holder[0]
+
     @torch.inference_mode()
     def _predict(
         self, infer_iter, settings: Optional[Dict[str, Any]] = None, streamer=None
@@ -283,12 +338,39 @@ class InferenceEnginePY(InferenceEngine):
 
         return self.predictor._score(infer_iter)
 
+    def infer_list(
+        self, src: List[str], settings: Optional[Dict[str, Any]] = None
+    ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
+        """List of strings inference.
+
+        For single-process mode the call is routed through the persistent
+        inference thread so that torch.compile / CUDA-graph thread-local
+        storage (TLS) is always accessed from the same OS thread.
+        """
+        settings = settings or {}
+
+        if self.config.world_size > 1:
+            return self.infer_list_parallel(src, settings=settings)
+
+        # Single-process: submit to the persistent inference thread.
+        result_holder: list = []
+
+        def _run():
+            infer_iter = self._build_inference_iterator(src=src)
+            s, e, p = self._predict(infer_iter, settings=settings)
+            result_holder.append((s, e, p))
+
+        self._run_on_infer_thread(_run)
+        return result_holder[0]
+
     def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None):
         """Stream inference results for a single input string.
 
-        Runs inference in a background thread and yields decoded text
-        chunks as they are produced token by token. This is the
-        recommended API for interactive / chatbot-style use cases.
+        Submits inference to the persistent inference thread and yields decoded
+        text chunks as they are produced token by token.  Using the persistent
+        thread (rather than a fresh OS thread per request) ensures that
+        torch.compile / CUDA-graph thread-local storage (TLS) is initialised
+        exactly once and reused for every subsequent request.
 
         Only supported for single-process mode (``world_size <= 1``) and
         decoder-only (LM) models. Encoder-decoder models are not supported
@@ -312,7 +394,6 @@ class InferenceEnginePY(InferenceEngine):
                 print(chunk, end="", flush=True)
             print()
         """
-        import threading
         from eole.predict.streamer import GenerationStreamer
 
         if self.config.world_size > 1:
@@ -325,7 +406,7 @@ class InferenceEnginePY(InferenceEngine):
             transform_pipe=self.transform_pipe,
         )
 
-        exception_holder = []
+        exception_holder: list = []
 
         def _run_inference():
             try:
@@ -336,13 +417,19 @@ class InferenceEnginePY(InferenceEngine):
                 exception_holder.append(exc)
                 streamer.end()
 
-        thread = threading.Thread(target=_run_inference, daemon=True)
-        thread.start()
+        # Submit to the persistent inference thread instead of spawning a new
+        # OS thread.  This prevents the CUDA-graph TLS assertion failure that
+        # occurs when torch.compile (cudagraphs) is active:
+        #   assert torch._C._is_key_in_tls("tree_manager_containers")
+        # The streamer's internal queue decouples production (inference thread)
+        # from consumption (this generator), so no blocking is needed here.
+        self._infer_queue.put(_run_inference)
 
         yield from streamer
 
-        thread.join()
-
+        # exception_holder is populated (if at all) before streamer.end() is
+        # called, so by the time the generator above is exhausted the holder
+        # is already stable – no extra join/Event needed.
         if exception_holder:
             raise exception_holder[0]
 
@@ -454,7 +541,11 @@ class InferenceEnginePY(InferenceEngine):
         return self._aggregate_inference_results(scores, estims, preds)
 
     def terminate(self):
-        """Terminate all worker processes."""
+        """Terminate all worker processes and the persistent inference thread."""
+        # Shut down the persistent inference thread (single-process mode).
+        if hasattr(self, "_infer_queue"):
+            self._infer_queue.put(None)
+
         if self.config.world_size <= 1:
             return
 

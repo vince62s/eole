@@ -752,15 +752,10 @@ def create_app(config_file):
                     """Async generator that yields SSE-formatted data lines."""
                     loop = asyncio.get_event_loop()
 
-                    # Run the synchronous streaming generator in a thread-pool
-                    # executor so it doesn't block the event loop.
-                    import concurrent.futures
-
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-                    # The engine's infer_list_stream is a synchronous generator.
-                    # We iterate it inside run_in_executor via a queue-bridging
-                    # pattern to keep the event loop responsive.
+                    # infer_list_stream is a synchronous generator that runs
+                    # inference on the engine's persistent inference thread.
+                    # We bridge it to the async world via a queue so that the
+                    # event loop is never blocked while waiting for tokens.
                     chunk_queue: asyncio.Queue = asyncio.Queue()
 
                     def _produce():
@@ -774,7 +769,11 @@ def create_app(config_file):
                         finally:
                             loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
 
-                    executor.submit(_produce)
+                    # Run _produce in the default executor (reused threads).
+                    # The actual model forward pass happens on the engine's own
+                    # persistent thread, so _produce merely bridges the
+                    # synchronous generator to the async queue.
+                    loop.run_in_executor(None, _produce)
 
                     # First chunk: role announcement
                     first_chunk = OpenAIStreamChunk(
