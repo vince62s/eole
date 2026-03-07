@@ -503,6 +503,8 @@ class Model(object):
                     req.future.set_exception(Exception("Model unloaded"))
             except Exception:
                 break
+        if self.engine is not None:
+            self.engine.terminate()
         del self.engine
         gc.collect()
         torch.cuda.empty_cache()
@@ -752,15 +754,11 @@ def create_app(config_file):
                     """Async generator that yields SSE-formatted data lines."""
                     loop = asyncio.get_event_loop()
 
-                    # Run the synchronous streaming generator in a thread-pool
-                    # executor so it doesn't block the event loop.
-                    import concurrent.futures
-
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
                     # The engine's infer_list_stream is a synchronous generator.
                     # We iterate it inside run_in_executor via a queue-bridging
                     # pattern to keep the event loop responsive.
+                    # Using the default executor avoids creating a new
+                    # ThreadPoolExecutor per streaming request (resource leak).
                     chunk_queue: asyncio.Queue = asyncio.Queue()
 
                     def _produce():
@@ -772,7 +770,7 @@ def create_app(config_file):
                         finally:
                             loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
 
-                    executor.submit(_produce)
+                    produce_future = loop.run_in_executor(None, _produce)
 
                     # First chunk: role announcement
                     first_chunk = OpenAIStreamChunk(
@@ -806,6 +804,9 @@ def create_app(config_file):
                             ],
                         )
                         yield f"data: {content_chunk.model_dump_json()}\n\n"
+
+                    # Ensure the producer thread has fully finished.
+                    await produce_future
 
                     # Final chunk with finish_reason
                     final_chunk = OpenAIStreamChunk(
