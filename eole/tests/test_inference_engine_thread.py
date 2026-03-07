@@ -125,7 +125,7 @@ class TestPersistentInferenceThread(unittest.TestCase):
         self.assertNotEqual(caller_id, worker_ids[0])
 
     # ------------------------------------------------------------------
-    # Streaming (infer_list_stream) scenario: non-blocking enqueue
+    # Streaming (infer_list_stream) scenario: "started" event pattern
     # ------------------------------------------------------------------
 
     def test_stream_task_does_not_block_caller(self):
@@ -155,6 +155,62 @@ class TestPersistentInferenceThread(unittest.TestCase):
             consumed.append(item)
 
         self.assertEqual(consumed, ["Hello", " world"])
+
+    def test_concurrent_streams_do_not_time_out(self):
+        """A second concurrent infer_list_stream must not time out while queued.
+
+        Before the fix, infer_list_stream immediately started consuming
+        from its streamer.  If a previous request was still running, the
+        second request's per-token timeout would fire before any token was
+        produced, silently truncating the response.
+
+        The fix is to fire a ``started`` threading.Event inside the task
+        (before calling _predict) and wait for it in infer_list_stream
+        before starting ``yield from streamer``.  This test verifies that
+        a short token timeout does NOT truncate a second request that is
+        genuinely queued behind a slow first request.
+        """
+        SHORT_TIMEOUT = 0.1  # seconds – would fire if we didn't wait on "started"
+
+        first_done = threading.Event()
+        results: list = []
+
+        # --- First task: long-running (holds the worker for a bit) ---
+        def _first_task():
+            threading.Event().wait(timeout=0.3)  # simulate slow inference
+            first_done.set()
+
+        # --- Second task: streaming style with started-event pattern ---
+        second_in_stream = queue.SimpleQueue()
+        _STOP = object()
+        started_event = threading.Event()
+
+        def _second_task():
+            started_event.set()  # mirrors infer_list_stream's started.set()
+            for token in ["A", "B"]:
+                second_in_stream.put(token)
+            second_in_stream.put(_STOP)
+
+        # Enqueue both tasks
+        self.infer_queue.put(_first_task)
+        self.infer_queue.put(_second_task)
+
+        # Wait for started_event before consuming (mirrors the fix)
+        started_event.wait(timeout=5)
+
+        # Consume with a short per-item timeout; this must NOT time out
+        # because inference has already started when we reach this point.
+        while True:
+            try:
+                item = second_in_stream.get(timeout=SHORT_TIMEOUT)
+            except queue.Empty:
+                results.append("TIMEOUT")
+                break
+            if item is _STOP:
+                break
+            results.append(item)
+
+        self.assertEqual(results, ["A", "B"], "Second concurrent stream timed out unexpectedly")
 
     # ------------------------------------------------------------------
     # Shutdown

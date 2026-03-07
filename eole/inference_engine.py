@@ -408,7 +408,14 @@ class InferenceEnginePY(InferenceEngine):
 
         exception_holder: list = []
 
+        # started fires when the persistent thread actually picks up this task.
+        # We wait on it before yielding tokens so that the streamer's per-token
+        # timeout does not expire while this request is still queued behind a
+        # previous one.
+        started = threading.Event()
+
         def _run_inference():
+            started.set()  # Inference is now running on the persistent thread
             try:
                 infer_iter = self._build_inference_iterator(src=[src])
                 self._predict(infer_iter, settings=settings, streamer=streamer)
@@ -424,6 +431,13 @@ class InferenceEnginePY(InferenceEngine):
         # The streamer's internal queue decouples production (inference thread)
         # from consumption (this generator), so no blocking is needed here.
         self._infer_queue.put(_run_inference)
+
+        # Block until the inference thread actually picks up this task.
+        # Without this wait, a second concurrent request would start
+        # iterating its streamer while the task is still in the queue;
+        # the streamer's per-token timeout would then fire before any token
+        # is produced, silently truncating the response.
+        started.wait()
 
         yield from streamer
 
