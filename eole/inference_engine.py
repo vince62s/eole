@@ -270,17 +270,27 @@ class InferenceEnginePY(InferenceEngine):
         # (e.g. update_settings) from concurrent mutation.
         #
         # Historical context – what happened *before* this design was introduced:
-        #   • infer_list called _predict directly on the HTTP handler thread with NO
-        #     lock.  Two concurrent requests therefore raced on update_settings (which
-        #     writes fields such as beam_size and temperature onto the shared predictor
-        #     object) and the settings of one request could silently overwrite those of
-        #     the other before the forward pass read them.
-        #   • infer_list_stream spawned a new daemon thread per call (also with NO
-        #     lock), so the same Python-level data race applied.
-        #   • CUDA itself serialises kernel execution on its default stream, so the GPU
-        #     did NOT execute two forward passes literally in parallel — the kernels
-        #     were queued one after the other by CUDA's stream scheduler.  However the
-        #     Python predictor state was still corrupted, producing wrong results.
+        #
+        # serve.py dispatches inference via asyncio + run_in_executor (thread pool).
+        # Two concurrent HTTP requests therefore land on two *different* OS threads
+        # that call infer_list / infer_list_stream simultaneously with NO lock.
+        #
+        # This caused two distinct classes of breakage:
+        #
+        # 1. Python-level data race: update_settings() writes fields such as
+        #    beam_size and temperature directly onto the shared predictor object.
+        #    Thread B's write could overwrite Thread A's settings between A's
+        #    update_settings() call and A's forward pass, silently producing wrong
+        #    outputs for both requests.
+        #
+        # 2. GPU-level concurrent execution: PyTorch assigns each OS thread its own
+        #    default CUDA stream.  Two threads calling the model forward pass
+        #    simultaneously therefore submit kernels on *separate* CUDA streams.
+        #    CUDA schedules these streams concurrently (not serialised), so both
+        #    forward passes actually ran at the same time on the GPU — interleaving
+        #    reads/writes to the shared KV cache, attention masks, and any other
+        #    GPU-side state.  This caused model-level corruption (wrong outputs,
+        #    crashes) that was not caused by Python at all.
         #
         # NOTE – GPU-level throughput is always single-threaded (eager AND compiled):
         # _predict_lock is held unconditionally during every forward pass, regardless
