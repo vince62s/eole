@@ -2,6 +2,7 @@ import os
 import json
 import queue
 import threading
+import uuid
 from typing import List, Tuple, Optional, Dict, Any
 from time import time
 import torch
@@ -257,36 +258,71 @@ class InferenceEnginePY(InferenceEngine):
         self.transforms = make_transforms(self.config, self.transforms_cls, self.vocabs)
         self.transform_pipe = TransformPipe.build_from(self.transforms.values())
 
-        # --- Persistent inference thread (torch.compile / CUDA-graph TLS fix) ---
-        # torch.compile with CUDA graphs stores its tree-manager in thread-local
-        # storage (TLS) that is tied to the OS thread that first captures the
-        # graph.  Creating a fresh thread for every streaming request triggers
-        #   assert torch._C._is_key_in_tls("tree_manager_containers")
-        # because the new thread has no TLS.  Routing ALL _predict calls through
-        # a single long-lived thread guarantees that the same TLS context is
-        # used for every inference, whether streaming or non-streaming.
-        self._infer_queue: queue.SimpleQueue = queue.SimpleQueue()
-        self._infer_thread = threading.Thread(
-            target=self._inference_thread_worker,
-            name="eole-inference",
-            daemon=True,
-        )
-        self._infer_thread.start()
+        # --- Session-affinity thread pool (torch.compile / CUDA-graph TLS fix) ---
+        # Each user session runs on its own persistent OS thread.  All requests
+        # from the same session are routed to the same thread, which satisfies the
+        # torch.compile CUDA-graph constraint: TLS (thread-local storage) is
+        # captured once per session thread and reused for every subsequent call.
+        #
+        # Concurrent sessions each have their own thread, so they do NOT share a
+        # FIFO queue.  Instead they compete fairly for _predict_lock, which
+        # serialises the actual GPU forward pass and protects shared predictor state
+        # (e.g. update_settings) from concurrent mutation.
+        self._predict_lock: threading.Lock = threading.Lock()
+        self._session_workers: dict = {}           # session_id -> (queue.SimpleQueue, threading.Thread)
+        self._session_workers_lock: threading.Lock = threading.Lock()
+        # Pre-create the default session (used by infer_list / file inference).
+        self._get_or_create_session_worker("_default")
 
-    def _inference_thread_worker(self):
-        """Process inference tasks sequentially on the persistent OS thread.
+    def _session_thread_worker(self, q: queue.SimpleQueue) -> None:
+        """Process inference tasks sequentially on a persistent session OS thread.
 
-        Each task is a zero-argument callable pushed onto ``self._infer_queue``.
+        Each task is a zero-argument callable pushed onto *q*.
         Sending ``None`` signals a clean shutdown.
         """
         while True:
-            task = self._infer_queue.get()
+            task = q.get()
             if task is None:
                 break
             task()
 
-    def _run_on_infer_thread(self, fn) -> None:
-        """Submit *fn* to the persistent inference thread and block until done.
+    def _get_or_create_session_worker(self, session_id: str):
+        """Return the (queue, thread) pair for *session_id*, creating it if needed.
+
+        Thread creation is protected by ``_session_workers_lock`` so concurrent
+        calls with the same *session_id* always get back the same worker.
+        """
+        with self._session_workers_lock:
+            if session_id not in self._session_workers:
+                q: queue.SimpleQueue = queue.SimpleQueue()
+                # Truncate long UUIDs in the thread name for readability.
+                t = threading.Thread(
+                    target=self._session_thread_worker,
+                    args=(q,),
+                    name=f"eole-inference-{session_id[:12]}",
+                    daemon=True,
+                )
+                t.start()
+                self._session_workers[session_id] = (q, t)
+            return self._session_workers[session_id]
+
+    def release_session(self, session_id: str) -> None:
+        """Stop the session worker for *session_id* and remove it from the pool.
+
+        The ``None`` sentinel is enqueued *after* any in-flight task, so the
+        thread exits cleanly once its current inference (if any) completes.
+        Silently ignored for the ``"_default"`` session and unknown IDs.
+        """
+        if session_id == "_default":
+            return
+        with self._session_workers_lock:
+            entry = self._session_workers.pop(session_id, None)
+        if entry is not None:
+            q, _ = entry
+            q.put(None)
+
+    def _run_on_session_thread(self, session_id: str, fn) -> None:
+        """Submit *fn* to *session_id*'s persistent thread and block until done.
 
         Raises any exception raised by *fn* in the calling thread.
 
@@ -294,6 +330,7 @@ class InferenceEnginePY(InferenceEngine):
         (model errors, CUDA errors, etc.) and we must propagate it faithfully
         to the caller regardless of the exception type.
         """
+        q, _ = self._get_or_create_session_worker(session_id)
         done = threading.Event()
         exc_holder: list = []
 
@@ -305,7 +342,7 @@ class InferenceEnginePY(InferenceEngine):
             finally:
                 done.set()
 
-        self._infer_queue.put(_wrapper)
+        q.put(_wrapper)
         done.wait()
         if exc_holder:
             raise exc_holder[0]
@@ -343,34 +380,45 @@ class InferenceEnginePY(InferenceEngine):
     ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
         """List of strings inference.
 
-        For single-process mode the call is routed through the persistent
-        inference thread so that torch.compile / CUDA-graph thread-local
-        storage (TLS) is always accessed from the same OS thread.
+        Routes through the ``"_default"`` session worker so that all
+        non-streaming inference runs on the same persistent OS thread.
+        This satisfies the torch.compile / CUDA-graph TLS constraint while
+        also allowing concurrent streaming sessions to use the GPU between
+        batched calls via ``_predict_lock``.
         """
         settings = settings or {}
 
         if self.config.world_size > 1:
             return self.infer_list_parallel(src, settings=settings)
 
-        # Single-process: submit to the persistent inference thread.
+        # Single-process: submit to the default session thread.
         result_holder: list = []
 
         def _run():
-            infer_iter = self._build_inference_iterator(src=src)
-            s, e, p = self._predict(infer_iter, settings=settings)
+            with self._predict_lock:
+                infer_iter = self._build_inference_iterator(src=src)
+                s, e, p = self._predict(infer_iter, settings=settings)
             result_holder.append((s, e, p))
 
-        self._run_on_infer_thread(_run)
+        self._run_on_session_thread("_default", _run)
         return result_holder[0]
 
     def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None):
         """Stream inference results for a single input string.
 
-        Submits inference to the persistent inference thread and yields decoded
-        text chunks as they are produced token by token.  Using the persistent
-        thread (rather than a fresh OS thread per request) ensures that
-        torch.compile / CUDA-graph thread-local storage (TLS) is initialised
-        exactly once and reused for every subsequent request.
+        Each call to this method creates a **dedicated session thread** for the
+        lifetime of the streaming response.  Concurrent callers therefore each
+        run on their own thread and compete fairly for ``_predict_lock`` rather
+        than queueing behind each other in a shared FIFO queue.
+
+        The ``started`` event fires *inside* ``with self._predict_lock:`` — just
+        before ``_predict`` is called — so the caller only begins consuming the
+        streamer once the model is actually ready to produce tokens.  This
+        prevents the per-token timeout from firing while this request is waiting
+        for the lock to be released by another concurrent session.
+
+        The session thread is automatically released in a ``finally`` block once
+        the generator is exhausted or abandoned by the caller.
 
         Only supported for single-process mode (``world_size <= 1``) and
         decoder-only (LM) models. Encoder-decoder models are not supported
@@ -408,44 +456,49 @@ class InferenceEnginePY(InferenceEngine):
 
         exception_holder: list = []
 
-        # started fires when the persistent thread actually picks up this task.
-        # We wait on it before yielding tokens so that the streamer's per-token
-        # timeout does not expire while this request is still queued behind a
-        # previous one.
+        # Each streaming call gets its own session so that concurrent callers do
+        # not share a FIFO queue.  The UUID ensures session IDs are unique.
+        session_id = uuid.uuid4().hex
+
+        # started fires once _predict_lock is acquired by this session's thread,
+        # meaning inference is about to begin.  The caller waits on it before
+        # consuming the streamer so that the per-token timeout only starts once
+        # real token generation is underway.
         started = threading.Event()
 
         def _run_inference():
-            started.set()  # Inference is now running on the persistent thread
-            try:
-                infer_iter = self._build_inference_iterator(src=[src])
-                self._predict(infer_iter, settings=settings, streamer=streamer)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"Streaming inference failed: {exc}")
-                exception_holder.append(exc)
-                streamer.end()
+            with self._predict_lock:
+                # Signal caller: lock is held, _predict is starting now.
+                started.set()
+                try:
+                    infer_iter = self._build_inference_iterator(src=[src])
+                    self._predict(infer_iter, settings=settings, streamer=streamer)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error(f"Streaming inference failed: {exc}")
+                    exception_holder.append(exc)
+                    streamer.end()
 
-        # Submit to the persistent inference thread instead of spawning a new
-        # OS thread.  This prevents the CUDA-graph TLS assertion failure that
-        # occurs when torch.compile (cudagraphs) is active:
-        #   assert torch._C._is_key_in_tls("tree_manager_containers")
-        # The streamer's internal queue decouples production (inference thread)
-        # from consumption (this generator), so no blocking is needed here.
-        self._infer_queue.put(_run_inference)
+        # Submit to this request's dedicated session thread.  _get_or_create
+        # creates the thread immediately; it will block on _predict_lock if
+        # another session is currently using the GPU.
+        q, _ = self._get_or_create_session_worker(session_id)
+        q.put(_run_inference)
 
-        # Block until the inference thread actually picks up this task.
-        # Without this wait, a second concurrent request would start
-        # iterating its streamer while the task is still in the queue;
-        # the streamer's per-token timeout would then fire before any token
-        # is produced, silently truncating the response.
-        started.wait()
+        try:
+            # Block until _predict_lock is acquired so the per-token timeout in
+            # the streamer only applies once real token generation has begun.
+            started.wait()
+            yield from streamer
 
-        yield from streamer
-
-        # exception_holder is populated (if at all) before streamer.end() is
-        # called, so by the time the generator above is exhausted the holder
-        # is already stable – no extra join/Event needed.
-        if exception_holder:
-            raise exception_holder[0]
+            # exception_holder is populated (if at all) before streamer.end() is
+            # called, so by the time the generator above is exhausted the holder
+            # is already stable – no extra join/Event needed.
+            if exception_holder:
+                raise exception_holder[0]
+        finally:
+            # Clean up the per-request session thread regardless of how the
+            # generator exits (normal, exception, or caller abandonment).
+            self.release_session(session_id)
 
     def _distribute_parallel_task(self, task_name: str, task_arg: Any, settings: Optional[Dict[str, Any]] = None):
         """Distribute a task to all parallel workers.
@@ -555,19 +608,24 @@ class InferenceEnginePY(InferenceEngine):
         return self._aggregate_inference_results(scores, estims, preds)
 
     def terminate(self):
-        """Terminate all worker processes and the persistent inference thread."""
-        # Shut down the persistent inference thread (single-process mode).
-        if hasattr(self, "_infer_queue"):
-            self._infer_queue.put(None)
+        """Terminate all worker processes and the session thread pool."""
+        # Single-process: stop all session workers (including the default one).
+        if hasattr(self, "_session_workers"):
+            with self._session_workers_lock:
+                workers = list(self._session_workers.values())
+                self._session_workers.clear()
+            for q, _ in workers:
+                q.put(None)
+            for _, t in workers:
+                t.join(timeout=5)
 
         if self.config.world_size <= 1:
             return
 
-        # Ask workers to stop
+        # Multi-process: ask workers to stop, then join.
         for device_id in range(self.config.world_size):
             self.queue_instruct[device_id].put((InferenceConstants.STOP, ""))
 
-        # Join workers
         for proc in self.procs:
             proc.join()
 

@@ -1,18 +1,25 @@
-"""Unit tests for InferenceEnginePY's persistent inference thread.
+"""Unit tests for InferenceEnginePY's session-affinity thread pool.
 
 These tests exercise the thread-management machinery directly without
 loading a real model, so they run in environments without GPU / torch model
 weights.
 
-The persistent inference thread was introduced to fix a torch.compile /
-CUDA-graph AssertionError that occurred when each ``infer_list_stream`` call
-spawned a fresh OS thread:
+The session-affinity thread pool was introduced to fix two issues:
 
-    assert torch._C._is_key_in_tls("tree_manager_containers")  # AssertionError
+1. torch.compile / CUDA-graph AssertionError that occurred when each
+   ``infer_list_stream`` call spawned a fresh OS thread:
 
-CUDA-graph trees store their tree-manager in thread-local storage (TLS) that
-is initialised only on the thread that first captures the graph.  Using a
-single long-lived thread ensures TLS is valid for every subsequent call.
+       assert torch._C._is_key_in_tls("tree_manager_containers")  # AssertionError
+
+   CUDA-graph trees store their tree-manager in thread-local storage (TLS)
+   that is initialised only on the thread that first captures the graph.
+   Each session always uses the same persistent thread, satisfying the TLS
+   constraint.
+
+2. Cross-user FIFO bottleneck: with a single global inference queue all
+   concurrent users serialise behind each other.  With per-session threads
+   each user's request runs on its own thread and competes fairly for
+   ``_predict_lock`` instead of waiting in a shared FIFO queue.
 """
 
 import queue
@@ -21,28 +28,29 @@ import unittest
 
 
 # ---------------------------------------------------------------------------
-# Minimal stub so we can instantiate the thread worker without loading a model
+# Minimal stubs that mirror InferenceEnginePY's session-pool machinery
+# without loading a real model.
 # ---------------------------------------------------------------------------
 
 
-def _make_worker_triple():
-    """Return (infer_queue, thread, stop_event) wired up like InferenceEnginePY."""
-    infer_queue: queue.SimpleQueue = queue.SimpleQueue()
+def _make_session_worker(session_id="test"):
+    """Return (q, thread) wired up like InferenceEnginePY._get_or_create_session_worker."""
+    q: queue.SimpleQueue = queue.SimpleQueue()
 
     def _worker():
         while True:
-            task = infer_queue.get()
+            task = q.get()
             if task is None:
                 break
             task()
 
-    thread = threading.Thread(target=_worker, name="eole-inference-test", daemon=True)
-    thread.start()
-    return infer_queue, thread
+    t = threading.Thread(target=_worker, name=f"eole-inference-{session_id}", daemon=True)
+    t.start()
+    return q, t
 
 
-def _run_on_thread(infer_queue, fn) -> None:
-    """Mirrors InferenceEnginePY._run_on_infer_thread."""
+def _run_on_thread(q, fn) -> None:
+    """Mirrors InferenceEnginePY._run_on_session_thread."""
     done = threading.Event()
     exc_holder: list = []
 
@@ -54,7 +62,7 @@ def _run_on_thread(infer_queue, fn) -> None:
         finally:
             done.set()
 
-    infer_queue.put(_wrapper)
+    q.put(_wrapper)
     done.wait()
     if exc_holder:
         raise exc_holder[0]
@@ -65,13 +73,14 @@ def _run_on_thread(infer_queue, fn) -> None:
 # ---------------------------------------------------------------------------
 
 
-class TestPersistentInferenceThread(unittest.TestCase):
+class TestSessionAffinityPool(unittest.TestCase):
+    """Tests for the per-session thread pool mechanics."""
+
     def setUp(self):
-        self.infer_queue, self.thread = _make_worker_triple()
+        self.q, self.thread = _make_session_worker("default")
 
     def tearDown(self):
-        # Signal shutdown
-        self.infer_queue.put(None)
+        self.q.put(None)
         self.thread.join(timeout=2)
 
     # ------------------------------------------------------------------
@@ -79,16 +88,16 @@ class TestPersistentInferenceThread(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_task_is_executed(self):
-        """_run_on_infer_thread executes the submitted function."""
+        """_run_on_session_thread executes the submitted function."""
         results = []
-        _run_on_thread(self.infer_queue, lambda: results.append(42))
+        _run_on_thread(self.q, lambda: results.append(42))
         self.assertEqual(results, [42])
 
     def test_multiple_tasks_execute_in_order(self):
-        """Tasks submitted sequentially execute in FIFO order."""
+        """Tasks submitted to the same session execute in FIFO order."""
         order = []
         for i in range(5):
-            _run_on_thread(self.infer_queue, lambda n=i: order.append(n))
+            _run_on_thread(self.q, lambda n=i: order.append(n))
         self.assertEqual(order, list(range(5)))
 
     def test_exception_is_re_raised(self):
@@ -98,131 +107,216 @@ class TestPersistentInferenceThread(unittest.TestCase):
             raise ValueError("boom")
 
         with self.assertRaisesRegex(ValueError, "boom"):
-            _run_on_thread(self.infer_queue, _raise)
+            _run_on_thread(self.q, _raise)
 
     # ------------------------------------------------------------------
-    # Same thread identity across calls (the key guarantee for CUDA-graph TLS)
+    # Session-affinity: same session => same OS thread (key guarantee for
+    # CUDA-graph TLS)
     # ------------------------------------------------------------------
 
-    def test_same_thread_used_for_every_call(self):
-        """All tasks run on the same persistent OS thread."""
+    def test_same_thread_used_for_every_call_in_same_session(self):
+        """All tasks for the same session run on the same persistent OS thread."""
         thread_ids = []
 
         def _record_tid():
             thread_ids.append(threading.get_ident())
 
         for _ in range(10):
-            _run_on_thread(self.infer_queue, _record_tid)
+            _run_on_thread(self.q, _record_tid)
 
-        # All tasks must have run on the same thread.
         self.assertEqual(len(set(thread_ids)), 1, f"Tasks ran on multiple threads: {thread_ids}")
 
-    def test_caller_thread_is_different_from_worker_thread(self):
-        """The caller thread and the inference thread must be distinct."""
+    def test_caller_thread_is_different_from_session_thread(self):
+        """The caller thread and the session thread must be distinct."""
         caller_id = threading.get_ident()
         worker_ids = []
-        _run_on_thread(self.infer_queue, lambda: worker_ids.append(threading.get_ident()))
+        _run_on_thread(self.q, lambda: worker_ids.append(threading.get_ident()))
         self.assertNotEqual(caller_id, worker_ids[0])
 
     # ------------------------------------------------------------------
-    # Streaming (infer_list_stream) scenario: "started" event pattern
+    # Different sessions use different threads
     # ------------------------------------------------------------------
 
-    def test_stream_task_does_not_block_caller(self):
-        """Putting a task directly on the queue (streaming style) does not block.
+    def test_different_sessions_use_different_threads(self):
+        """Two separate sessions must run on distinct OS threads."""
+        q_a, t_a = _make_session_worker("session-A")
+        q_b, t_b = _make_session_worker("session-B")
+        try:
+            tid_a, tid_b = [], []
+            _run_on_thread(q_a, lambda: tid_a.append(threading.get_ident()))
+            _run_on_thread(q_b, lambda: tid_b.append(threading.get_ident()))
+            self.assertNotEqual(tid_a[0], tid_b[0], "Different sessions should use different threads")
+        finally:
+            q_a.put(None)
+            q_b.put(None)
+            t_a.join(timeout=2)
+            t_b.join(timeout=2)
 
-        infer_list_stream puts the task on the queue and immediately starts
-        iterating the streamer.  The task must NOT be waited on before the
-        caller starts consuming.
+    # ------------------------------------------------------------------
+    # _predict_lock serialises concurrent sessions (protects shared model
+    # state and satisfies the single-GPU constraint)
+    # ------------------------------------------------------------------
+
+    def test_predict_lock_serializes_concurrent_sessions(self):
+        """_predict_lock ensures only one session accesses the model at a time.
+
+        Two sessions start concurrently; the lock must guarantee that their
+        critical sections do not overlap.
         """
-        consumed: list = []
-        in_stream = queue.SimpleQueue()  # simulated streamer internal queue
-        _STOP = object()
+        predict_lock = threading.Lock()
+        overlap_detected = []
+        inside_count = [0]
 
-        def _stream_task():
-            for token in ["Hello", " world"]:
-                in_stream.put(token)
-            in_stream.put(_STOP)
+        def _critical_section():
+            with predict_lock:
+                inside_count[0] += 1
+                if inside_count[0] > 1:
+                    overlap_detected.append(True)
+                threading.Event().wait(timeout=0.05)  # simulate short inference
+                inside_count[0] -= 1
 
-        # Non-blocking enqueue (mirrors infer_list_stream behaviour)
-        self.infer_queue.put(_stream_task)
+        q_a, t_a = _make_session_worker("lock-A")
+        q_b, t_b = _make_session_worker("lock-B")
+        try:
+            # Submit to both sessions simultaneously
+            done_a = threading.Event()
+            done_b = threading.Event()
 
-        # Consume streamer output (mirrors "yield from streamer")
-        while True:
-            item = in_stream.get(timeout=5)
-            if item is _STOP:
-                break
-            consumed.append(item)
+            def _task_a():
+                _critical_section()
+                done_a.set()
 
-        self.assertEqual(consumed, ["Hello", " world"])
+            def _task_b():
+                _critical_section()
+                done_b.set()
 
-    def test_concurrent_streams_do_not_time_out(self):
-        """A second concurrent infer_list_stream must not time out while queued.
+            q_a.put(_task_a)
+            q_b.put(_task_b)
+            done_a.wait(timeout=5)
+            done_b.wait(timeout=5)
 
-        Before the fix, infer_list_stream immediately started consuming
-        from its streamer.  If a previous request was still running, the
-        second request's per-token timeout would fire before any token was
-        produced, silently truncating the response.
+            self.assertFalse(overlap_detected, "Concurrent sessions overlapped inside _predict_lock")
+        finally:
+            q_a.put(None)
+            q_b.put(None)
+            t_a.join(timeout=2)
+            t_b.join(timeout=2)
 
-        The fix is to fire a ``started`` threading.Event inside the task
-        (before calling _predict) and wait for it in infer_list_stream
-        before starting ``yield from streamer``.  This test verifies that
-        a short token timeout does NOT truncate a second request that is
-        genuinely queued behind a slow first request.
+    # ------------------------------------------------------------------
+    # Streaming (infer_list_stream) scenario: started event inside lock
+    # ------------------------------------------------------------------
+
+    def test_started_fires_inside_predict_lock(self):
+        """In infer_list_stream the 'started' event fires inside _predict_lock.
+
+        This means:
+        - The caller's started.wait() unblocks only once the lock is held.
+        - The streamer's per-token timeout applies from that point, not from
+          the moment the task was enqueued.
         """
-        SHORT_TIMEOUT = 0.1  # seconds – would fire if we didn't wait on "started"
-
-        first_done = threading.Event()
+        predict_lock = threading.Lock()
+        SHORT_TIMEOUT = 0.1  # would fire if started fired before lock acquisition
         results: list = []
 
-        # --- First task: long-running (holds the worker for a bit) ---
-        def _first_task():
-            threading.Event().wait(timeout=0.3)  # simulate slow inference
-            first_done.set()
-
-        # --- Second task: streaming style with started-event pattern ---
-        second_in_stream = queue.SimpleQueue()
+        in_stream = queue.SimpleQueue()
         _STOP = object()
-        started_event = threading.Event()
+        started = threading.Event()
 
-        def _second_task():
-            started_event.set()  # mirrors infer_list_stream's started.set()
-            for token in ["A", "B"]:
-                second_in_stream.put(token)
-            second_in_stream.put(_STOP)
+        def _streaming_task():
+            with predict_lock:
+                started.set()  # mirrors infer_list_stream: fire inside lock
+                for token in ["X", "Y"]:
+                    in_stream.put(token)
+                in_stream.put(_STOP)
 
-        # Enqueue both tasks
-        self.infer_queue.put(_first_task)
-        self.infer_queue.put(_second_task)
+        q, t = _make_session_worker("streaming")
+        try:
+            # Hold the lock from outside to simulate another session running
+            predict_lock.acquire()
 
-        # Wait for started_event before consuming (mirrors the fix)
-        started_event.wait(timeout=5)
+            q.put(_streaming_task)
 
-        # Consume with a short per-item timeout; this must NOT time out
-        # because inference has already started when we reach this point.
-        while True:
-            try:
-                item = second_in_stream.get(timeout=SHORT_TIMEOUT)
-            except queue.Empty:
-                results.append("TIMEOUT")
-                break
-            if item is _STOP:
-                break
-            results.append(item)
+            # started must NOT fire while the lock is held externally
+            fired_early = started.wait(timeout=0.05)
+            self.assertFalse(fired_early, "started fired before _predict_lock was available")
 
-        self.assertEqual(results, ["A", "B"], "Second concurrent stream timed out unexpectedly")
+            # Release the lock; the session thread can now acquire it
+            predict_lock.release()
+
+            # Now started should fire promptly
+            started.wait(timeout=5)
+
+            while True:
+                try:
+                    item = in_stream.get(timeout=SHORT_TIMEOUT)
+                except queue.Empty:
+                    results.append("TIMEOUT")
+                    break
+                if item is _STOP:
+                    break
+                results.append(item)
+
+            self.assertEqual(results, ["X", "Y"], "Streaming tokens timed out unexpectedly")
+        finally:
+            q.put(None)
+            t.join(timeout=2)
+
+    def test_concurrent_sessions_do_not_block_each_other_in_queue(self):
+        """Concurrent sessions each start immediately on their own thread.
+
+        Unlike a single FIFO queue where Session B waits for Session A to
+        complete before being dequeued, with per-session threads Session B
+        is dequeued instantly and only waits for _predict_lock.
+        """
+        predict_lock = threading.Lock()
+
+        # Track when each session picks up its task (not when it finishes)
+        picked_up = {}
+
+        q_a, t_a = _make_session_worker("concurrent-A")
+        q_b, t_b = _make_session_worker("concurrent-B")
+        try:
+            done_a = threading.Event()
+            done_b = threading.Event()
+
+            def _task_a():
+                picked_up["A"] = True
+                with predict_lock:
+                    threading.Event().wait(timeout=0.1)
+                done_a.set()
+
+            def _task_b():
+                picked_up["B"] = True
+                with predict_lock:
+                    pass
+                done_b.set()
+
+            q_a.put(_task_a)
+            q_b.put(_task_b)
+
+            done_a.wait(timeout=5)
+            done_b.wait(timeout=5)
+
+            # Both sessions must have picked up their tasks (even if B ran after A)
+            self.assertIn("A", picked_up)
+            self.assertIn("B", picked_up)
+        finally:
+            q_a.put(None)
+            q_b.put(None)
+            t_a.join(timeout=2)
+            t_b.join(timeout=2)
 
     # ------------------------------------------------------------------
-    # Shutdown
+    # Session release / shutdown
     # ------------------------------------------------------------------
 
     def test_thread_stops_on_none_sentinel(self):
-        """Sending None shuts down the worker thread cleanly."""
-        self.infer_queue.put(None)
+        """Sending None shuts down the session thread cleanly."""
+        self.q.put(None)
         self.thread.join(timeout=2)
         self.assertFalse(self.thread.is_alive(), "Worker thread did not stop after None sentinel")
         # Prevent tearDown from sending a second None (thread already stopped)
-        self.infer_queue = queue.SimpleQueue()  # dummy queue for tearDown
+        self.q = queue.SimpleQueue()  # dummy queue for tearDown
 
 
 if __name__ == "__main__":
