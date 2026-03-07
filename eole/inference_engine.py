@@ -268,6 +268,15 @@ class InferenceEnginePY(InferenceEngine):
         # FIFO queue.  Instead they compete fairly for _predict_lock, which
         # serialises the actual GPU forward pass and protects shared predictor state
         # (e.g. update_settings) from concurrent mutation.
+        #
+        # NOTE – GPU-level throughput is still single-threaded:
+        # A single GPU executes one forward pass at a time regardless of how many
+        # OS threads exist.  _predict_lock is the serialisation point for that.
+        # The benefit of per-session threads is *latency fairness*: User B's
+        # thread is ready to acquire the lock the instant User A releases it,
+        # with no FIFO queue overhead or streamer-timeout risk.  Total GPU
+        # throughput is unchanged; per-user response latency improves because
+        # there is no extra queuing delay beyond the GPU itself.
         self._predict_lock: threading.Lock = threading.Lock()
         self._session_workers: dict = {}           # session_id -> (queue.SimpleQueue, threading.Thread)
         self._session_workers_lock: threading.Lock = threading.Lock()
@@ -410,6 +419,13 @@ class InferenceEnginePY(InferenceEngine):
         lifetime of the streaming response.  Concurrent callers therefore each
         run on their own thread and compete fairly for ``_predict_lock`` rather
         than queueing behind each other in a shared FIFO queue.
+
+        **GPU-level performance note:** A single GPU can only execute one forward
+        pass at a time regardless of OS thread count.  ``_predict_lock`` is the
+        serialisation point for GPU access, so total GPU throughput remains the
+        same as with a single thread.  The benefit of per-session threads is
+        *latency fairness*: User B's thread acquires the lock the instant User A
+        releases it, with no FIFO queue delay or streamer-timeout risk.
 
         The ``started`` event fires *inside* ``with self._predict_lock:`` — just
         before ``_predict`` is called — so the caller only begins consuming the
