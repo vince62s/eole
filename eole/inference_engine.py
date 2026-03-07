@@ -449,18 +449,23 @@ class InferenceEnginePY(InferenceEngine):
         run on their own thread and compete fairly for ``_predict_lock`` rather
         than queueing behind each other in a shared FIFO queue.
 
-        **GPU-level performance note (eager and compiled):** ``_predict_lock`` is
-        held unconditionally during every forward pass — two concurrent streaming
-        requests are **never** handled simultaneously, regardless of whether
-        ``torch.compile`` is active.  In eager mode the lock is still necessary to
-        prevent concurrent mutation of shared predictor state (``update_settings``
-        writes fields such as ``beam_size`` and ``temperature`` that are read
-        immediately in the next forward pass).  In compiled / CUDA-graph mode it
-        additionally pins all graph captures and replays to the correct thread (TLS
-        constraint).  Since a single GPU executes one forward pass at a time anyway,
-        this does not reduce throughput.  The benefit of per-session threads is
-        *latency fairness*: User B's thread acquires the lock the instant User A
-        releases it, with no FIFO queue delay or streamer-timeout risk.
+        **Serialisation (eager and compiled):** ``_predict_lock`` is held
+        unconditionally during every forward pass — two concurrent streaming
+        requests are **never** handled simultaneously.  User B's forward pass
+        cannot start until User A releases the lock.  In eager mode the lock
+        prevents concurrent mutation of shared predictor state
+        (``update_settings`` writes fields such as ``beam_size`` and
+        ``temperature`` that are read immediately in the next forward pass).
+        In compiled / CUDA-graph mode it additionally ensures that all graph
+        captures and replays run on the correct thread (TLS constraint).
+
+        **Design trade-off — continuous batching:** True request-level
+        parallelism (User A and User B generating tokens simultaneously) would
+        require *continuous batching* — combining both requests into a single
+        batched forward pass with separate KV-cache slots per sequence.
+        Without continuous batching, concurrent forward passes would share and
+        corrupt each other's KV cache and attention masks, so serialisation is
+        the only safe design for a shared single-GPU server.
 
         The ``started`` event fires *inside* ``with self._predict_lock:`` — just
         before ``_predict`` is called — so the caller only begins consuming the

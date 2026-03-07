@@ -769,10 +769,22 @@ def create_app(config_file):
                         finally:
                             loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
 
-                    # Run _produce in the default executor (reused threads).
-                    # The actual model forward pass happens on the engine's own
-                    # persistent thread, so _produce merely bridges the
-                    # synchronous generator to the async queue.
+                    # Run _produce in the default thread-pool executor.
+                    #
+                    # Each call to infer_list_stream creates a dedicated session
+                    # thread for this request.  All session threads compete for
+                    # the engine's _predict_lock, which serialises GPU forward
+                    # passes: User B's inference cannot start until User A's
+                    # completes and releases the lock.  _produce is therefore a
+                    # thin bridge that copies tokens from the synchronous
+                    # generator into chunk_queue once the lock is held.
+                    #
+                    # True request-level parallelism (User A and B generating
+                    # tokens simultaneously) would require continuous batching —
+                    # combining both requests into a single batched forward pass
+                    # with separate KV-cache slots per sequence.  Without that,
+                    # concurrent forward passes would share and corrupt each
+                    # other's KV cache and attention masks.
                     loop.run_in_executor(None, _produce)
 
                     # First chunk: role announcement
