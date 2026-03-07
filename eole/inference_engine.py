@@ -269,14 +269,20 @@ class InferenceEnginePY(InferenceEngine):
         # serialises the actual GPU forward pass and protects shared predictor state
         # (e.g. update_settings) from concurrent mutation.
         #
-        # NOTE – GPU-level throughput is still single-threaded:
-        # A single GPU executes one forward pass at a time regardless of how many
-        # OS threads exist.  _predict_lock is the serialisation point for that.
-        # The benefit of per-session threads is *latency fairness*: User B's
-        # thread is ready to acquire the lock the instant User A releases it,
-        # with no FIFO queue overhead or streamer-timeout risk.  Total GPU
-        # throughput is unchanged; per-user response latency improves because
-        # there is no extra queuing delay beyond the GPU itself.
+        # NOTE – GPU-level throughput is always single-threaded (eager AND compiled):
+        # _predict_lock is held unconditionally during every forward pass, regardless
+        # of whether torch.compile / CUDA graphs are active.  Two concurrent requests
+        # are therefore *never* handled simultaneously:
+        #   • In eager mode the lock prevents concurrent mutation of shared predictor
+        #     state (update_settings writes fields like beam_size, temperature, etc.
+        #     that are read during the very next forward pass).
+        #   • In compiled / CUDA-graph mode the lock additionally ensures that all
+        #     graph captures and replays happen on the same thread (TLS constraint).
+        # A single GPU executes one forward pass at a time regardless of OS thread
+        # count, so this does not reduce throughput.  The benefit of per-session
+        # threads is *latency fairness*: User B's thread is ready to acquire the lock
+        # the instant User A releases it, with no FIFO queue overhead or
+        # streamer-timeout risk.
         self._predict_lock: threading.Lock = threading.Lock()
         self._session_workers: dict = {}           # session_id -> (queue.SimpleQueue, threading.Thread)
         self._session_workers_lock: threading.Lock = threading.Lock()
@@ -420,10 +426,16 @@ class InferenceEnginePY(InferenceEngine):
         run on their own thread and compete fairly for ``_predict_lock`` rather
         than queueing behind each other in a shared FIFO queue.
 
-        **GPU-level performance note:** A single GPU can only execute one forward
-        pass at a time regardless of OS thread count.  ``_predict_lock`` is the
-        serialisation point for GPU access, so total GPU throughput remains the
-        same as with a single thread.  The benefit of per-session threads is
+        **GPU-level performance note (eager and compiled):** ``_predict_lock`` is
+        held unconditionally during every forward pass — two concurrent streaming
+        requests are **never** handled simultaneously, regardless of whether
+        ``torch.compile`` is active.  In eager mode the lock is still necessary to
+        prevent concurrent mutation of shared predictor state (``update_settings``
+        writes fields such as ``beam_size`` and ``temperature`` that are read
+        immediately in the next forward pass).  In compiled / CUDA-graph mode it
+        additionally pins all graph captures and replays to the correct thread (TLS
+        constraint).  Since a single GPU executes one forward pass at a time anyway,
+        this does not reduce throughput.  The benefit of per-session threads is
         *latency fairness*: User B's thread acquires the lock the instant User A
         releases it, with no FIFO queue delay or streamer-timeout risk.
 
