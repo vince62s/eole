@@ -1011,10 +1011,13 @@ def _mmproj_to_eole_tensors(
 
         if suffix in ("attn_qkv.weight", "attn_qkv.bias"):
             # Fused QKV tensor: split into separate Q / K / V along dim-0.
-            # data.shape = (3*hidden_size, hidden_size) after GGUF ne-reversal.
-            q = t[:hidden_size]
-            k = t[hidden_size: 2 * hidden_size]
-            v = t[2 * hidden_size:]
+            # The Q/K/V projection size may differ from hidden_size (e.g. when
+            # head_dim * num_heads != hidden_size), so compute the per-component
+            # size dynamically from the tensor rather than assuming hidden_size.
+            qkv_size = t.shape[0] // 3
+            q = t[:qkv_size]
+            k = t[qkv_size: 2 * qkv_size]
+            v = t[2 * qkv_size:]
             param = ".weight" if suffix.endswith(".weight") else ".bias"
             written[f"{pfx}.self_attn.linear_query{param}"] = q.contiguous()
             written[f"{pfx}.self_attn.linear_keys{param}"] = k.contiguous()

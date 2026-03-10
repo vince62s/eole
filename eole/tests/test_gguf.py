@@ -939,11 +939,15 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         spatial_size = img_size // patch_size  # 8
         num_pos = spatial_size * spatial_size   # 64  (one entry per patch, NOT 2x)
         projection_dim = 128  # clip.vision.projection_dim: decoder hidden size
+        # Use proj_size != hidden to exercise the shape//3 split fix.
+        # Qwen3.5 VL uses head_dim*num_heads != hidden_size (e.g. 256*16=4096 vs 1152).
+        proj_size = 2 * hidden  # 128 – deliberately different from hidden=64
         cls.hidden = hidden
         cls.ff = ff
         cls.patch_size = patch_size
         cls.num_layers = num_layers
         cls.num_pos = num_pos
+        cls.proj_size = proj_size
 
         w = GGUFWriter(cls.mmproj_path, "clip")
         w.add_uint32("clip.vision.block_count", num_layers)
@@ -972,12 +976,14 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         w.add_tensor("mm.0.bias", np.zeros(merged_hidden_size, dtype=np.float32))
         w.add_tensor("mm.2.weight", np.ones((merged_hidden_size, projection_dim), dtype=np.float32))
         w.add_tensor("mm.2.bias", np.zeros(projection_dim, dtype=np.float32))
-        # encoder blocks
+        # encoder blocks: attn_qkv uses proj_size != hidden to test the shape//3 split
         for i in range(num_layers):
             p = f"v.blk.{i}"
-            w.add_tensor(f"{p}.attn_qkv.weight", np.ones((3 * hidden, hidden), dtype=np.float32))
-            w.add_tensor(f"{p}.attn_qkv.bias", np.zeros(3 * hidden, dtype=np.float32))
-            w.add_tensor(f"{p}.attn_out.weight", np.ones((hidden, hidden), dtype=np.float32))
+            # attn_qkv projects hidden → 3*proj_size (fused Q+K+V), so shape (3*proj_size, hidden)
+            w.add_tensor(f"{p}.attn_qkv.weight", np.ones((3 * proj_size, hidden), dtype=np.float32))
+            w.add_tensor(f"{p}.attn_qkv.bias", np.zeros(3 * proj_size, dtype=np.float32))
+            # attn_out projects concatenated heads (proj_size) back to hidden: (hidden, proj_size)
+            w.add_tensor(f"{p}.attn_out.weight", np.ones((hidden, proj_size), dtype=np.float32))
             w.add_tensor(f"{p}.attn_out.bias", np.zeros(hidden, dtype=np.float32))
             w.add_tensor(f"{p}.ffn_up.weight", np.ones((ff, hidden), dtype=np.float32))
             w.add_tensor(f"{p}.ffn_up.bias", np.zeros(ff, dtype=np.float32))
@@ -1150,14 +1156,20 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         self.assertNotIn(f"{pfx}.qkv_proj.weight", tensors)
 
     def test_qkv_split_shapes(self):
-        """Each of Q/K/V must have shape (hidden, hidden) after split."""
+        """Each of Q/K/V must have shape (proj_size, hidden) after split.
+
+        proj_size may differ from hidden_size when head_dim * num_heads != hidden_size
+        (e.g. Qwen3.5 VL: head_dim=256, num_heads=16 → proj=4096 vs hidden=1152).
+        The split must use shape//3, NOT hidden_size, as the boundary.
+        """
         import torch
         tensors = self._tensors()
         pfx = "encoder.transformer_layers.0.self_attn"
         for proj in ("linear_query", "linear_keys", "linear_values"):
             shape = tensors[f"{pfx}.{proj}.weight"].shape
-            self.assertEqual(shape, torch.Size([self.hidden, self.hidden]),
-                             f"{proj}.weight wrong shape: {shape}")
+            self.assertEqual(shape, torch.Size([self.proj_size, self.hidden]),
+                             f"{proj}.weight wrong shape: {shape} "
+                             f"(expected proj_size={self.proj_size}, hidden={self.hidden})")
 
     def test_ffn_up_maps_to_gate_up_proj(self):
         tensors = self._tensors()
