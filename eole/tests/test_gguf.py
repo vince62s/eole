@@ -96,10 +96,10 @@ class TestGGUFNameMapping(unittest.TestCase):
     def setUp(self):
         _require("gguf")
 
-    def _map(self, name):
+    def _map(self, name, linear_blocks=frozenset()):
         from eole.bin.convert.convert_gguf import _gguf_to_eole_name
 
-        return _gguf_to_eole_name(name)
+        return _gguf_to_eole_name(name, linear_blocks)
 
     def test_embedding(self):
         self.assertEqual(self._map("token_embd.weight"), "tgt_emb.embeddings.weight")
@@ -140,20 +140,71 @@ class TestGGUFNameMapping(unittest.TestCase):
     def test_unknown_returns_empty(self):
         self.assertEqual(self._map("some.unknown.tensor"), "")
 
-    def test_known_unsupported_attn_gate_returns_none(self):
-        """Qwen3.5 attn_gate is known but not yet modelled in EOLE → None."""
-        self.assertIsNone(self._map("blk.0.attn_gate.weight"))
+    def test_post_attention_norm_maps_for_full_attention_block(self):
+        """post_attention_norm is present in full-attention blocks and must map."""
+        r = self._map("blk.3.post_attention_norm.weight")
+        self.assertEqual(r, "decoder.transformer_layers.3.post_attention_layernorm.weight")
 
-    def test_known_unsupported_post_attention_norm_returns_none(self):
-        """Qwen3.5 post_attention_norm is known but not modelled → None."""
-        self.assertIsNone(self._map("blk.0.post_attention_norm.weight"))
+    def test_post_attention_norm_maps_for_linear_attention_block(self):
+        """post_attention_norm is also present in linear-attention blocks."""
+        r = self._map("blk.0.post_attention_norm.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.post_attention_layernorm.weight")
 
-    def test_known_unsupported_ssm_returns_none(self):
-        """Mamba/SSM tensors are known but not modelled in EOLE → None."""
-        self.assertIsNone(self._map("blk.0.ssm_a"))
-        self.assertIsNone(self._map("blk.0.ssm_alpha.weight"))
-        self.assertIsNone(self._map("blk.0.ssm_beta.weight"))
-        self.assertIsNone(self._map("blk.0.ssm_out.weight"))
+    # ------------------------------------------------------------------
+    # Linear-attention block mappings (SSM / GatedDeltaNet)
+    # ------------------------------------------------------------------
+
+    def test_linear_attn_ssm_a_maps_to_A_log(self):
+        r = self._map("blk.0.ssm_a", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.A_log")
+
+    def test_linear_attn_ssm_alpha_maps_to_in_proj_a(self):
+        r = self._map("blk.0.ssm_alpha.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.in_proj_a.weight")
+
+    def test_linear_attn_ssm_beta_maps_to_in_proj_b(self):
+        r = self._map("blk.0.ssm_beta.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.in_proj_b.weight")
+
+    def test_linear_attn_ssm_out_maps_to_out_proj(self):
+        r = self._map("blk.0.ssm_out.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.out_proj.weight")
+
+    def test_linear_attn_ssm_conv1d_maps(self):
+        r = self._map("blk.0.ssm_conv1d.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.conv1d.weight")
+
+    def test_linear_attn_ssm_dt_bias_maps(self):
+        r = self._map("blk.0.ssm_dt.bias", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.dt_bias")
+
+    def test_linear_attn_ssm_norm_maps(self):
+        r = self._map("blk.0.ssm_norm.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.norm.weight")
+
+    def test_linear_attn_attn_qkv_maps_to_in_proj_qkv(self):
+        """In a linear-attention block attn_qkv goes to in_proj_qkv, not qkv_proj."""
+        r = self._map("blk.0.attn_qkv.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.in_proj_qkv.weight")
+
+    def test_linear_attn_attn_gate_maps_to_in_proj_z(self):
+        r = self._map("blk.0.attn_gate.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.0.linear_attn.in_proj_z.weight")
+
+    def test_full_attn_block_attn_qkv_maps_to_qkv_proj(self):
+        """In a full-attention block attn_qkv still maps to self_attn.qkv_proj."""
+        r = self._map("blk.1.attn_qkv.weight", linear_blocks=frozenset({0}))
+        self.assertEqual(r, "decoder.transformer_layers.1.self_attn.qkv_proj.weight")
+
+    def test_ssm_tensors_unrecognised_without_linear_blocks(self):
+        """Without linear_blocks context, SSM tensor names are unrecognised (warn)."""
+        self.assertEqual(self._map("blk.0.ssm_a"), "")
+        self.assertEqual(self._map("blk.0.ssm_alpha.weight"), "")
+        self.assertEqual(self._map("blk.0.ssm_out.weight"), "")
+
+    def test_attn_gate_unrecognised_in_full_attention_block(self):
+        """attn_gate.weight in a non-linear block is unrecognised (no silent skip)."""
+        self.assertEqual(self._map("blk.3.attn_gate.weight"), "")
 
 
 class TestGGUFLinear(unittest.TestCase):
@@ -541,6 +592,320 @@ class TestGGUFFuseHandlers(unittest.TestCase):
         mlp._fuse_gate()
         self.assertIsInstance(mlp.gate_up_proj, GL)
         self.assertIsInstance(mlp.up_proj, GL)
+
+
+class TestGGUFDetectLinearBlocks(unittest.TestCase):
+    """Test :func:`_detect_linear_attention_blocks`."""
+
+    def setUp(self):
+        _require("gguf")
+        _require("numpy")
+
+    def test_detects_blocks_with_ssm_tensors(self):
+        """Blocks that have ssm_* tensors should be returned as linear-attention."""
+        import numpy as np
+        from gguf import GGUFWriter, GGUFReader
+        import tempfile
+
+        from eole.bin.convert.convert_gguf import _detect_linear_attention_blocks
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "h.gguf")
+            w = GGUFWriter(path, "qwen35")
+            w.add_block_count(4)
+            w.add_embedding_length(64)
+            w.add_vocab_size(8)
+            w.add_token_list([str(i) for i in range(8)])
+            # Block 0 and 2: linear attention (have ssm_a)
+            for blk in (0, 2):
+                w.add_tensor(f"blk.{blk}.ssm_a", np.ones(4, dtype=np.float32))
+                w.add_tensor(f"blk.{blk}.ssm_norm.weight", np.ones(16, dtype=np.float32))
+            # Block 1 and 3: full attention (no ssm_*)
+            for blk in (1, 3):
+                w.add_tensor(f"blk.{blk}.attn_q.weight", np.zeros((64, 64), dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            reader = GGUFReader(path)
+
+        linear = _detect_linear_attention_blocks(reader.tensors)
+        self.assertEqual(linear, frozenset({0, 2}))
+
+    def test_empty_for_pure_attention_model(self):
+        """Models without any ssm_* tensors return an empty set."""
+        import numpy as np
+        from gguf import GGUFWriter, GGUFReader
+        import tempfile
+
+        from eole.bin.convert.convert_gguf import _detect_linear_attention_blocks
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "a.gguf")
+            w = GGUFWriter(path, "llama")
+            w.add_block_count(2)
+            w.add_embedding_length(64)
+            w.add_vocab_size(8)
+            w.add_token_list([str(i) for i in range(8)])
+            w.add_tensor("blk.0.attn_q.weight", np.zeros((64, 64), dtype=np.float32))
+            w.add_tensor("blk.1.attn_q.weight", np.zeros((64, 64), dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            reader = GGUFReader(path)
+
+        linear = _detect_linear_attention_blocks(reader.tensors)
+        self.assertEqual(linear, frozenset())
+
+
+class TestGGUFHybridConverter(unittest.TestCase):
+    """Integration test for the GGUF → EOLE conversion of a hybrid model.
+
+    A synthetic 2-block model is constructed:
+      - blk.0: linear-attention block (GatedDeltaNet / SSM)
+      - blk.1: full-attention block (standard self-attention)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _require("gguf")
+        _require("numpy")
+        _require("safetensors")
+
+        import numpy as np
+        from gguf import GGMLQuantizationType, GGUFWriter
+
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.gguf_path = os.path.join(cls.tmpdir, "hybrid.gguf")
+        cls.output_dir = os.path.join(cls.tmpdir, "hybrid_out")
+
+        # Dimensions chosen to be consistent with GatedDeltaNet:
+        #   hidden_size=64, num_v_heads=4, head_v_dim=16 → value_dim=64
+        #   num_k_heads=2, head_k_dim=16 → key_dim=32
+        #   conv_dim = key_dim*2 + value_dim = 32*2 + 64 = 128
+        hidden, ff = 64, 128
+        num_heads, heads_kv, n_vocab = 4, 2, 32
+        # GatedDeltaNet dims
+        num_v_heads, head_v_dim = 4, 16    # value_dim = 64
+        num_k_heads, head_k_dim = 2, 16    # key_dim = 32
+        conv_dim = num_k_heads * head_k_dim * 2 + num_v_heads * head_v_dim  # 128
+        kernel_size = 4
+
+        writer = GGUFWriter(cls.gguf_path, "qwen35")
+        writer.add_block_count(2)
+        writer.add_context_length(128)
+        writer.add_embedding_length(hidden)
+        writer.add_feed_forward_length(ff)
+        writer.add_head_count(num_heads)
+        writer.add_head_count_kv(heads_kv)
+        writer.add_layer_norm_rms_eps(1e-5)
+        writer.add_rope_freq_base(10000.0)
+        writer.add_vocab_size(n_vocab)
+        writer.add_token_list([str(i) for i in range(n_vocab)])
+        writer.add_bos_token_id(1)
+        writer.add_eos_token_id(2)
+
+        writer.add_tensor("token_embd.weight", np.random.randn(n_vocab, hidden).astype(np.float32))
+        writer.add_tensor("output_norm.weight", np.ones(hidden, dtype=np.float32))
+
+        # -------- blk.0: linear attention block --------
+        writer.add_tensor("blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32))
+        writer.add_tensor("blk.0.post_attention_norm.weight", np.ones(hidden, dtype=np.float32))
+        writer.add_tensor("blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
+        # Linear-attention projections (quantised Q5_K / Q8_0)
+        writer.add_tensor(
+            "blk.0.attn_qkv.weight",
+            np.random.randn(hidden, conv_dim).astype(np.float32),
+            raw_dtype=GGMLQuantizationType.Q5_K,
+        )
+        writer.add_tensor(
+            "blk.0.attn_gate.weight",
+            np.random.randn(hidden, num_v_heads * head_v_dim).astype(np.float32),
+            raw_dtype=GGMLQuantizationType.Q5_K,
+        )
+        # SSM params (float)
+        writer.add_tensor("blk.0.ssm_a", np.ones(num_v_heads, dtype=np.float32))
+        writer.add_tensor("blk.0.ssm_dt.bias", np.ones(num_v_heads, dtype=np.float32))
+        writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32))
+        writer.add_tensor(
+            "blk.0.ssm_conv1d.weight",
+            np.random.randn(kernel_size, conv_dim).astype(np.float32),
+        )
+        writer.add_tensor(
+            "blk.0.ssm_alpha.weight",
+            np.random.randn(hidden, num_v_heads).astype(np.float32),
+            raw_dtype=GGMLQuantizationType.Q8_0,
+        )
+        writer.add_tensor(
+            "blk.0.ssm_beta.weight",
+            np.random.randn(hidden, num_v_heads).astype(np.float32),
+            raw_dtype=GGMLQuantizationType.Q8_0,
+        )
+        writer.add_tensor(
+            "blk.0.ssm_out.weight",
+            np.random.randn(hidden, num_v_heads * head_v_dim).astype(np.float32),
+            raw_dtype=GGMLQuantizationType.Q5_K,
+        )
+        # FFN
+        for suffix, shape in [
+            ("ffn_gate", (ff, hidden)),
+            ("ffn_up", (ff, hidden)),
+            ("ffn_down", (hidden, ff)),
+        ]:
+            writer.add_tensor(
+                f"blk.0.{suffix}.weight",
+                np.random.randn(*shape).astype(np.float32),
+                raw_dtype=GGMLQuantizationType.Q4_K,
+            )
+
+        # -------- blk.1: full attention block --------
+        writer.add_tensor("blk.1.attn_norm.weight", np.ones(hidden, dtype=np.float32))
+        writer.add_tensor("blk.1.post_attention_norm.weight", np.ones(hidden, dtype=np.float32))
+        writer.add_tensor("blk.1.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
+        for suffix, shape in [
+            ("attn_q", (hidden, hidden)),
+            ("attn_k", (hidden, hidden // num_heads * heads_kv)),
+            ("attn_v", (hidden, hidden // num_heads * heads_kv)),
+            ("attn_output", (hidden, hidden)),
+            ("ffn_gate", (ff, hidden)),
+            ("ffn_up", (ff, hidden)),
+            ("ffn_down", (hidden, ff)),
+        ]:
+            writer.add_tensor(
+                f"blk.1.{suffix}.weight",
+                np.random.randn(*shape).astype(np.float32),
+                raw_dtype=GGMLQuantizationType.Q4_K,
+            )
+
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _run_converter(self):
+        from argparse import Namespace
+        from eole.bin.convert.convert_gguf import GGUFConverter
+
+        args = Namespace(
+            gguf_path=self.gguf_path,
+            output=self.output_dir,
+            dtype="fp16",
+            tokenizer="hf",
+            hf_tokenizer=None,
+        )
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+        GGUFConverter.run(args)
+
+    def _tensors(self):
+        import safetensors.torch
+        return safetensors.torch.load_file(
+            os.path.join(self.output_dir, "model.00.safetensors")
+        )
+
+    def test_linear_attn_block0_detected(self):
+        """The converter must identify block 0 as linear-attention."""
+        from eole.bin.convert.convert_gguf import GGUFMetadata, _detect_linear_attention_blocks
+        meta = GGUFMetadata(self.gguf_path)
+        linear = _detect_linear_attention_blocks(meta.tensors)
+        self.assertIn(0, linear)
+        self.assertNotIn(1, linear)
+
+    def test_ssm_out_weight_mapped(self):
+        """ssm_out.weight must appear as linear_attn.out_proj.weight in the shard."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.out_proj.weight"
+        self.assertIn(key, tensors, f"Missing key: {key}")
+
+    def test_ssm_a_mapped_to_A_log(self):
+        """ssm_a must appear as linear_attn.A_log (float, not uint8)."""
+        self._run_converter()
+        import torch
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.A_log"
+        self.assertIn(key, tensors)
+        self.assertNotEqual(tensors[key].dtype, torch.uint8, "A_log should be float")
+
+    def test_ssm_alpha_mapped_to_in_proj_a(self):
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_a.weight"
+        self.assertIn(key, tensors)
+
+    def test_ssm_beta_mapped_to_in_proj_b(self):
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_b.weight"
+        self.assertIn(key, tensors)
+
+    def test_attn_qkv_in_linear_block_goes_to_in_proj_qkv(self):
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_qkv.weight"
+        self.assertIn(key, tensors)
+
+    def test_attn_gate_goes_to_in_proj_z(self):
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_z.weight"
+        self.assertIn(key, tensors)
+
+    def test_conv1d_weight_is_3d(self):
+        """conv1d.weight must be reshaped to 3-D (conv_dim, 1, kernel_size) for PyTorch Conv1d."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.conv1d.weight"
+        self.assertIn(key, tensors)
+        t = tensors[key]
+        self.assertEqual(t.dim(), 3, "conv1d.weight must be 3-D")
+        self.assertEqual(t.shape[1], 1, "middle dim (in_ch/groups) must be 1")
+        # First dim = conv_dim, last dim = kernel_size (4 in the synthetic model).
+        self.assertEqual(t.shape[2], 4, "last dim must be kernel_size=4")
+
+    def test_post_attention_norm_both_blocks(self):
+        """post_attention_norm maps to post_attention_layernorm for both block types."""
+        self._run_converter()
+        tensors = self._tensors()
+        for blk in (0, 1):
+            key = f"decoder.transformer_layers.{blk}.post_attention_layernorm.weight"
+            self.assertIn(key, tensors, f"Missing post_attention_layernorm for blk {blk}")
+
+    def test_config_has_layer_types(self):
+        """config.json must contain layer_types reflecting the hybrid layout."""
+        self._run_converter()
+        with open(os.path.join(self.output_dir, "config.json")) as fh:
+            cfg = json.load(fh)
+        decoder_cfg = cfg["model"].get("decoder", cfg["model"])
+        layer_types = decoder_cfg.get("layer_types")
+        self.assertIsNotNone(layer_types, "layer_types missing from config")
+        self.assertEqual(layer_types[0], "linear_attention")
+        self.assertEqual(layer_types[1], "full_attention")
+
+    def test_config_has_linear_attn_hyper_params(self):
+        """Config must include GatedDeltaNet hyper-parameters inferred from tensors."""
+        self._run_converter()
+        with open(os.path.join(self.output_dir, "config.json")) as fh:
+            cfg = json.load(fh)
+        decoder_cfg = cfg["model"].get("decoder", cfg["model"])
+        self.assertIn("linear_num_value_heads", decoder_cfg)
+        self.assertIn("linear_value_head_dim", decoder_cfg)
+        self.assertIn("linear_conv_kernel_dim", decoder_cfg)
+
+    def test_quant_layers_include_linear_attn_modules(self):
+        """quant_layers must include GatedDeltaNet module names for hybrid models."""
+        self._run_converter()
+        with open(os.path.join(self.output_dir, "config.json")) as fh:
+            cfg = json.load(fh)
+        ql = cfg["training"]["quant_layers"]
+        self.assertIn("in_proj_qkv", ql)
+        self.assertIn("out_proj", ql)
 
 
 if __name__ == "__main__":

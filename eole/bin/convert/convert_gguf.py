@@ -121,47 +121,77 @@ _BLOCK_MAP: dict[str, Optional[str]] = {
     "ffn_gate_exps.weight": "mlp.experts_gate_up.weight",
     "ffn_up_exps.weight": "mlp.experts_up.weight",
     "ffn_down_exps.weight": "mlp.experts_down.weight",
-    # ------------------------------------------------------------------
-    # Known tensors that have no direct EOLE equivalent yet – skip silently.
-    # ------------------------------------------------------------------
-    # Post-attention output norm (Qwen3.5 and similar models)
-    "post_attention_norm.weight": None,
-    "post_attention_norm.bias": None,
-    # Attention output gate (Qwen3.5 gated-attention mechanism)
-    "attn_gate.weight": None,
-    "attn_gate.bias": None,
-    # Mamba / SSM layer weights (hybrid models: Qwen3.5, Jamba, …)
-    "ssm_a": None,
-    "ssm_a.weight": None,
-    "ssm_d": None,
-    "ssm_d.weight": None,
-    "ssm_conv1d.weight": None,
-    "ssm_conv1d.bias": None,
-    "ssm_in_proj.weight": None,
-    "ssm_out.weight": None,
-    "ssm_out_proj.weight": None,
-    "ssm_dt.weight": None,
-    "ssm_dt.bias": None,
-    "ssm_norm.weight": None,
-    "ssm_alpha.weight": None,
-    "ssm_beta.weight": None,
+    # Post-attention output norm – present in both full-attention and linear-attention
+    # blocks (Qwen3.5 and similar hybrid models).
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "post_attention_norm.bias": "post_attention_layernorm.bias",
+}
+
+# ---------------------------------------------------------------------------
+# Per-block suffix → EOLE decoder-layer suffix for *linear-attention* blocks.
+#
+# In hybrid models (Qwen3.5, …) some blocks are linear/SSM layers
+# (GatedDeltaNet) rather than standard self-attention layers.  Tensor names
+# that are specific to those blocks – or whose mapping differs from the
+# full-attention case – are listed here.
+#
+# ``_gguf_to_eole_name`` checks this map *first* for blocks that are detected
+# as linear-attention blocks; anything not found here falls through to
+# ``_BLOCK_MAP`` so that shared tensors (input norm, FFN, …) are still handled.
+# ---------------------------------------------------------------------------
+_LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
+    # In linear-attention blocks the merged QKV projection feeds GatedDeltaNet,
+    # not self_attn – override the _BLOCK_MAP entry.
+    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
+    "attn_qkv.bias": "linear_attn.in_proj_qkv.bias",
+    # Gate / z projection (in_proj_z)
+    "attn_gate.weight": "linear_attn.in_proj_z.weight",
+    "attn_gate.bias": "linear_attn.in_proj_z.bias",
+    # GatedDeltaNet SSM weights
+    "ssm_a": "linear_attn.A_log",          # log-scale A decay factor
+    "ssm_a.weight": "linear_attn.A_log",   # alternative naming in some GGUF files
+    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+    "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+    "ssm_conv1d.weight": "linear_attn.conv1d.weight",
+    "ssm_conv1d.bias": "linear_attn.conv1d.bias",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_norm.weight": "linear_attn.norm.weight",
+    "ssm_out.weight": "linear_attn.out_proj.weight",
 }
 
 
-def _gguf_to_eole_name(gguf_name: str) -> Optional[str]:
+def _gguf_to_eole_name(gguf_name: str, linear_blocks: frozenset = frozenset()) -> Optional[str]:
     """Map a GGUF tensor name to the EOLE tensor name.
 
-    Returns ``None`` for tensors that should be skipped (e.g., RoPE cache,
-    or architecture-specific tensors not yet modelled in EOLE).
-    Returns the empty string ``""`` for unrecognised names (caller should warn).
+    Args:
+        gguf_name: The name of the tensor in the GGUF file.
+        linear_blocks: Set of block indices that are linear-attention (SSM/GatedDeltaNet)
+            blocks, as detected by :func:`_detect_linear_attention_blocks`.  When a
+            block index appears here the ``_LINEAR_ATTN_BLOCK_MAP`` is consulted first
+            before falling through to ``_BLOCK_MAP``.
+
+    Returns:
+        ``None`` for tensors that should be skipped (e.g., RoPE cache).
+        The empty string ``""`` for unrecognised names (caller should warn).
+        Otherwise the EOLE tensor name string.
     """
     if gguf_name in _GLOBAL_MAP:
         return _GLOBAL_MAP[gguf_name]
 
     m = re.fullmatch(r"blk\.(\d+)\.(.*)", gguf_name)
     if m:
-        block_idx = m.group(1)
+        block_idx = int(m.group(1))
         suffix = m.group(2)
+
+        if block_idx in linear_blocks:
+            # Linear-attention block: check the SSM/GatedDeltaNet map first.
+            if suffix in _LINEAR_ATTN_BLOCK_MAP:
+                eole_suffix = _LINEAR_ATTN_BLOCK_MAP[suffix]
+                if eole_suffix is None:
+                    return None
+                return f"decoder.transformer_layers.{block_idx}.{eole_suffix}"
+            # Fall through to _BLOCK_MAP for shared tensors (norms, FFN, …).
+
         if suffix not in _BLOCK_MAP:
             return ""  # unrecognised
         eole_suffix = _BLOCK_MAP[suffix]
@@ -170,6 +200,86 @@ def _gguf_to_eole_name(gguf_name: str) -> Optional[str]:
         return f"decoder.transformer_layers.{block_idx}.{eole_suffix}"
 
     return ""  # unrecognised
+
+
+# ---------------------------------------------------------------------------
+# Hybrid-model helpers
+# ---------------------------------------------------------------------------
+
+
+def _detect_linear_attention_blocks(tensors) -> frozenset:
+    """Return the set of block indices that contain SSM / linear-attention weights.
+
+    Linear-attention blocks in hybrid models (Qwen3.5, …) always have a ``ssm_a``
+    tensor (the GatedDeltaNet log-scale A decay factor).  We use this as a reliable
+    sentinel to distinguish them from standard full-attention blocks.
+    """
+    linear_blocks: set[int] = set()
+    for tensor in tensors:
+        m = re.fullmatch(r"blk\.(\d+)\.ssm_.*", tensor.name)
+        if m:
+            linear_blocks.add(int(m.group(1)))
+    return frozenset(linear_blocks)
+
+
+def _infer_linear_attn_config(meta, linear_blocks: frozenset) -> dict:
+    """Infer :class:`~eole.modules.gated_delta_net.GatedDeltaNet` hyper-parameters.
+
+    Parameters are read from GGUF metadata when available, and fall back to
+    inference from tensor shapes.  The returned dict contains the keys expected
+    by ``TransformerDecoderConfig`` (``layer_types``, ``linear_num_value_heads``,
+    ``linear_value_head_dim``, ``linear_num_key_heads``, ``linear_key_head_dim``,
+    ``linear_conv_kernel_dim``).
+    """
+    if not linear_blocks:
+        return {}
+
+    cfg: dict = {}
+
+    # Build a block_idx → shape lookup from the first linear-attention block.
+    block_idx = min(linear_blocks)
+    shapes: dict[str, list] = {t.name: list(t.shape) for t in meta.tensors}
+
+    # ---------- num_value_heads ----------------------------------------
+    # ssm_a has shape (num_v_heads,) [1-D tensor] in the GGUF file; after the
+    # gguf reader reverses dims, shape[0] = num_v_heads.
+    ssm_a_shape = shapes.get(f"blk.{block_idx}.ssm_a") or shapes.get(f"blk.{block_idx}.ssm_dt.bias")
+    if ssm_a_shape:
+        cfg["linear_num_value_heads"] = int(ssm_a_shape[0])
+
+    # ---------- head_value_dim -----------------------------------------
+    # ssm_norm.weight has shape (head_v_dim,).
+    ssm_norm_shape = shapes.get(f"blk.{block_idx}.ssm_norm.weight")
+    if ssm_norm_shape:
+        cfg["linear_value_head_dim"] = int(ssm_norm_shape[0])
+
+    # ---------- conv_kernel_dim and key dimensions ----------------------
+    # ssm_conv1d.weight is stored with GGUF ne=[kernel_size, conv_dim]; after
+    # reversal the reader gives shape=[conv_dim, kernel_size].
+    ssm_conv1d_shape = shapes.get(f"blk.{block_idx}.ssm_conv1d.weight")
+    if ssm_conv1d_shape and len(ssm_conv1d_shape) >= 2:
+        conv_dim = int(ssm_conv1d_shape[0])   # conv_dim = key_dim*2 + value_dim
+        kernel_size = int(ssm_conv1d_shape[1])
+        cfg["linear_conv_kernel_dim"] = kernel_size
+
+        num_v_heads = cfg.get("linear_num_value_heads", 32)
+        head_v_dim = cfg.get("linear_value_head_dim", 128)
+        value_dim = num_v_heads * head_v_dim
+        key_dim = (conv_dim - value_dim) // 2
+        # Assume key_head_dim == value_head_dim (standard in Qwen3.5).
+        head_k_dim = head_v_dim
+        cfg["linear_key_head_dim"] = head_k_dim
+        if head_k_dim > 0:
+            cfg["linear_num_key_heads"] = key_dim // head_k_dim
+
+    # ---------- layer_types list ----------------------------------------
+    n_layers = meta.block_count
+    cfg["layer_types"] = [
+        "linear_attention" if i in linear_blocks else "full_attention"
+        for i in range(n_layers)
+    ]
+
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -395,8 +505,15 @@ _SWIGLU_ARCHS = frozenset(
 )
 
 
-def build_model_config(meta: GGUFMetadata) -> dict:
-    """Build an EOLE ``model_config`` dict from GGUF metadata."""
+def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
+    """Build an EOLE ``model_config`` dict from GGUF metadata.
+
+    Args:
+        meta: Parsed GGUF metadata.
+        linear_blocks: Set of block indices detected as linear-attention (SSM/GatedDeltaNet)
+            blocks.  When non-empty, ``layer_types`` and GatedDeltaNet hyper-parameters
+            are added to the returned config.
+    """
     arch = meta.arch.lower()
     hidden_size = meta.embedding_length
     layers = meta.block_count
@@ -473,6 +590,11 @@ def build_model_config(meta: GGUFMetadata) -> dict:
 
     if arch in ("gemma2", "gemma3"):
         model_config["ffn_layernorm"] = True
+
+    # Hybrid models: add layer_types and GatedDeltaNet hyper-parameters.
+    if linear_blocks:
+        lin_cfg = _infer_linear_attn_config(meta, linear_blocks)
+        model_config.update(lin_cfg)
 
     return model_config
 
@@ -656,8 +778,16 @@ def build_safetensors(
     meta: GGUFMetadata,
     output_dir: str,
     target_dtype: torch.dtype,
+    linear_blocks: frozenset = frozenset(),
 ) -> tuple[dict, list[str]]:
     """Convert all tensors from the GGUF and write ``model.00.safetensors``.
+
+    Args:
+        meta: Parsed GGUF metadata / tensor source.
+        output_dir: Directory where ``model.00.safetensors`` will be written.
+        target_dtype: Target dtype for non-quantised (float) tensors.
+        linear_blocks: Set of block indices that are linear-attention (SSM)
+            blocks, used to route tensor names correctly.
 
     Returns ``(written_tensor_dict, quant_layers)`` where *quant_layers* is the
     list of EOLE leaf-module names (e.g. ``"linear_query"``) that carry
@@ -674,7 +804,7 @@ def build_safetensors(
 
     for tensor in meta.tensors:
         gguf_name = tensor.name
-        eole_name = _gguf_to_eole_name(gguf_name)
+        eole_name = _gguf_to_eole_name(gguf_name, linear_blocks)
 
         if eole_name is None:
             # Explicitly skipped (e.g. rope_freqs)
@@ -684,6 +814,14 @@ def build_safetensors(
             continue
 
         t, qtype_t = _tensor_to_torch(tensor, target_dtype)
+
+        # Conv1d weights come from GGUF as (kernel_size, conv_dim) – the GGML
+        # data layout stores the kernel dimension innermost (ne[0]=kernel_size).
+        # PyTorch's nn.Conv1d expects (out_channels, in_channels/groups, kernel_size).
+        # Transpose to (conv_dim, kernel_size) then unsqueeze the groups dim.
+        if eole_name.endswith("conv1d.weight") and t.dim() == 2:
+            t = t.T.unsqueeze(1).contiguous()
+
         written[eole_name] = t
 
         # For quantised linear weights, also store the per-tensor qtype so
@@ -948,15 +1086,24 @@ class GGUFConverter(BaseBin):
                     fh.write(tok + "\n")
 
         # ------------------------------------------------------------------
+        # Detect hybrid-model block layout (linear vs. full attention)
+        # ------------------------------------------------------------------
+        linear_blocks = _detect_linear_attention_blocks(meta.tensors)
+        if linear_blocks:
+            shown = sorted(linear_blocks)[:5]
+            suffix = "…" if len(linear_blocks) > 5 else ""
+            print(f"  Linear-attention blocks: {shown}{suffix}  ({len(linear_blocks)} total)")
+
+        # ------------------------------------------------------------------
         # Convert tensors (keep quantised as uint8, cast floats to target_dtype)
         # ------------------------------------------------------------------
         print("Converting tensors …")
-        written, quant_layers = build_safetensors(meta, args.output, target_dtype)
+        written, quant_layers = build_safetensors(meta, args.output, target_dtype, linear_blocks)
 
         # ------------------------------------------------------------------
         # Build EOLE config
         # ------------------------------------------------------------------
-        model_config_dict = build_model_config(meta)
+        model_config_dict = build_model_config(meta, linear_blocks)
         model_config_dict["share_decoder_embeddings"] = share_decoder_embeddings
 
         quant_layers_all = [
@@ -968,6 +1115,9 @@ class GGUFConverter(BaseBin):
             "linear_keys",
             "final_linear",
         ]
+        if linear_blocks:
+            # GatedDeltaNet linear layers that may carry quantised weights.
+            quant_layers_all += ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]
 
         training_config_dict: dict = {
             "quant_type": "gguf" if quant_layers else "",
