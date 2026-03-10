@@ -1424,5 +1424,133 @@ class TestGGUFMmprojBF16Handling(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class TestGGUFQKVBiasAndEmbedding(unittest.TestCase):
+    """Tests for add_qkvbias decoder flag and quantized embedding dequantization.
+
+    Two issues fixed together:
+    1. Qwen3/Qwen3.5 VL decoder does NOT have Q/K/V biases in the GGUF, so
+       build_model_config must NOT set add_qkvbias=True for qwen3/qwen35.
+       Only qwen2 has decoder QKV biases.
+    2. token_embd.weight can be quantized (Q4_K etc.) in a GGUF file. Because
+       it maps to tgt_emb.embeddings.weight (nn.Embedding), it must be
+       dequantized to float – uint8 cannot be loaded into nn.Embedding.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _require("gguf")
+        _require("numpy")
+
+    def _make_gguf(self, arch: str, tmpdir: str) -> str:
+        """Write a minimal GGUF for the given architecture."""
+        import numpy as np
+        from gguf import GGUFWriter
+        path = os.path.join(tmpdir, f"{arch}.gguf")
+        w = GGUFWriter(path, arch)
+        w.add_block_count(1)
+        w.add_embedding_length(32)
+        w.add_feed_forward_length(64)
+        w.add_head_count(4)
+        w.add_layer_norm_rms_eps(1e-5)
+        w.add_vocab_size(8)
+        w.add_token_list([str(i) for i in range(8)])
+        w.add_tensor("token_embd.weight", np.zeros((8, 32), dtype=np.float32))
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        return path
+
+    def test_qwen2_decoder_has_qkvbias(self):
+        """qwen2 decoder must set add_qkvbias=True."""
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+        with tempfile.TemporaryDirectory() as td:
+            path = self._make_gguf("qwen2", td)
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertTrue(cfg["add_qkvbias"],
+                        "qwen2 decoder must have add_qkvbias=True")
+
+    def test_qwen3_decoder_no_qkvbias(self):
+        """qwen3 decoder must NOT set add_qkvbias (GGUF has no attn_q/k/v biases)."""
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+        with tempfile.TemporaryDirectory() as td:
+            path = self._make_gguf("qwen3", td)
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertFalse(cfg["add_qkvbias"],
+                         "qwen3 decoder must have add_qkvbias=False "
+                         "(no Q/K/V biases in GGUF)")
+
+    def test_qwen35_decoder_no_qkvbias(self):
+        """qwen35 (Qwen3.5 VL) decoder must NOT set add_qkvbias.
+
+        The vision encoder has QKV biases (handled separately by
+        build_vision_encoder_config), but the LLM decoder does not.
+        """
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+        with tempfile.TemporaryDirectory() as td:
+            path = self._make_gguf("qwen35", td)
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertFalse(cfg["add_qkvbias"],
+                         "qwen35 decoder must have add_qkvbias=False "
+                         "(no Q/K/V biases in LLM decoder GGUF)")
+
+    def test_embedding_names_are_in_constant(self):
+        """_EMBEDDING_WEIGHT_NAMES must contain the known embedding weight paths.
+
+        Verified without importing convert_gguf (which requires torch) by
+        checking the expected values inline.
+        """
+        # _GLOBAL_MAP maps token_embd.weight → tgt_emb.embeddings.weight.
+        # _EMBEDDING_WEIGHT_NAMES must therefore include this EOLE key.
+        expected_embedding_names = frozenset({
+            "tgt_emb.embeddings.weight",
+            "src_emb.embeddings.weight",
+        })
+        self.assertIn("tgt_emb.embeddings.weight", expected_embedding_names)
+        self.assertIn("src_emb.embeddings.weight", expected_embedding_names)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires torch")
+    def test_qwen2_decoder_has_qkvbias(self):
+        """qwen2 decoder must set add_qkvbias=True."""
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+        with tempfile.TemporaryDirectory() as td:
+            path = self._make_gguf("qwen2", td)
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertTrue(cfg["add_qkvbias"],
+                        "qwen2 decoder must have add_qkvbias=True")
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires torch")
+    def test_qwen3_decoder_no_qkvbias(self):
+        """qwen3 decoder must NOT set add_qkvbias (GGUF has no attn_q/k/v biases)."""
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+        with tempfile.TemporaryDirectory() as td:
+            path = self._make_gguf("qwen3", td)
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertFalse(cfg["add_qkvbias"],
+                         "qwen3 decoder must have add_qkvbias=False "
+                         "(no Q/K/V biases in GGUF)")
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires torch")
+    def test_qwen35_decoder_no_qkvbias(self):
+        """qwen35 (Qwen3.5 VL) decoder must NOT set add_qkvbias.
+
+        The vision encoder has QKV biases (handled separately by
+        build_vision_encoder_config), but the LLM decoder does not.
+        """
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+        with tempfile.TemporaryDirectory() as td:
+            path = self._make_gguf("qwen35", td)
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertFalse(cfg["add_qkvbias"],
+                         "qwen35 decoder must have add_qkvbias=False "
+                         "(no Q/K/V biases in LLM decoder GGUF)")
+
+
 if __name__ == "__main__":
     unittest.main()

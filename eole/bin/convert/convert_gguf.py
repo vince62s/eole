@@ -79,6 +79,14 @@ _GLOBAL_MAP: dict[str, Optional[str]] = {
     "rope_factors_short.weight": None,
 }
 
+# EOLE weight names that are backed by nn.Embedding (not nn.Linear / GGUFLinear).
+# Quantized data (uint8) cannot be loaded into nn.Embedding, so these tensors
+# must be dequantized to float even when the rest of the model stays quantized.
+_EMBEDDING_WEIGHT_NAMES: frozenset[str] = frozenset({
+    "tgt_emb.embeddings.weight",
+    "src_emb.embeddings.weight",
+})
+
 # Per-block suffix → EOLE decoder-layer suffix.
 # A value of None means "known tensor but not yet modelled in EOLE – skip silently".
 _BLOCK_MAP: dict[str, Optional[str]] = {
@@ -584,7 +592,10 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
             add_final_linear_bias=True,
             add_ffnbias=True,
         )
-    if arch in ("qwen2", "qwen3", "qwen35"):
+    # Qwen2 has Q/K/V projection biases in the decoder; Qwen3 and Qwen3.5 VL
+    # do not.  The vision encoder's add_qkvbias is set separately in
+    # build_vision_encoder_config and is always True (the encoder has biases).
+    if arch in ("qwen2",):
         model_config.update(add_qkvbias=True, add_final_linear_bias=False)
     if meta.use_parallel_residual:
         model_config["parallel_residual"] = True
@@ -821,6 +832,21 @@ def build_safetensors(
             continue
 
         t, qtype_t = _tensor_to_torch(tensor, target_dtype)
+
+        # Embedding weights (nn.Embedding) cannot hold uint8 quantized data –
+        # only nn.Linear / GGUFLinear can.  Dequantize them to target_dtype here.
+        if qtype_t is not None and eole_name in _EMBEDDING_WEIGHT_NAMES:
+            try:
+                import numpy as _np
+                from gguf.quants import dequantize as _gguf_dequantize
+                dq = _gguf_dequantize(tensor.data, tensor.tensor_type)
+                t = torch.from_numpy(_np.array(dq, copy=True)).to(target_dtype)
+                qtype_t = None  # no companion gguf_qtype – it's plain float now
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Embedding tensor {gguf_name!r} is quantized "
+                    f"({tensor.tensor_type.name}) and could not be dequantized: {exc}"
+                ) from exc
 
         # Conv1d weights: the gguf reader reverses GGUF ne, so data arrives as
         # (conv_dim, kernel_size) – i.e. shape[0]=kernel_size, shape[1]=conv_dim
