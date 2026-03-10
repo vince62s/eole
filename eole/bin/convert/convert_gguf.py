@@ -138,6 +138,7 @@ _BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_conv1d.weight": None,
     "ssm_conv1d.bias": None,
     "ssm_in_proj.weight": None,
+    "ssm_out.weight": None,
     "ssm_out_proj.weight": None,
     "ssm_dt.weight": None,
     "ssm_dt.bias": None,

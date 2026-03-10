@@ -153,6 +153,7 @@ class TestGGUFNameMapping(unittest.TestCase):
         self.assertIsNone(self._map("blk.0.ssm_a"))
         self.assertIsNone(self._map("blk.0.ssm_alpha.weight"))
         self.assertIsNone(self._map("blk.0.ssm_beta.weight"))
+        self.assertIsNone(self._map("blk.0.ssm_out.weight"))
 
 
 class TestGGUFLinear(unittest.TestCase):
