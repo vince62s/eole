@@ -518,6 +518,13 @@ _SWIGLU_ARCHS = frozenset(
     "llama mistral mixtral qwen2 qwen2moe qwen3 qwen3moe qwen35 phi3 deepseek2 "
     "gemma gemma2 gemma3 llama4 deci grok starcoder2".split()
 )
+# Architectures that apply per-head RMS normalisations to Q and K before
+# (or after) RoPE.  These require query_norm=True / key_norm=True in the
+# decoder config so that MultiHeadedAttention creates the norm modules and
+# the stored q_norm / k_norm weights can be loaded.
+_QK_NORM_ARCHS = frozenset(
+    "qwen3 qwen3moe qwen35 gemma3 deepseek2".split()
+)
 
 
 def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
@@ -567,6 +574,12 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
         "embeddings": {
             "position_encoding_type": PositionEncodingType.Rotary,
             "n_positions": 0,
+            # Embedding vectors must match the model's hidden dimension.
+            # EmbeddingsConfig.tgt_word_vec_size defaults to 512, so we must
+            # set it explicitly here or the decoder will process 512-dim
+            # tensors regardless of the actual hidden_size.
+            "src_word_vec_size": hidden_size,
+            "tgt_word_vec_size": hidden_size,
         },
     }
 
@@ -608,6 +621,16 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
 
     if arch in ("gemma2", "gemma3"):
         model_config["ffn_layernorm"] = True
+
+    # Architectures that apply per-head RMS norms to Q and K projections.
+    # These must go in the decoder sub-dict (TransformerConfig fields are
+    # shared between encoder and decoder; putting them at model level would
+    # incorrectly propagate to the vision encoder in VLM models).
+    if arch in _QK_NORM_ARCHS:
+        model_config.setdefault("decoder", {}).update(
+            query_norm=True,
+            key_norm=True,
+        )
 
     # Hybrid models: add layer_types and GatedDeltaNet hyper-parameters.
     # These are decoder-specific fields (TransformerDecoderConfig), so they must

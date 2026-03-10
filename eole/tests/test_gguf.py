@@ -1574,5 +1574,296 @@ class TestGGUFQKVBiasAndEmbedding(unittest.TestCase):
                          "dequantized generator.weight must not have gguf_qtype")
 
 
+class TestGGUFWordVecSize(unittest.TestCase):
+    """build_model_config must set src/tgt_word_vec_size equal to hidden_size.
+
+    Without this the Embeddings module defaults to word_vec_size=512 and the
+    text embedding would output 512-dim vectors regardless of the model's
+    actual hidden_size, causing a shape mismatch at the first decoder layer.
+    """
+
+    def setUp(self):
+        _require("gguf")
+        _require("numpy")
+        _require("torch")
+
+    def _make_meta(self, arch: str, hidden: int):
+        import tempfile
+        import numpy as np
+        from gguf import GGUFWriter
+        from eole.bin.convert.convert_gguf import GGUFMetadata
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "m.gguf")
+            w = GGUFWriter(path, arch)
+            w.add_block_count(1)
+            w.add_embedding_length(hidden)
+            w.add_feed_forward_length(hidden * 4)
+            w.add_head_count(4)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_vocab_size(8)
+            w.add_token_list([str(i) for i in range(8)])
+            w.add_tensor("token_embd.weight", np.zeros((8, hidden), dtype=np.float16))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+            return GGUFMetadata(path)
+
+    def test_word_vec_size_matches_hidden_for_llama(self):
+        from eole.bin.convert.convert_gguf import build_model_config
+        hidden = 256
+        meta = self._make_meta("llama", hidden)
+        cfg = build_model_config(meta)
+        self.assertEqual(cfg["embeddings"]["tgt_word_vec_size"], hidden)
+        self.assertEqual(cfg["embeddings"]["src_word_vec_size"], hidden)
+
+    def test_word_vec_size_matches_hidden_for_qwen3(self):
+        from eole.bin.convert.convert_gguf import build_model_config
+        hidden = 512
+        meta = self._make_meta("qwen3", hidden)
+        cfg = build_model_config(meta)
+        self.assertEqual(cfg["embeddings"]["tgt_word_vec_size"], hidden)
+        self.assertEqual(cfg["embeddings"]["src_word_vec_size"], hidden)
+
+    def test_word_vec_size_not_512_default(self):
+        """For hidden=4096 the word_vec_size must be 4096, not the old default 512."""
+        from eole.bin.convert.convert_gguf import build_model_config
+        hidden = 4096
+        meta = self._make_meta("llama", hidden)
+        cfg = build_model_config(meta)
+        self.assertNotEqual(cfg["embeddings"]["tgt_word_vec_size"], 512)
+        self.assertEqual(cfg["embeddings"]["tgt_word_vec_size"], hidden)
+
+
+class TestGGUFQKNorm(unittest.TestCase):
+    """build_model_config must set query_norm/key_norm=True in the decoder
+    sub-dict for architectures that apply per-head Q/K RMS normalisations
+    (qwen3, qwen3moe, qwen35, gemma3, deepseek2) and must NOT set them for
+    architectures that don't (llama, qwen2, …).
+    """
+
+    def setUp(self):
+        _require("gguf")
+        _require("numpy")
+        _require("torch")
+
+    def _cfg_for_arch(self, arch: str) -> dict:
+        import tempfile
+        import numpy as np
+        from gguf import GGUFWriter
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "m.gguf")
+            w = GGUFWriter(path, arch)
+            w.add_block_count(1)
+            w.add_embedding_length(64)
+            w.add_feed_forward_length(128)
+            w.add_head_count(4)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_vocab_size(8)
+            w.add_token_list([str(i) for i in range(8)])
+            w.add_tensor("token_embd.weight", np.zeros((8, 64), dtype=np.float16))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+            meta = GGUFMetadata(path)
+        return build_model_config(meta)
+
+    def test_qwen3_has_qk_norm(self):
+        cfg = self._cfg_for_arch("qwen3")
+        decoder = cfg.get("decoder", {})
+        self.assertTrue(decoder.get("query_norm"), "qwen3 must have query_norm=True")
+        self.assertTrue(decoder.get("key_norm"), "qwen3 must have key_norm=True")
+
+    def test_qwen3moe_has_qk_norm(self):
+        cfg = self._cfg_for_arch("qwen3moe")
+        decoder = cfg.get("decoder", {})
+        self.assertTrue(decoder.get("query_norm"))
+        self.assertTrue(decoder.get("key_norm"))
+
+    def test_qwen35_has_qk_norm(self):
+        cfg = self._cfg_for_arch("qwen35")
+        decoder = cfg.get("decoder", {})
+        self.assertTrue(decoder.get("query_norm"), "qwen35 must have query_norm=True")
+        self.assertTrue(decoder.get("key_norm"), "qwen35 must have key_norm=True")
+
+    def test_gemma3_has_qk_norm(self):
+        cfg = self._cfg_for_arch("gemma3")
+        decoder = cfg.get("decoder", {})
+        self.assertTrue(decoder.get("query_norm"))
+        self.assertTrue(decoder.get("key_norm"))
+
+    def test_deepseek2_has_qk_norm(self):
+        cfg = self._cfg_for_arch("deepseek2")
+        decoder = cfg.get("decoder", {})
+        self.assertTrue(decoder.get("query_norm"))
+        self.assertTrue(decoder.get("key_norm"))
+
+    def test_llama_no_qk_norm(self):
+        """llama does not use Q/K norms – must not have them in config."""
+        cfg = self._cfg_for_arch("llama")
+        decoder = cfg.get("decoder", {})
+        self.assertFalse(decoder.get("query_norm", False))
+        self.assertFalse(decoder.get("key_norm", False))
+
+    def test_qwen2_no_qk_norm(self):
+        """qwen2 does not use Q/K norms – must not have them in config."""
+        cfg = self._cfg_for_arch("qwen2")
+        decoder = cfg.get("decoder", {})
+        self.assertFalse(decoder.get("query_norm", False))
+        self.assertFalse(decoder.get("key_norm", False))
+
+    def test_qk_norm_in_saved_config_json(self):
+        """After a full conversion the config.json decoder section must include
+        query_norm and key_norm for qwen35 models."""
+        _require("safetensors")
+        import tempfile
+        import numpy as np
+        from gguf import GGMLQuantizationType, GGUFWriter
+        from argparse import Namespace
+        from eole.bin.convert.convert_gguf import GGUFConverter
+
+        with tempfile.TemporaryDirectory() as td:
+            gguf_path = os.path.join(td, "qwen35.gguf")
+            out_dir = os.path.join(td, "out")
+            hidden, heads, ff, n_vocab = 64, 4, 128, 32
+
+            w = GGUFWriter(gguf_path, "qwen35")
+            w.add_block_count(1)
+            w.add_context_length(128)
+            w.add_embedding_length(hidden)
+            w.add_feed_forward_length(ff)
+            w.add_head_count(heads)
+            w.add_head_count_kv(heads)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_rope_freq_base(10000.0)
+            w.add_vocab_size(n_vocab)
+            w.add_token_list([str(i) for i in range(n_vocab)])
+            w.add_bos_token_id(1)
+            w.add_eos_token_id(2)
+            w.add_tensor("token_embd.weight",
+                         np.random.randn(n_vocab, hidden).astype(np.float32))
+            w.add_tensor("output_norm.weight", np.ones(hidden, dtype=np.float32))
+            for sfx, shape in [
+                ("attn_q", (hidden, hidden)),
+                ("attn_k", (hidden, hidden)),
+                ("attn_v", (hidden, hidden)),
+                ("attn_output", (hidden, hidden)),
+                ("attn_q_norm.weight", None),
+                ("attn_k_norm.weight", None),
+                ("ffn_gate", (ff, hidden)),
+                ("ffn_up", (ff, hidden)),
+                ("ffn_down", (hidden, ff)),
+            ]:
+                if shape is not None:
+                    w.add_tensor(
+                        f"blk.0.{sfx}",
+                        np.random.randn(*shape).astype(np.float32),
+                        raw_dtype=GGMLQuantizationType.Q4_K,
+                    )
+                else:
+                    w.add_tensor(
+                        f"blk.0.{sfx}",
+                        np.ones(hidden // heads, dtype=np.float32),
+                    )
+            w.add_tensor("blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor("blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            args = Namespace(
+                gguf_path=gguf_path,
+                output=out_dir,
+                dtype="fp16",
+                tokenizer="hf",
+                hf_tokenizer=None,
+            )
+            GGUFConverter.run(args)
+
+            with open(os.path.join(out_dir, "config.json")) as fh:
+                cfg = json.load(fh)
+
+        decoder_cfg = cfg["model"].get("decoder", {})
+        self.assertTrue(decoder_cfg.get("query_norm"),
+                        "query_norm must be True in decoder config for qwen35")
+        self.assertTrue(decoder_cfg.get("key_norm"),
+                        "key_norm must be True in decoder config for qwen35")
+
+    def test_word_vec_size_in_saved_config_json(self):
+        """After a full conversion the config.json embeddings section must have
+        tgt_word_vec_size equal to hidden_size (not the old default 512)."""
+        _require("safetensors")
+        import tempfile
+        import numpy as np
+        from gguf import GGMLQuantizationType, GGUFWriter
+        from argparse import Namespace
+        from eole.bin.convert.convert_gguf import GGUFConverter
+
+        with tempfile.TemporaryDirectory() as td:
+            gguf_path = os.path.join(td, "llama.gguf")
+            out_dir = os.path.join(td, "out")
+            hidden, heads, ff, n_vocab = 256, 4, 512, 32
+
+            w = GGUFWriter(gguf_path, "llama")
+            w.add_block_count(1)
+            w.add_context_length(128)
+            w.add_embedding_length(hidden)
+            w.add_feed_forward_length(ff)
+            w.add_head_count(heads)
+            w.add_head_count_kv(heads)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_rope_freq_base(10000.0)
+            w.add_vocab_size(n_vocab)
+            w.add_token_list([str(i) for i in range(n_vocab)])
+            w.add_bos_token_id(1)
+            w.add_eos_token_id(2)
+            w.add_tensor("token_embd.weight",
+                         np.random.randn(n_vocab, hidden).astype(np.float32))
+            w.add_tensor("output_norm.weight", np.ones(hidden, dtype=np.float32))
+            for sfx, shape in [
+                ("attn_q", (hidden, hidden)),
+                ("attn_k", (hidden, hidden)),
+                ("attn_v", (hidden, hidden)),
+                ("attn_output", (hidden, hidden)),
+                ("ffn_gate", (ff, hidden)),
+                ("ffn_up", (ff, hidden)),
+                ("ffn_down", (hidden, ff)),
+            ]:
+                w.add_tensor(
+                    f"blk.0.{sfx}.weight",
+                    np.random.randn(*shape).astype(np.float32),
+                    raw_dtype=GGMLQuantizationType.Q4_K,
+                )
+            w.add_tensor("blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor("blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            args = Namespace(
+                gguf_path=gguf_path,
+                output=out_dir,
+                dtype="fp16",
+                tokenizer="hf",
+                hf_tokenizer=None,
+            )
+            GGUFConverter.run(args)
+
+            with open(os.path.join(out_dir, "config.json")) as fh:
+                cfg = json.load(fh)
+
+        emb = cfg["model"].get("embeddings", {})
+        self.assertEqual(emb.get("tgt_word_vec_size"), hidden,
+                         f"tgt_word_vec_size must be {hidden}, got {emb.get('tgt_word_vec_size')}")
+        self.assertEqual(emb.get("src_word_vec_size"), hidden,
+                         f"src_word_vec_size must be {hidden}, got {emb.get('src_word_vec_size')}")
+
+
 if __name__ == "__main__":
     unittest.main()
