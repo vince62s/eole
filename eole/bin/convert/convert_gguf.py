@@ -254,12 +254,13 @@ def _infer_linear_attn_config(meta, linear_blocks: frozenset) -> dict:
         cfg["linear_value_head_dim"] = int(ssm_norm_shape[0])
 
     # ---------- conv_kernel_dim and key dimensions ----------------------
-    # ssm_conv1d.weight is stored with GGUF ne=[kernel_size, conv_dim]; after
-    # reversal the reader gives shape=[conv_dim, kernel_size].
+    # ssm_conv1d.weight is stored with GGUF ne=[conv_dim, kernel_size]; after
+    # the gguf reader reverses the ne array, shape=[kernel_size, conv_dim].
+    # (Verified against real Qwen3.5 GGUF files: shape[0]=kernel_size, shape[1]=conv_dim.)
     ssm_conv1d_shape = shapes.get(f"blk.{block_idx}.ssm_conv1d.weight")
     if ssm_conv1d_shape and len(ssm_conv1d_shape) >= 2:
-        conv_dim = int(ssm_conv1d_shape[0])   # conv_dim = key_dim*2 + value_dim
-        kernel_size = int(ssm_conv1d_shape[1])
+        kernel_size = int(ssm_conv1d_shape[0])   # shape[0] = kernel_size (typically 4)
+        conv_dim = int(ssm_conv1d_shape[1])       # shape[1] = conv_dim = key_dim*2 + value_dim
         cfg["linear_conv_kernel_dim"] = kernel_size
 
         num_v_heads = cfg.get("linear_num_value_heads", 32)
@@ -817,12 +818,13 @@ def build_safetensors(
 
         t, qtype_t = _tensor_to_torch(tensor, target_dtype)
 
-        # Conv1d weights come from GGUF as (kernel_size, conv_dim) – the GGML
-        # data layout stores the kernel dimension innermost (ne[0]=kernel_size).
-        # PyTorch's nn.Conv1d expects (out_channels, in_channels/groups, kernel_size).
-        # Transpose to (conv_dim, kernel_size) then unsqueeze the groups dim.
+        # Conv1d weights: the gguf reader reverses GGUF ne, so data arrives as
+        # (conv_dim, kernel_size) – i.e. shape[0]=kernel_size, shape[1]=conv_dim
+        # in tensor.shape, but data.shape=(conv_dim, kernel_size) in NumPy order.
+        # PyTorch nn.Conv1d expects (out_channels, in_channels/groups, kernel_size)
+        # = (conv_dim, 1, kernel_size).  Insert the groups dim without transposing.
         if eole_name.endswith("conv1d.weight") and t.dim() == 2:
-            t = t.T.unsqueeze(1).contiguous()
+            t = t.unsqueeze(1).contiguous()
 
         written[eole_name] = t
 

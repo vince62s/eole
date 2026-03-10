@@ -715,16 +715,17 @@ class TestGGUFHybridConverter(unittest.TestCase):
         writer.add_tensor("blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32))
         writer.add_tensor("blk.0.post_attention_norm.weight", np.ones(hidden, dtype=np.float32))
         writer.add_tensor("blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
-        # Linear-attention projections (quantised Q5_K / Q8_0)
+        # Linear-attention projections (quantised Q8_0 – Q5_K/Q4_K need block_size=256
+        # which is larger than our synthetic hidden=64 / conv_dim=128 dimensions)
         writer.add_tensor(
             "blk.0.attn_qkv.weight",
             np.random.randn(hidden, conv_dim).astype(np.float32),
-            raw_dtype=GGMLQuantizationType.Q5_K,
+            raw_dtype=GGMLQuantizationType.Q8_0,
         )
         writer.add_tensor(
             "blk.0.attn_gate.weight",
             np.random.randn(hidden, num_v_heads * head_v_dim).astype(np.float32),
-            raw_dtype=GGMLQuantizationType.Q5_K,
+            raw_dtype=GGMLQuantizationType.Q8_0,
         )
         # SSM params (float)
         writer.add_tensor("blk.0.ssm_a", np.ones(num_v_heads, dtype=np.float32))
@@ -732,22 +733,27 @@ class TestGGUFHybridConverter(unittest.TestCase):
         writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32))
         writer.add_tensor(
             "blk.0.ssm_conv1d.weight",
-            np.random.randn(kernel_size, conv_dim).astype(np.float32),
+            # Real GGUF (llama.cpp): stored as (conv_dim, kernel_size); the gguf
+            # reader reverses GGUF ne, so tensor.shape=[kernel_size, conv_dim] and
+            # data.shape=(conv_dim, kernel_size) in NumPy order.
+            np.random.randn(conv_dim, kernel_size).astype(np.float32),
         )
         writer.add_tensor(
             "blk.0.ssm_alpha.weight",
-            np.random.randn(hidden, num_v_heads).astype(np.float32),
+            # in_proj_a: Linear(hidden → num_v_heads); weight shape (num_v_heads, hidden)
+            # so the innermost GGUF dim is hidden=64, which is a valid Q8_0 row size.
+            np.random.randn(num_v_heads, hidden).astype(np.float32),
             raw_dtype=GGMLQuantizationType.Q8_0,
         )
         writer.add_tensor(
             "blk.0.ssm_beta.weight",
-            np.random.randn(hidden, num_v_heads).astype(np.float32),
+            np.random.randn(num_v_heads, hidden).astype(np.float32),
             raw_dtype=GGMLQuantizationType.Q8_0,
         )
         writer.add_tensor(
             "blk.0.ssm_out.weight",
             np.random.randn(hidden, num_v_heads * head_v_dim).astype(np.float32),
-            raw_dtype=GGMLQuantizationType.Q5_K,
+            raw_dtype=GGMLQuantizationType.Q8_0,
         )
         # FFN
         for suffix, shape in [
@@ -758,7 +764,7 @@ class TestGGUFHybridConverter(unittest.TestCase):
             writer.add_tensor(
                 f"blk.0.{suffix}.weight",
                 np.random.randn(*shape).astype(np.float32),
-                raw_dtype=GGMLQuantizationType.Q4_K,
+                raw_dtype=GGMLQuantizationType.Q8_0,
             )
 
         # -------- blk.1: full attention block --------
@@ -777,7 +783,7 @@ class TestGGUFHybridConverter(unittest.TestCase):
             writer.add_tensor(
                 f"blk.1.{suffix}.weight",
                 np.random.randn(*shape).astype(np.float32),
-                raw_dtype=GGMLQuantizationType.Q4_K,
+                raw_dtype=GGMLQuantizationType.Q8_0,
             )
 
         writer.write_header_to_file()
