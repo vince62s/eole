@@ -920,5 +920,186 @@ class TestGGUFHybridConverter(unittest.TestCase):
         self.assertIn("out_proj", ql)
 
 
+class TestGGUFMmprojConverter(unittest.TestCase):
+    """Test conversion of a clip mmproj GGUF (vision encoder) file."""
+
+    @classmethod
+    def setUpClass(cls):
+        _require("gguf")
+        _require("numpy")
+        import numpy as np
+        from gguf import GGUFWriter
+
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.mmproj_path = os.path.join(cls.tmpdir, "mmproj.gguf")
+
+        hidden, ff, heads = 64, 128, 4
+        img_size, patch_size = 64, 8
+        num_layers = 2
+        spatial_size = img_size // patch_size  # 8
+        num_pos = 2 * spatial_size * spatial_size  # 128
+        projection_dim = 128  # clip.vision.projection_dim: decoder hidden size
+        cls.hidden = hidden
+        cls.ff = ff
+        cls.patch_size = patch_size
+        cls.num_layers = num_layers
+
+        w = GGUFWriter(cls.mmproj_path, "clip")
+        w.add_uint32("clip.vision.block_count", num_layers)
+        w.add_uint32("clip.vision.embedding_length", hidden)
+        w.add_uint32("clip.vision.feed_forward_length", ff)
+        w.add_uint32("clip.vision.attention.head_count", heads)
+        w.add_uint32("clip.vision.image_size", img_size)
+        w.add_uint32("clip.vision.patch_size", patch_size)
+        w.add_uint32("clip.vision.spatial_merge_size", 2)
+        w.add_uint32("clip.vision.projection_dim", projection_dim)
+        w.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+        w.add_string("clip.projector_type", "qwen3vl_merger")
+
+        # patch embedding: (out_ch, in_ch, kH, kW)
+        w.add_tensor("v.patch_embd.weight", np.ones((hidden, 3, patch_size, patch_size), dtype=np.float32))
+        w.add_tensor("v.patch_embd.bias", np.zeros(hidden, dtype=np.float32))
+        # position embedding table
+        w.add_tensor("v.position_embd.weight", np.ones((hidden, num_pos), dtype=np.float32))
+        # merger norm (v.post_ln → adapter.norm)
+        w.add_tensor("v.post_ln.weight", np.ones(hidden, dtype=np.float32))
+        w.add_tensor("v.post_ln.bias", np.zeros(hidden, dtype=np.float32))
+        # merger linear layers: spatial_merge_size^2 * hidden = 4 * hidden
+        merged_hidden_size = 4 * hidden
+        w.add_tensor("mm.0.weight", np.ones((merged_hidden_size, merged_hidden_size), dtype=np.float32))
+        w.add_tensor("mm.0.bias", np.zeros(merged_hidden_size, dtype=np.float32))
+        w.add_tensor("mm.2.weight", np.ones((merged_hidden_size, projection_dim), dtype=np.float32))
+        w.add_tensor("mm.2.bias", np.zeros(projection_dim, dtype=np.float32))
+        # encoder blocks
+        for i in range(num_layers):
+            p = f"v.blk.{i}"
+            w.add_tensor(f"{p}.attn_qkv.weight", np.ones((3 * hidden, hidden), dtype=np.float32))
+            w.add_tensor(f"{p}.attn_qkv.bias", np.zeros(3 * hidden, dtype=np.float32))
+            w.add_tensor(f"{p}.attn_out.weight", np.ones((hidden, hidden), dtype=np.float32))
+            w.add_tensor(f"{p}.attn_out.bias", np.zeros(hidden, dtype=np.float32))
+            w.add_tensor(f"{p}.ffn_up.weight", np.ones((ff, hidden), dtype=np.float32))
+            w.add_tensor(f"{p}.ffn_up.bias", np.zeros(ff, dtype=np.float32))
+            w.add_tensor(f"{p}.ffn_down.weight", np.ones((hidden, ff), dtype=np.float32))
+            w.add_tensor(f"{p}.ffn_down.bias", np.zeros(hidden, dtype=np.float32))
+            w.add_tensor(f"{p}.ln1.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor(f"{p}.ln1.bias", np.zeros(hidden, dtype=np.float32))
+            w.add_tensor(f"{p}.ln2.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor(f"{p}.ln2.bias", np.zeros(hidden, dtype=np.float32))
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _clip(self):
+        from eole.bin.convert.convert_gguf import GGUFClipMetadata
+        return GGUFClipMetadata(self.mmproj_path)
+
+    def _tensors(self):
+        import torch
+        from eole.bin.convert.convert_gguf import _mmproj_to_eole_tensors
+        clip = self._clip()
+        tensors, _ = _mmproj_to_eole_tensors(clip, torch.float32)
+        return tensors
+
+    def test_clip_metadata_fields(self):
+        clip = self._clip()
+        self.assertEqual(clip.arch, "clip")
+        self.assertEqual(clip.vision_block_count, self.num_layers)
+        self.assertEqual(clip.vision_embedding_length, self.hidden)
+        self.assertEqual(clip.vision_head_count, 4)
+        self.assertEqual(clip.projector_type, "qwen3vl_merger")
+
+    def test_patch_conv_weight_present(self):
+        tensors = self._tensors()
+        self.assertIn("encoder.patch_conv.weight", tensors)
+
+    def test_patch_conv_shape(self):
+        import torch
+        tensors = self._tensors()
+        w = tensors["encoder.patch_conv.weight"]
+        # PyTorch Conv2d expects (out_channels, in_channels, kH, kW)
+        self.assertEqual(w.shape, torch.Size([self.hidden, 3, self.patch_size, self.patch_size]))
+
+    def test_pos_embed_weight_present(self):
+        tensors = self._tensors()
+        self.assertIn("encoder.pos_embed.weight", tensors)
+
+    def test_adapter_norm_maps_from_post_ln(self):
+        """v.post_ln → adapter.norm (part of the Qwen3VL merger)."""
+        tensors = self._tensors()
+        self.assertIn("adapter.norm.weight", tensors)
+        self.assertIn("adapter.norm.bias", tensors)
+
+    def test_adapter_linear_fc1_maps_from_mm0(self):
+        tensors = self._tensors()
+        self.assertIn("adapter.linear_fc1.weight", tensors)
+        self.assertIn("adapter.linear_fc1.bias", tensors)
+
+    def test_adapter_linear_fc2_maps_from_mm2(self):
+        tensors = self._tensors()
+        self.assertIn("adapter.linear_fc2.weight", tensors)
+        self.assertIn("adapter.linear_fc2.bias", tensors)
+
+    def test_qkv_is_split_into_q_k_v(self):
+        """Fused attn_qkv must be split into separate linear_query/keys/values."""
+        tensors = self._tensors()
+        pfx = "encoder.transformer_layers.0.self_attn"
+        self.assertIn(f"{pfx}.linear_query.weight", tensors)
+        self.assertIn(f"{pfx}.linear_keys.weight", tensors)
+        self.assertIn(f"{pfx}.linear_values.weight", tensors)
+        # No fused qkv_proj in encoder
+        self.assertNotIn(f"{pfx}.qkv_proj.weight", tensors)
+
+    def test_qkv_split_shapes(self):
+        """Each of Q/K/V must have shape (hidden, hidden) after split."""
+        import torch
+        tensors = self._tensors()
+        pfx = "encoder.transformer_layers.0.self_attn"
+        for proj in ("linear_query", "linear_keys", "linear_values"):
+            shape = tensors[f"{pfx}.{proj}.weight"].shape
+            self.assertEqual(shape, torch.Size([self.hidden, self.hidden]),
+                             f"{proj}.weight wrong shape: {shape}")
+
+    def test_ffn_up_maps_to_gate_up_proj(self):
+        tensors = self._tensors()
+        key = "encoder.transformer_layers.0.mlp.gate_up_proj.weight"
+        self.assertIn(key, tensors)
+
+    def test_ffn_down_maps_to_down_proj(self):
+        tensors = self._tensors()
+        key = "encoder.transformer_layers.0.mlp.down_proj.weight"
+        self.assertIn(key, tensors)
+
+    def test_ln1_maps_to_input_layernorm(self):
+        tensors = self._tensors()
+        self.assertIn("encoder.transformer_layers.0.input_layernorm.weight", tensors)
+
+    def test_ln2_maps_to_post_attention_layernorm(self):
+        tensors = self._tensors()
+        self.assertIn("encoder.transformer_layers.0.post_attention_layernorm.weight", tensors)
+
+    def test_all_layers_converted(self):
+        """All num_layers encoder blocks must be present."""
+        tensors = self._tensors()
+        for i in range(self.num_layers):
+            key = f"encoder.transformer_layers.{i}.self_attn.linear_query.weight"
+            self.assertIn(key, tensors, f"Missing layer {i}")
+
+    def test_build_vision_encoder_config(self):
+        from eole.bin.convert.convert_gguf import build_vision_encoder_config
+        clip = self._clip()
+        enc_cfg = build_vision_encoder_config(clip)
+        self.assertEqual(enc_cfg["layers"], self.num_layers)
+        self.assertEqual(enc_cfg["hidden_size"], self.hidden)
+        self.assertEqual(enc_cfg["transformer_ff"], self.ff)
+        self.assertFalse(enc_cfg["layernorm_pre"])
+        self.assertFalse(enc_cfg["layernorm_post"])
+        self.assertEqual(enc_cfg["temporal_patch_size"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

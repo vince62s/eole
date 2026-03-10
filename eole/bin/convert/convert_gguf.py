@@ -782,6 +782,7 @@ def build_safetensors(
     output_dir: str,
     target_dtype: torch.dtype,
     linear_blocks: frozenset = frozenset(),
+    extra_tensors: Optional[dict] = None,
 ) -> tuple[dict, list[str]]:
     """Convert all tensors from the GGUF and write ``model.00.safetensors``.
 
@@ -791,6 +792,9 @@ def build_safetensors(
         target_dtype: Target dtype for non-quantised (float) tensors.
         linear_blocks: Set of block indices that are linear-attention (SSM)
             blocks, used to route tensor names correctly.
+        extra_tensors: Optional dict of additional tensors (already converted
+            to torch) to merge into the safetensors shard.  Used when an
+            mmproj GGUF has been separately converted.
 
     Returns ``(written_tensor_dict, quant_layers)`` where *quant_layers* is the
     list of EOLE leaf-module names (e.g. ``"linear_query"``) that carry
@@ -835,6 +839,10 @@ def build_safetensors(
             qtype_key = eole_name.rsplit(".weight", 1)[0] + ".gguf_qtype"
             written[qtype_key] = qtype_t
 
+    # Merge in any extra tensors from the vision encoder (mmproj)
+    if extra_tensors:
+        written.update(extra_tensors)
+
     shard_path = os.path.join(output_dir, "model.00.safetensors")
     safetensors_save_file(written, shard_path)
 
@@ -846,6 +854,233 @@ def build_safetensors(
         print(f"  Skipped {len(skipped)} unrecognised tensor(s): {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
 
     return written, quant_layers
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder (mmproj) GGUF support
+# ---------------------------------------------------------------------------
+
+
+class GGUFClipMetadata(GGUFMetadata):
+    """GGUFMetadata specialised for ``clip`` architecture mmproj files.
+
+    The clip GGUF uses ``clip.vision.*`` keys rather than the standard
+    ``{arch}.*`` keys that :class:`GGUFMetadata` reads.
+    """
+
+    @property
+    def arch(self) -> str:
+        return self._str("general.architecture", "clip")
+
+    # Vision-encoder specific fields
+    @property
+    def vision_block_count(self) -> int:
+        return int(self._scalar("clip.vision.block_count", 27))
+
+    @property
+    def vision_embedding_length(self) -> int:
+        return int(self._scalar("clip.vision.embedding_length", 1152))
+
+    @property
+    def vision_feed_forward_length(self) -> int:
+        return int(self._scalar("clip.vision.feed_forward_length", 4304))
+
+    @property
+    def vision_head_count(self) -> int:
+        return int(self._scalar("clip.vision.attention.head_count", 16))
+
+    @property
+    def vision_image_size(self) -> int:
+        return int(self._scalar("clip.vision.image_size", 768))
+
+    @property
+    def vision_patch_size(self) -> int:
+        return int(self._scalar("clip.vision.patch_size", 16))
+
+    @property
+    def vision_spatial_merge_size(self) -> int:
+        return int(self._scalar("clip.vision.spatial_merge_size", 2))
+
+    @property
+    def vision_projection_dim(self) -> int:
+        return int(self._scalar("clip.vision.projection_dim", 4096))
+
+    @property
+    def vision_norm_eps(self) -> float:
+        return float(self._scalar("clip.vision.attention.layer_norm_epsilon", 1e-6))
+
+    @property
+    def projector_type(self) -> str:
+        return self._str("clip.projector_type", "qwen3vl_merger")
+
+
+def _mmproj_to_eole_tensors(
+    clip_meta: "GGUFClipMetadata",
+    target_dtype: torch.dtype,
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """Convert all tensors from a clip mmproj GGUF to EOLE names.
+
+    Returns ``(eole_tensor_dict, skipped_names)`` where the dict maps EOLE
+    tensor names to already-converted torch tensors.
+
+    The Qwen3.5/Qwen3VL mmproj GGUF uses the following tensor naming scheme:
+
+    * ``v.blk.{i}.attn_qkv.weight``  – fused QKV; split into separate Q/K/V
+    * ``v.blk.{i}.attn_out.weight``  – attention output projection
+    * ``v.blk.{i}.ffn_up.weight``    – MLP up projection → ``mlp.gate_up_proj``
+    * ``v.blk.{i}.ffn_down.weight``  – MLP down projection → ``mlp.down_proj``
+    * ``v.blk.{i}.ln1.*``            – pre-attention layer norm
+    * ``v.blk.{i}.ln2.*``            – post-attention layer norm
+    * ``v.patch_embd.weight``        – patch convolution weights
+    * ``v.patch_embd.weight.1``      – second temporal patch conv (Qwen3.5 VL)
+    * ``v.position_embd.weight``     – absolute position embedding table
+    * ``v.post_ln.weight/bias``      – post-encoder layer norm (part of merger)
+    * ``mm.0.weight/bias``           – merger linear_fc1
+    * ``mm.2.weight/bias``           – merger linear_fc2
+    """
+    hidden_size = clip_meta.vision_embedding_length
+
+    written: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+
+    for tensor in clip_meta.tensors:
+        name = tensor.name
+        t, _ = _tensor_to_torch(tensor, target_dtype)
+
+        # --- Global vision-encoder tensors -----------------------------------
+        if name == "v.patch_embd.weight":
+            # GGUF: stored as (out_ch, in_ch, kH, kW) after ne-reversal
+            # PyTorch Conv2d expects (out_channels, in_channels, kH, kW): already correct.
+            written["encoder.patch_conv.weight"] = t
+            continue
+
+        if name == "v.patch_embd.weight.1":
+            # Second temporal patch conv for Qwen3.5 VL Conv3d; stored as
+            # separate tensor next to weight.  Map to the ".1" sibling key
+            # that the HF converter also stores.
+            written["encoder.patch_conv.weight.1"] = t
+            continue
+
+        if name == "v.patch_embd.bias":
+            written["encoder.patch_conv.bias"] = t
+            continue
+
+        if name == "v.position_embd.weight":
+            written["encoder.pos_embed.weight"] = t
+            continue
+
+        # v.post_ln is the norm inside the Qwen3VL merger (adapter.norm)
+        if name == "v.post_ln.weight":
+            written["adapter.norm.weight"] = t
+            continue
+        if name == "v.post_ln.bias":
+            written["adapter.norm.bias"] = t
+            continue
+
+        # --- Merger (adapter) linear layers ----------------------------------
+        # mm.0 → linear_fc1,  mm.2 → linear_fc2
+        if name == "mm.0.weight":
+            written["adapter.linear_fc1.weight"] = t
+            continue
+        if name == "mm.0.bias":
+            written["adapter.linear_fc1.bias"] = t
+            continue
+        if name == "mm.2.weight":
+            written["adapter.linear_fc2.weight"] = t
+            continue
+        if name == "mm.2.bias":
+            written["adapter.linear_fc2.bias"] = t
+            continue
+
+        # --- Per-block vision encoder tensors --------------------------------
+        m = re.fullmatch(r"v\.blk\.(\d+)\.(.*)", name)
+        if not m:
+            skipped.append(name)
+            continue
+
+        blk = int(m.group(1))
+        suffix = m.group(2)
+        pfx = f"encoder.transformer_layers.{blk}"
+
+        if suffix in ("attn_qkv.weight", "attn_qkv.bias"):
+            # Fused QKV tensor: split into separate Q / K / V along dim-0.
+            # data.shape = (3*hidden_size, hidden_size) after GGUF ne-reversal.
+            q = t[:hidden_size]
+            k = t[hidden_size: 2 * hidden_size]
+            v = t[2 * hidden_size:]
+            param = ".weight" if suffix.endswith(".weight") else ".bias"
+            written[f"{pfx}.self_attn.linear_query{param}"] = q.contiguous()
+            written[f"{pfx}.self_attn.linear_keys{param}"] = k.contiguous()
+            written[f"{pfx}.self_attn.linear_values{param}"] = v.contiguous()
+
+        elif suffix == "attn_out.weight":
+            written[f"{pfx}.self_attn.final_linear.weight"] = t
+        elif suffix == "attn_out.bias":
+            written[f"{pfx}.self_attn.final_linear.bias"] = t
+
+        elif suffix == "ffn_up.weight":
+            # Non-gated MLP → gate_up_proj (single up-projection)
+            written[f"{pfx}.mlp.gate_up_proj.weight"] = t
+        elif suffix == "ffn_up.bias":
+            written[f"{pfx}.mlp.gate_up_proj.bias"] = t
+        elif suffix == "ffn_down.weight":
+            written[f"{pfx}.mlp.down_proj.weight"] = t
+        elif suffix == "ffn_down.bias":
+            written[f"{pfx}.mlp.down_proj.bias"] = t
+
+        elif suffix in ("ln1.weight", "ln.weight"):
+            written[f"{pfx}.input_layernorm.weight"] = t
+        elif suffix in ("ln1.bias", "ln.bias"):
+            written[f"{pfx}.input_layernorm.bias"] = t
+        elif suffix == "ln2.weight":
+            written[f"{pfx}.post_attention_layernorm.weight"] = t
+        elif suffix == "ln2.bias":
+            written[f"{pfx}.post_attention_layernorm.bias"] = t
+
+        else:
+            skipped.append(name)
+
+    return written, skipped
+
+
+def build_vision_encoder_config(clip_meta: "GGUFClipMetadata") -> dict:
+    """Build the EOLE ``encoder`` sub-config dict from clip metadata.
+
+    The returned dict is suitable for passing as the ``encoder`` key inside
+    a :class:`~eole.config.models.VisionTransformerLMModelConfig` dict.
+    """
+    hidden = clip_meta.vision_embedding_length
+    heads = clip_meta.vision_head_count
+    ff = clip_meta.vision_feed_forward_length
+    img_size = clip_meta.vision_image_size
+    patch_size = clip_meta.vision_patch_size
+    norm_eps = clip_meta.vision_norm_eps
+
+    # Number of patches along each spatial dimension (used for position table)
+    spatial_size = img_size // patch_size
+    # Qwen3VL / Qwen3.5 VL: position table is 2×spatial×spatial to encode 2D
+    num_pos = 2 * spatial_size * spatial_size
+
+    return {
+        "layers": clip_meta.vision_block_count,
+        "hidden_size": hidden,
+        "heads": heads,
+        "heads_kv": heads,
+        "transformer_ff": ff,
+        "add_qkvbias": True,
+        "add_ffnbias": True,
+        "add_final_linear_bias": True,
+        "layer_norm": "standard",
+        "norm_eps": norm_eps,
+        "mlp_activation_fn": "gelu-tanh",
+        "image_size": img_size,
+        "patch_size": patch_size,
+        "layernorm_pre": False,
+        "layernorm_post": False,
+        "temporal_patch_size": 2,  # Qwen3.5 VL uses Conv3d with kernel (2,patch,patch)
+        "patch_conv_bias": True,
+        "num_position_embeddings": num_pos,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -862,8 +1097,18 @@ def build_eole_config(
     transforms_configs: dict,
     optional_eos: list,
 ) -> dict:
-    """Assemble and return the EOLE ``config.json`` dictionary."""
-    from eole.config.models import TransformerLMModelConfig
+    """Assemble and return the EOLE ``config.json`` dictionary.
+
+    When *model_config_dict* contains an ``"encoder"`` key the function uses
+    :class:`~eole.config.models.VisionTransformerLMModelConfig` (multimodal
+    model) instead of :class:`~eole.config.models.TransformerLMModelConfig`.
+    """
+    if "encoder" in model_config_dict:
+        from eole.config.models import VisionTransformerLMModelConfig
+        model_cls = VisionTransformerLMModelConfig
+    else:
+        from eole.config.models import TransformerLMModelConfig
+        model_cls = TransformerLMModelConfig
 
     config = TrainConfig(
         data=None,
@@ -880,7 +1125,7 @@ def build_eole_config(
         **{k: v for k, v in vocabs.get("specials", {}).items()},
         transforms=transforms,
         transforms_configs=transforms_configs,
-        model=TransformerLMModelConfig(**model_config_dict),
+        model=model_cls(**model_config_dict),
         training=TrainingConfig(**{
             k: v for k, v in training_config_dict.items()
             if k not in ("compute_dtype",)
@@ -948,6 +1193,17 @@ class GGUFConverter(BaseBin):
                 "instead of extracting it from the GGUF metadata."
             ),
         )
+        parser.add_argument(
+            "--mmproj",
+            type=str,
+            default=None,
+            help=(
+                "Optional path to a separate clip/mmproj GGUF file containing the "
+                "vision encoder (e.g. mmproj-BF16.gguf for Qwen3.5 VL).  When "
+                "provided the vision tensors are merged into the output safetensors "
+                "shard and the config uses VisionTransformerLMModelConfig."
+            ),
+        )
 
     @classmethod
     def run(cls, args):
@@ -971,6 +1227,23 @@ class GGUFConverter(BaseBin):
             print(f"  KV heads     : {meta.head_count_kv}")
         if meta.expert_count:
             print(f"  Experts      : {meta.expert_count} (used: {meta.expert_used_count})")
+
+        # ------------------------------------------------------------------
+        # Optional vision encoder (mmproj GGUF)
+        # ------------------------------------------------------------------
+        clip_meta = None
+        mmproj_tensors: dict = {}
+        if getattr(args, "mmproj", None):
+            print(f"Reading mmproj (vision encoder) from {args.mmproj} …")
+            clip_meta = GGUFClipMetadata(args.mmproj)
+            print(f"  Projector    : {clip_meta.projector_type}")
+            print(f"  Enc layers   : {clip_meta.vision_block_count}")
+            print(f"  Enc hidden   : {clip_meta.vision_embedding_length}")
+            print(f"  Image size   : {clip_meta.vision_image_size}")
+            mmproj_tensors, mmproj_skipped = _mmproj_to_eole_tensors(clip_meta, target_dtype)
+            print(f"  Converted {len(mmproj_tensors)} vision tensors")
+            if mmproj_skipped:
+                print(f"  Skipped {len(mmproj_skipped)}: {mmproj_skipped[:5]}")
 
         # Detect whether the output.weight tensor is missing (tied embeddings)
         tensor_names = {t.name for t in meta.tensors}
@@ -1102,13 +1375,22 @@ class GGUFConverter(BaseBin):
         # Convert tensors (keep quantised as uint8, cast floats to target_dtype)
         # ------------------------------------------------------------------
         print("Converting tensors …")
-        written, quant_layers = build_safetensors(meta, args.output, target_dtype, linear_blocks)
+        written, quant_layers = build_safetensors(
+            meta, args.output, target_dtype, linear_blocks,
+            extra_tensors=mmproj_tensors or None,
+        )
 
         # ------------------------------------------------------------------
         # Build EOLE config
         # ------------------------------------------------------------------
         model_config_dict = build_model_config(meta, linear_blocks)
         model_config_dict["share_decoder_embeddings"] = share_decoder_embeddings
+
+        # When a vision encoder was provided, inject the encoder config and
+        # adapter type so that VisionTransformerLMModelConfig is produced.
+        if clip_meta is not None:
+            model_config_dict["encoder"] = build_vision_encoder_config(clip_meta)
+            model_config_dict["adapter"] = "qwen3_5vl"
 
         quant_layers_all = [
             "gate_up_proj",
