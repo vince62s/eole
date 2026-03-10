@@ -574,6 +574,24 @@ class BaseModel(nn.Module):
         if param.dim() == 2:
             col_start, col_end, row_start, row_end = slices
             sliced = ckpt_t[col_start:col_end, row_start:row_end]
+            # Warn when the row dimension of the checkpoint tensor is larger
+            # than what the model parameter covers AND the module is not a
+            # known row-parallel TP module.  _get_tp_slices clips to param.size()
+            # so the assertion below never catches this; the checkpoint data is
+            # silently truncated.  The most common cause is an incorrect
+            # tgt_word_vec_size (or src_word_vec_size) in config.json — typically
+            # from a GGUF converter that did not explicitly set the embedding
+            # dimension to match hidden_size.
+            _row_parallel_modules = {"final_linear", "down_proj"}
+            if row_end < ckpt_t.size(1) and base_name not in _row_parallel_modules:
+                logger.warning(
+                    f"Checkpoint tensor '{module_name}.{param_name}' has shape "
+                    f"{list(ckpt_t.size())} but the model parameter has shape "
+                    f"{list(param.size())}. The checkpoint data was silently truncated "
+                    f"(using columns 0:{row_end} of {ckpt_t.size(1)}). "
+                    "This usually means the model config (e.g. tgt_word_vec_size) does not "
+                    "match the checkpoint. Re-convert the model with the correct config."
+                )
             assert param.size() == sliced.size(), (
                 "An error in model's partition and checkpoint's slice was detected, "
                 f"[{module_name}, {module}, {param_name}, {param.size()}, {ckpt_t.size()}]"
