@@ -592,9 +592,11 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
         model_config["ffn_layernorm"] = True
 
     # Hybrid models: add layer_types and GatedDeltaNet hyper-parameters.
+    # These are decoder-specific fields (TransformerDecoderConfig), so they must
+    # go under the "decoder" sub-dict rather than the top-level model config.
     if linear_blocks:
         lin_cfg = _infer_linear_attn_config(meta, linear_blocks)
-        model_config.update(lin_cfg)
+        model_config.setdefault("decoder", {}).update(lin_cfg)
 
     return model_config
 

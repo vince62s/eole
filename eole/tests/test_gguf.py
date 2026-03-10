@@ -878,25 +878,31 @@ class TestGGUFHybridConverter(unittest.TestCase):
             self.assertIn(key, tensors, f"Missing post_attention_layernorm for blk {blk}")
 
     def test_config_has_layer_types(self):
-        """config.json must contain layer_types reflecting the hybrid layout."""
+        """config.json must contain layer_types in the decoder sub-config."""
         self._run_converter()
         with open(os.path.join(self.output_dir, "config.json")) as fh:
             cfg = json.load(fh)
-        decoder_cfg = cfg["model"].get("decoder", cfg["model"])
+        # layer_types is a TransformerDecoderConfig field – must live under "decoder"
+        self.assertIn("decoder", cfg["model"], "decoder section missing from model config")
+        decoder_cfg = cfg["model"]["decoder"]
         layer_types = decoder_cfg.get("layer_types")
-        self.assertIsNotNone(layer_types, "layer_types missing from config")
+        self.assertIsNotNone(layer_types, "layer_types missing from decoder config")
         self.assertEqual(layer_types[0], "linear_attention")
         self.assertEqual(layer_types[1], "full_attention")
+        # Ensure these keys did NOT leak to the top-level model config
+        self.assertNotIn("layer_types", cfg["model"], "layer_types must be in decoder, not top-level model")
 
     def test_config_has_linear_attn_hyper_params(self):
-        """Config must include GatedDeltaNet hyper-parameters inferred from tensors."""
+        """GatedDeltaNet hyper-parameters must live in the decoder sub-config."""
         self._run_converter()
         with open(os.path.join(self.output_dir, "config.json")) as fh:
             cfg = json.load(fh)
-        decoder_cfg = cfg["model"].get("decoder", cfg["model"])
+        decoder_cfg = cfg["model"]["decoder"]
         self.assertIn("linear_num_value_heads", decoder_cfg)
         self.assertIn("linear_value_head_dim", decoder_cfg)
         self.assertIn("linear_conv_kernel_dim", decoder_cfg)
+        # Ensure these did NOT leak to top-level
+        self.assertNotIn("linear_num_value_heads", cfg["model"], "linear params must be in decoder, not top-level")
 
     def test_quant_layers_include_linear_attn_modules(self):
         """quant_layers must include GatedDeltaNet module names for hybrid models."""
