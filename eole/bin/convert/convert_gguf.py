@@ -954,7 +954,23 @@ def _mmproj_to_eole_tensors(
 
     for tensor in clip_meta.tensors:
         name = tensor.name
-        t, _ = _tensor_to_torch(tensor, target_dtype)
+        t, qtype_t = _tensor_to_torch(tensor, target_dtype)
+
+        # Vision encoder uses plain nn.Linear (not GGUFLinear), so every tensor
+        # must be a floating-point dtype.  If the mmproj GGUF carries quantized
+        # weights (e.g. Q4_0, Q8_0), dequantize them here before splitting.
+        if qtype_t is not None:
+            try:
+                from gguf.quants import dequantize as _gguf_dequantize
+                import numpy as _np
+                dq = _gguf_dequantize(tensor.data, tensor.tensor_type)
+                t = torch.from_numpy(_np.array(dq, copy=True)).to(target_dtype)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Vision encoder tensor {name!r} is quantized "
+                    f"({tensor.tensor_type.name}) and could not be dequantized: {exc}. "
+                    "Use a BF16/F16 mmproj GGUF file instead."
+                ) from exc
 
         # --- Global vision-encoder tensors -----------------------------------
         if name == "v.patch_embd.weight":
@@ -1089,6 +1105,10 @@ def build_vision_encoder_config(clip_meta: "GGUFClipMetadata") -> dict:
         "hidden_size": hidden,
         "heads": heads,
         "heads_kv": heads,
+        # Explicitly set so the encoder never inherits the text decoder's head_dim
+        # (e.g. Qwen3.5 VL text decoder uses head_dim=256 while the vision encoder
+        # uses head_dim = hidden_size // heads = 1152 // 16 = 72).
+        "head_dim": hidden // heads,
         "transformer_ff": ff,
         "add_qkvbias": True,
         "add_ffnbias": True,

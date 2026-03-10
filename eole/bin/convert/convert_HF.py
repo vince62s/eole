@@ -475,7 +475,11 @@ def build_config_dict(hf):
                 # Qwen3.5 VL uses `num_heads` not `num_attention_heads`
                 "heads": num_heads,
                 "heads_kv": num_heads,
-                "head_dim": vision_config.get("hidden_size", 0) // num_heads,
+                # Derive from the encoder hidden_size that was already stored above,
+                # NOT from vision_config["head_dim"] which would inherit the decoder's
+                # head_dim=256 (only valid for the text decoder, not the vision encoder).
+                # For Qwen3.5 VL: 1152 // 16 = 72.
+                "head_dim": model_config["encoder"]["hidden_size"] // num_heads,
                 # Override layers using `depth` key
                 "layers": vision_config.get("depth", model_config["encoder"].get("layers", 27)),
                 # No fixed image_size in HF config → derive from pos embed table size

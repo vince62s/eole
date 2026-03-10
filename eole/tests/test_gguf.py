@@ -939,11 +939,12 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         spatial_size = img_size // patch_size  # 8
         num_pos = spatial_size * spatial_size   # 64  (one entry per patch, NOT 2x)
         projection_dim = 128  # clip.vision.projection_dim: decoder hidden size
-        # Use proj_size != hidden to exercise the shape//3 split fix.
-        # Qwen3.5 VL uses head_dim*num_heads != hidden_size (e.g. 256*16=4096 vs 1152).
-        proj_size = 2 * hidden  # 128 – deliberately different from hidden=64
+        # proj_size = head_dim * num_heads = (hidden // heads) * heads = hidden.
+        # For Qwen3.5 VL: head_dim = 1152 // 16 = 72, proj_size = 72 * 16 = 1152 = hidden.
+        proj_size = hidden  # head_dim * heads == hidden for the encoder
         cls.hidden = hidden
         cls.ff = ff
+        cls.heads = heads
         cls.patch_size = patch_size
         cls.num_layers = num_layers
         cls.num_pos = num_pos
@@ -1155,12 +1156,26 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         # No fused qkv_proj in encoder
         self.assertNotIn(f"{pfx}.qkv_proj.weight", tensors)
 
-    def test_qkv_split_shapes(self):
-        """Each of Q/K/V must have shape (proj_size, hidden) after split.
+    def test_qkv_tensors_are_float(self):
+        """Q/K/V weights must be floating-point (not uint8) so they can be
+        loaded into plain nn.Linear parameters without dtype errors."""
+        import torch
+        tensors = self._tensors()
+        pfx = "encoder.transformer_layers.0.self_attn"
+        for proj in ("linear_query", "linear_keys", "linear_values"):
+            t = tensors[f"{pfx}.{proj}.weight"]
+            self.assertTrue(
+                t.is_floating_point(),
+                f"{proj}.weight has non-float dtype {t.dtype}; "
+                "vision encoder requires float tensors for nn.Linear",
+            )
 
-        proj_size may differ from hidden_size when head_dim * num_heads != hidden_size
-        (e.g. Qwen3.5 VL: head_dim=256, num_heads=16 → proj=4096 vs hidden=1152).
-        The split must use shape//3, NOT hidden_size, as the boundary.
+    def test_qkv_split_shapes(self):
+        """Each of Q/K/V must have shape (proj_size, hidden) after the fused-QKV split.
+
+        For the vision encoder, head_dim = hidden_size // heads, so
+        proj_size = head_dim * heads = hidden_size.  The split uses shape//3
+        which equals hidden when proj_size == hidden.
         """
         import torch
         tensors = self._tensors()
@@ -1210,6 +1225,13 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         # For img_size=64, patch_size=8: spatial=8, so num_pos=64.
         self.assertEqual(enc_cfg["num_position_embeddings"], self.num_pos,
                          "num_position_embeddings should be spatial^2, not 2*spatial^2")
+        # head_dim must be hidden_size // heads (= 64 // 4 = 16), NOT the text
+        # decoder's head_dim (which can be e.g. 256 for Qwen3.5 VL models).
+        expected_head_dim = self.hidden // self.heads
+        self.assertEqual(enc_cfg["head_dim"], expected_head_dim,
+                         f"encoder head_dim should be {expected_head_dim} "
+                         f"(hidden={self.hidden} // heads={self.heads}), "
+                         "not the text decoder's head_dim")
 
 
 if __name__ == "__main__":
