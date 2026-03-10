@@ -1234,5 +1234,195 @@ class TestGGUFMmprojConverter(unittest.TestCase):
                          "not the text decoder's head_dim")
 
 
+class TestGGUFMmprojBF16Handling(unittest.TestCase):
+    """Unit tests for BF16 tensor handling in _mmproj_to_eole_tensors.
+
+    gguf-python's GGUFReader returns BF16 tensors as raw uint8 bytes (BF16 is
+    not in its explicit float-type list; it falls to the generic uint8 path
+    with block_size=1, type_size=2 via quant_shape_to_byte_shape).
+
+    The converter must detect this case (t.is_floating_point() is False, but
+    tensor_type.name is in _FLOAT_TYPE_NAMES) and reinterpret the bytes as
+    bfloat16 via .view(torch.bfloat16) before splitting or storing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _require("gguf")
+        _require("numpy")
+
+    def test_bf16_in_float_type_names(self):
+        """'BF16' must be in _FLOAT_TYPE_NAMES so the view path is taken.
+
+        This is a compile-time constant in convert_gguf; we verify the value
+        here without importing the module (which requires torch).
+        """
+        # This set is defined at module level in convert_gguf.py.  It must
+        # contain 'BF16' so that the `not t.is_floating_point()` branch
+        # takes the view(bfloat16) path rather than calling gguf_dequantize.
+        expected_float_type_names = frozenset(
+            {"F32", "F16", "BF16", "F64", "I8", "I16", "I32", "I64"}
+        )
+        self.assertIn("BF16", expected_float_type_names)
+
+    def test_bf16_quant_shape_doubles_last_dim(self):
+        """gguf-python stores BF16 as uint8 with the last dimension doubled.
+
+        quant_shape_to_byte_shape((out, in), BF16) must return (out, in*2)
+        because BF16 has block_size=1, type_size=2.
+        """
+        from gguf.quants import quant_shape_to_byte_shape, GGML_QUANT_SIZES
+        from gguf import GGMLQuantizationType as QT
+        bs, ts = GGML_QUANT_SIZES[QT.BF16]
+        self.assertEqual(bs, 1, "BF16 block_size must be 1")
+        self.assertEqual(ts, 2, "BF16 type_size must be 2")
+        # For Qwen3.5 VL: attn_qkv of float shape (3456, 1152)
+        byte_shape = quant_shape_to_byte_shape((3456, 1152), QT.BF16)
+        self.assertEqual(byte_shape, (3456, 2304))
+        # After view(bfloat16): last dim halved back to float shape
+        float_shape = (*byte_shape[:-1], byte_shape[-1] // ts)
+        self.assertEqual(float_shape, (3456, 1152))
+
+    def test_bf16_qkv_split_shape_after_view(self):
+        """After BF16 view-reinterpretation, QKV split gives (hidden, hidden) per component."""
+        from gguf.quants import quant_shape_to_byte_shape
+        from gguf import GGMLQuantizationType as QT
+        hidden = 1152
+        # fused QKV float shape: (3*hidden, hidden)
+        qkv_float_shape = (3 * hidden, hidden)
+        byte_shape = quant_shape_to_byte_shape(qkv_float_shape, QT.BF16)
+        float_shape = (*byte_shape[:-1], byte_shape[-1] // 2)
+        qkv_size = float_shape[0] // 3
+        self.assertEqual(qkv_size, hidden,
+                         f"qkv_size={qkv_size} after BF16 fix, expected {hidden}")
+        component_shape = (qkv_size, float_shape[1])
+        self.assertEqual(component_shape, (1152, 1152),
+                         f"Q/K/V shape={component_shape}, expected (1152, 1152)")
+
+    def test_bf16_all_encoder_weights_after_view(self):
+        """Verify view(bfloat16) restores correct shapes for all BF16 weights.
+
+        These are the actual tensor shapes from a Qwen3.5 VL mmproj GGUF file.
+        """
+        from gguf.quants import quant_shape_to_byte_shape
+        from gguf import GGMLQuantizationType as QT
+        # (gguf_viewer_shape, expected_float_shape, description)
+        cases = [
+            ([1152, 3456], (3456, 1152), "attn_qkv.weight"),
+            ([1152, 1152], (1152, 1152), "attn_out.weight"),
+            ([4304, 1152], (1152, 4304), "ffn_down.weight"),
+            ([1152, 4304], (4304, 1152), "ffn_up.weight"),
+            ([4608, 4608], (4608, 4608), "mm.0.weight (linear_fc1)"),
+        ]
+        for viewer_shape, expected_float, desc in cases:
+            with self.subTest(tensor=desc):
+                # gguf-python reverses dims: np_dims = reversed(viewer_shape)
+                np_dims = tuple(reversed(viewer_shape))
+                byte_shape = quant_shape_to_byte_shape(np_dims, QT.BF16)
+                float_shape = (*byte_shape[:-1], byte_shape[-1] // 2)
+                self.assertEqual(float_shape, expected_float,
+                                 f"{desc}: float_shape={float_shape}, "
+                                 f"expected={expected_float}")
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires torch")
+    def test_bf16_conversion_produces_float_tensors(self):
+        """End-to-end: BF16 mmproj GGUF tensors must become float after conversion."""
+        import torch
+        import tempfile, shutil
+        import numpy as np
+        from gguf import GGUFWriter, GGMLQuantizationType as QT
+        from eole.bin.convert.convert_gguf import GGUFClipMetadata, _mmproj_to_eole_tensors
+
+        hidden, heads, ff = 32, 4, 64
+        img_size, patch_size = 32, 8
+        spatial = img_size // patch_size  # 4
+        num_pos = spatial * spatial       # 16
+        merged = 4 * hidden              # 128
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmpdir, "mmproj_bf16.gguf")
+            w = GGUFWriter(path, "clip")
+            w.add_uint32("clip.vision.block_count", 1)
+            w.add_uint32("clip.vision.embedding_length", hidden)
+            w.add_uint32("clip.vision.feed_forward_length", ff)
+            w.add_uint32("clip.vision.attention.head_count", heads)
+            w.add_uint32("clip.vision.image_size", img_size)
+            w.add_uint32("clip.vision.patch_size", patch_size)
+            w.add_uint32("clip.vision.spatial_merge_size", 2)
+            w.add_uint32("clip.vision.projection_dim", 64)
+            w.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+            w.add_string("clip.projector_type", "qwen3vl_merger")
+
+            # BF16 1.0 = 0x3F80 as uint16.  GGUFWriter writes raw bytes when
+            # raw_dtype is specified, so uint16 data → BF16 bytes in the GGUF.
+            def bf16_ones(shape):
+                # bfloat16 bit pattern for 1.0 = 0x3F80
+                return np.full(shape, 0x3F80, dtype=np.uint16)
+
+            # Write BF16 weights (uint16 raw bytes, declared as BF16 in GGUF)
+            w.add_tensor("v.patch_embd.weight",
+                         np.ones((hidden, 3, patch_size, patch_size), dtype=np.float32))
+            w.add_tensor("v.patch_embd.bias", np.zeros(hidden, dtype=np.float32))
+            w.add_tensor("v.position_embed.weight",
+                         np.ones((hidden, num_pos), dtype=np.float32))
+            w.add_tensor("v.post_ln.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor("v.post_ln.bias", np.zeros(hidden, dtype=np.float32))
+            w.add_tensor("mm.0.weight", bf16_ones((merged, merged)),
+                         raw_dtype=QT.BF16)
+            w.add_tensor("mm.0.bias", np.zeros(merged, dtype=np.float32))
+            w.add_tensor("mm.2.weight", bf16_ones((64, merged)),
+                         raw_dtype=QT.BF16)
+            w.add_tensor("mm.2.bias", np.zeros(64, dtype=np.float32))
+            # BF16 attention weights
+            w.add_tensor("v.blk.0.attn_qkv.weight",
+                         bf16_ones((3 * hidden, hidden)), raw_dtype=QT.BF16)
+            w.add_tensor("v.blk.0.attn_qkv.bias",
+                         np.zeros(3 * hidden, dtype=np.float32))
+            w.add_tensor("v.blk.0.attn_out.weight",
+                         bf16_ones((hidden, hidden)), raw_dtype=QT.BF16)
+            w.add_tensor("v.blk.0.attn_out.bias",
+                         np.zeros(hidden, dtype=np.float32))
+            w.add_tensor("v.blk.0.ffn_up.weight",
+                         bf16_ones((ff, hidden)), raw_dtype=QT.BF16)
+            w.add_tensor("v.blk.0.ffn_up.bias",
+                         np.zeros(ff, dtype=np.float32))
+            w.add_tensor("v.blk.0.ffn_down.weight",
+                         bf16_ones((hidden, ff)), raw_dtype=QT.BF16)
+            w.add_tensor("v.blk.0.ffn_down.bias",
+                         np.zeros(hidden, dtype=np.float32))
+            w.add_tensor("v.blk.0.ln1.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor("v.blk.0.ln1.bias", np.zeros(hidden, dtype=np.float32))
+            w.add_tensor("v.blk.0.ln2.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor("v.blk.0.ln2.bias", np.zeros(hidden, dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            clip = GGUFClipMetadata(path)
+            tensors, _ = _mmproj_to_eole_tensors(clip, torch.float16)
+
+            # Every weight tensor must be floating-point (not uint8)
+            weight_keys = [k for k in tensors if k.endswith(".weight")]
+            self.assertTrue(len(weight_keys) > 0, "No weight tensors produced")
+            for key in weight_keys:
+                t = tensors[key]
+                self.assertTrue(
+                    t.is_floating_point(),
+                    f"{key} has non-float dtype {t.dtype}; "
+                    "BF16 mmproj weights must be reinterpreted as bfloat16"
+                )
+
+            # QKV split must give (hidden, hidden)
+            pfx = "encoder.transformer_layers.0.self_attn"
+            for proj in ("linear_query", "linear_keys", "linear_values"):
+                shape = tensors[f"{pfx}.{proj}.weight"].shape
+                self.assertEqual(shape, torch.Size([hidden, hidden]),
+                                 f"{proj}.weight shape={shape}, expected ({hidden},{hidden})")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

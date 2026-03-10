@@ -957,20 +957,31 @@ def _mmproj_to_eole_tensors(
         t, qtype_t = _tensor_to_torch(tensor, target_dtype)
 
         # Vision encoder uses plain nn.Linear (not GGUFLinear), so every tensor
-        # must be a floating-point dtype.  If the mmproj GGUF carries quantized
-        # weights (e.g. Q4_0, Q8_0), dequantize them here before splitting.
-        if qtype_t is not None:
-            try:
-                from gguf.quants import dequantize as _gguf_dequantize
-                import numpy as _np
-                dq = _gguf_dequantize(tensor.data, tensor.tensor_type)
-                t = torch.from_numpy(_np.array(dq, copy=True)).to(target_dtype)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Vision encoder tensor {name!r} is quantized "
-                    f"({tensor.tensor_type.name}) and could not be dequantized: {exc}. "
-                    "Use a BF16/F16 mmproj GGUF file instead."
-                ) from exc
+        # must be floating-point.  gguf-python handles F16/F32/F64 natively but
+        # returns BF16 as raw uint8 bytes (BF16 is not in its explicit float list,
+        # block_size=1 / type_size=2 → falls to the generic uint8 path).  The
+        # result: t.is_floating_point() is False even though it is a "float" type
+        # in _FLOAT_TYPE_NAMES, so qtype_t is None and the old check missed it.
+        # We therefore gate on t.is_floating_point() and handle two sub-cases:
+        #   1. BF16 (or any other raw-bytes float type in _FLOAT_TYPE_NAMES):
+        #      reinterpret the uint8 storage as bfloat16, then cast.
+        #   2. Truly quantized (Q8_0, Q4_K, …): use gguf.quants.dequantize.
+        if not t.is_floating_point():
+            if tensor.tensor_type.name in _FLOAT_TYPE_NAMES:
+                # Raw bytes for a float type (currently BF16 only): view as bf16.
+                t = t.contiguous().view(torch.bfloat16).to(target_dtype)
+            else:
+                try:
+                    from gguf.quants import dequantize as _gguf_dequantize
+                    import numpy as _np
+                    dq = _gguf_dequantize(tensor.data, tensor.tensor_type)
+                    t = torch.from_numpy(_np.array(dq, copy=True)).to(target_dtype)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Vision encoder tensor {name!r} is quantized "
+                        f"({tensor.tensor_type.name}) and could not be dequantized: {exc}. "
+                        "Use a BF16/F16 mmproj GGUF file instead."
+                    ) from exc
 
         # --- Global vision-encoder tensors -----------------------------------
         if name == "v.patch_embd.weight":
