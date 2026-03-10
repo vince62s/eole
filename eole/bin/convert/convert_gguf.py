@@ -79,12 +79,18 @@ _GLOBAL_MAP: dict[str, Optional[str]] = {
     "rope_factors_short.weight": None,
 }
 
-# EOLE weight names that are backed by nn.Embedding (not nn.Linear / GGUFLinear).
-# Quantized data (uint8) cannot be loaded into nn.Embedding, so these tensors
-# must be dequantized to float even when the rest of the model stays quantized.
-_EMBEDDING_WEIGHT_NAMES: frozenset[str] = frozenset({
+# EOLE weight names that must always be dequantized to float, even when the
+# rest of the model stays in quantized (uint8) form.
+#
+# These correspond to modules that are NOT replaced by GGUFLinear at load time:
+#  • nn.Embedding layers (tgt_emb / src_emb) – cannot hold uint8 at all.
+#  • The output projection / generator – when a vision encoder is present,
+#    replace_gguf_linear targets only self.decoder, not self.generator, so the
+#    generator remains a plain nn.Linear and cannot load uint8 weights.
+_MUST_DEQUANTIZE_NAMES: frozenset[str] = frozenset({
     "tgt_emb.embeddings.weight",
     "src_emb.embeddings.weight",
+    "generator.weight",
 })
 
 # Per-block suffix → EOLE decoder-layer suffix.
@@ -833,9 +839,10 @@ def build_safetensors(
 
         t, qtype_t = _tensor_to_torch(tensor, target_dtype)
 
-        # Embedding weights (nn.Embedding) cannot hold uint8 quantized data –
-        # only nn.Linear / GGUFLinear can.  Dequantize them to target_dtype here.
-        if qtype_t is not None and eole_name in _EMBEDDING_WEIGHT_NAMES:
+        # Some EOLE modules cannot hold uint8 quantized data (nn.Embedding,
+        # generator/lm-head nn.Linear when not covered by replace_gguf_linear).
+        # Dequantize these to target_dtype so they can be loaded normally.
+        if qtype_t is not None and eole_name in _MUST_DEQUANTIZE_NAMES:
             try:
                 import numpy as _np
                 from gguf.quants import dequantize as _gguf_dequantize
@@ -844,7 +851,7 @@ def build_safetensors(
                 qtype_t = None  # no companion gguf_qtype – it's plain float now
             except Exception as exc:
                 raise RuntimeError(
-                    f"Embedding tensor {gguf_name!r} is quantized "
+                    f"Tensor {gguf_name!r} (→ {eole_name!r}) is quantized "
                     f"({tensor.tensor_type.name}) and could not be dequantized: {exc}"
                 ) from exc
 

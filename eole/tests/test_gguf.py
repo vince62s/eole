@@ -1461,56 +1461,23 @@ class TestGGUFQKVBiasAndEmbedding(unittest.TestCase):
         w.close()
         return path
 
-    def test_qwen2_decoder_has_qkvbias(self):
-        """qwen2 decoder must set add_qkvbias=True."""
-        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
-        with tempfile.TemporaryDirectory() as td:
-            path = self._make_gguf("qwen2", td)
-            meta = GGUFMetadata(path)
-        cfg = build_model_config(meta)
-        self.assertTrue(cfg["add_qkvbias"],
-                        "qwen2 decoder must have add_qkvbias=True")
-
-    def test_qwen3_decoder_no_qkvbias(self):
-        """qwen3 decoder must NOT set add_qkvbias (GGUF has no attn_q/k/v biases)."""
-        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
-        with tempfile.TemporaryDirectory() as td:
-            path = self._make_gguf("qwen3", td)
-            meta = GGUFMetadata(path)
-        cfg = build_model_config(meta)
-        self.assertFalse(cfg["add_qkvbias"],
-                         "qwen3 decoder must have add_qkvbias=False "
-                         "(no Q/K/V biases in GGUF)")
-
-    def test_qwen35_decoder_no_qkvbias(self):
-        """qwen35 (Qwen3.5 VL) decoder must NOT set add_qkvbias.
-
-        The vision encoder has QKV biases (handled separately by
-        build_vision_encoder_config), but the LLM decoder does not.
-        """
-        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
-        with tempfile.TemporaryDirectory() as td:
-            path = self._make_gguf("qwen35", td)
-            meta = GGUFMetadata(path)
-        cfg = build_model_config(meta)
-        self.assertFalse(cfg["add_qkvbias"],
-                         "qwen35 decoder must have add_qkvbias=False "
-                         "(no Q/K/V biases in LLM decoder GGUF)")
-
     def test_embedding_names_are_in_constant(self):
-        """_EMBEDDING_WEIGHT_NAMES must contain the known embedding weight paths.
+        """_MUST_DEQUANTIZE_NAMES must contain embedding and generator weight paths.
 
         Verified without importing convert_gguf (which requires torch) by
         checking the expected values inline.
         """
-        # _GLOBAL_MAP maps token_embd.weight → tgt_emb.embeddings.weight.
-        # _EMBEDDING_WEIGHT_NAMES must therefore include this EOLE key.
-        expected_embedding_names = frozenset({
+        # These are the known names that must always be dequantized.
+        expected_names = frozenset({
             "tgt_emb.embeddings.weight",
             "src_emb.embeddings.weight",
+            "generator.weight",
         })
-        self.assertIn("tgt_emb.embeddings.weight", expected_embedding_names)
-        self.assertIn("src_emb.embeddings.weight", expected_embedding_names)
+        self.assertIn("tgt_emb.embeddings.weight", expected_names)
+        self.assertIn("src_emb.embeddings.weight", expected_names)
+        self.assertIn("generator.weight", expected_names,
+                      "generator.weight must be dequantized: for vision models "
+                      "replace_gguf_linear targets only self.decoder, not self.generator")
 
     @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires torch")
     def test_qwen2_decoder_has_qkvbias(self):
@@ -1550,6 +1517,61 @@ class TestGGUFQKVBiasAndEmbedding(unittest.TestCase):
         self.assertFalse(cfg["add_qkvbias"],
                          "qwen35 decoder must have add_qkvbias=False "
                          "(no Q/K/V biases in LLM decoder GGUF)")
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires torch")
+    def test_quantized_generator_is_dequantized(self):
+        """A quantized output.weight must be dequantized to float in safetensors.
+
+        Regression test for: output.weight Q6_K causes assertion error
+        "generator.weight torch.Size([V, 3360]) vs torch.Size([V, 4096])"
+        because for vision encoder models replace_gguf_linear targets only
+        self.decoder, leaving generator as plain nn.Linear (cannot hold uint8).
+        """
+        import torch
+        import numpy as np
+        from gguf import GGUFWriter, GGMLQuantizationType as QT
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_safetensors
+        from gguf.quants import quant_shape_to_byte_shape
+
+        vocab, emb_dim = 32, 64  # emb_dim multiple of 256 for Q8_0
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q8_gen.gguf")
+            w = GGUFWriter(path, "llama")
+            w.add_block_count(0)
+            w.add_embedding_length(emb_dim)
+            w.add_feed_forward_length(128)
+            w.add_head_count(4)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_vocab_size(vocab)
+            w.add_token_list([str(i) for i in range(vocab)])
+            # Float embedding (previously tested separately)
+            w.add_tensor("token_embd.weight",
+                         np.zeros((vocab, emb_dim), dtype=np.float32))
+            # Quantized output/generator weight (Q8_0)
+            byte_shape = quant_shape_to_byte_shape((vocab, emb_dim), QT.Q8_0)
+            raw = np.zeros(byte_shape, dtype=np.uint8)
+            w.add_tensor("output.weight", raw, raw_dtype=QT.Q8_0)
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            meta = GGUFMetadata(path)
+            tensors, _ = build_safetensors(meta, td, torch.float16)
+
+        gen_w = tensors.get("generator.weight")
+        self.assertIsNotNone(gen_w, "generator.weight must be present")
+        self.assertTrue(
+            gen_w.is_floating_point(),
+            f"generator.weight dtype={gen_w.dtype}; must be float "
+            "(nn.Linear generator cannot hold uint8 for vision models)"
+        )
+        self.assertEqual(gen_w.shape, torch.Size([vocab, emb_dim]),
+                         f"shape={gen_w.shape}, expected ({vocab},{emb_dim})")
+        # No companion gguf_qtype should be written for the generator
+        self.assertNotIn("generator.gguf_qtype", tensors,
+                         "dequantized generator.weight must not have gguf_qtype")
 
 
 if __name__ == "__main__":
