@@ -65,6 +65,12 @@ class MLP(nn.Module):
         self.maybe_ckpt = checkpoint if "ffn" in getattr(running_config, "use_ckpting", []) else lambda f, x: f(x)
 
     def _fuse_gate(self) -> None:
+        from eole.modules.gguf_linear import GGUFLinear
+
+        if isinstance(self.gate_up_proj, GGUFLinear):
+            # GGUFLinear stores uint8 quantized buffers that cannot be fused
+            # into a single float nn.Linear. Skip fusing silently.
+            return
         if hasattr(self.gate_up_proj, "weight"):
             new_gate = skip_init(
                 nn.Linear,

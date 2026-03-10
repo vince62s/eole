@@ -79,7 +79,8 @@ _GLOBAL_MAP: dict[str, Optional[str]] = {
     "rope_factors_short.weight": None,
 }
 
-# Per-block suffix → EOLE decoder-layer suffix
+# Per-block suffix → EOLE decoder-layer suffix.
+# A value of None means "known tensor but not yet modelled in EOLE – skip silently".
 _BLOCK_MAP: dict[str, Optional[str]] = {
     # Norms
     "attn_norm.weight": "input_layernorm.weight",
@@ -89,7 +90,7 @@ _BLOCK_MAP: dict[str, Optional[str]] = {
     # Per-layer norms for Gemma2/3
     "pre_feedforward_layernorm.weight": "pre_feedforward_layernorm.weight",
     "post_feedforward_layernorm.weight": "post_feedforward_layernorm.weight",
-    # Q-norm / K-norm (Qwen3 etc.)
+    # Q-norm / K-norm (Qwen3/Qwen3.5 etc.)
     "attn_q_norm.weight": "self_attn.q_norm.weight",
     "attn_k_norm.weight": "self_attn.k_norm.weight",
     # Attention projections (separate Q/K/V)
@@ -120,13 +121,37 @@ _BLOCK_MAP: dict[str, Optional[str]] = {
     "ffn_gate_exps.weight": "mlp.experts_gate_up.weight",
     "ffn_up_exps.weight": "mlp.experts_up.weight",
     "ffn_down_exps.weight": "mlp.experts_down.weight",
+    # ------------------------------------------------------------------
+    # Known tensors that have no direct EOLE equivalent yet – skip silently.
+    # ------------------------------------------------------------------
+    # Post-attention output norm (Qwen3.5 and similar models)
+    "post_attention_norm.weight": None,
+    "post_attention_norm.bias": None,
+    # Attention output gate (Qwen3.5 gated-attention mechanism)
+    "attn_gate.weight": None,
+    "attn_gate.bias": None,
+    # Mamba / SSM layer weights (hybrid models: Qwen3.5, Jamba, …)
+    "ssm_a": None,
+    "ssm_a.weight": None,
+    "ssm_d": None,
+    "ssm_d.weight": None,
+    "ssm_conv1d.weight": None,
+    "ssm_conv1d.bias": None,
+    "ssm_in_proj.weight": None,
+    "ssm_out_proj.weight": None,
+    "ssm_dt.weight": None,
+    "ssm_dt.bias": None,
+    "ssm_norm.weight": None,
+    "ssm_alpha.weight": None,
+    "ssm_beta.weight": None,
 }
 
 
 def _gguf_to_eole_name(gguf_name: str) -> Optional[str]:
     """Map a GGUF tensor name to the EOLE tensor name.
 
-    Returns ``None`` for tensors that should be skipped (e.g., RoPE cache).
+    Returns ``None`` for tensors that should be skipped (e.g., RoPE cache,
+    or architecture-specific tensors not yet modelled in EOLE).
     Returns the empty string ``""`` for unrecognised names (caller should warn).
     """
     if gguf_name in _GLOBAL_MAP:
@@ -136,9 +161,11 @@ def _gguf_to_eole_name(gguf_name: str) -> Optional[str]:
     if m:
         block_idx = m.group(1)
         suffix = m.group(2)
-        eole_suffix = _BLOCK_MAP.get(suffix)
-        if eole_suffix is None:
+        if suffix not in _BLOCK_MAP:
             return ""  # unrecognised
+        eole_suffix = _BLOCK_MAP[suffix]
+        if eole_suffix is None:
+            return None  # known but not yet supported in EOLE, skip silently
         return f"decoder.transformer_layers.{block_idx}.{eole_suffix}"
 
     return ""  # unrecognised
@@ -358,11 +385,11 @@ class GGUFMetadata:
 # ---------------------------------------------------------------------------
 
 _RMS_NORM_ARCHS = frozenset(
-    "llama mistral mixtral qwen2 qwen2moe qwen3 qwen3moe phi3 deepseek2 "
+    "llama mistral mixtral qwen2 qwen2moe qwen3 qwen3moe qwen35 phi3 deepseek2 "
     "falcon gemma gemma2 gemma3 llama4 deci grok starcoder2".split()
 )
 _SWIGLU_ARCHS = frozenset(
-    "llama mistral mixtral qwen2 qwen2moe qwen3 qwen3moe phi3 deepseek2 "
+    "llama mistral mixtral qwen2 qwen2moe qwen3 qwen3moe qwen35 phi3 deepseek2 "
     "gemma gemma2 gemma3 llama4 deci grok starcoder2".split()
 )
 
@@ -385,7 +412,7 @@ def build_model_config(meta: GGUFMetadata) -> dict:
     use_rms = arch in _RMS_NORM_ARCHS
     norm_eps = meta.norm_rms_eps if use_rms else meta.norm_eps
     layer_norm = "rms" if use_rms else "standard"
-    mlp_activation_fn = "silu" if arch in _SWIGLU_ARCHS else "gelu"
+    mlp_activation_fn = "gated-silu" if arch in _SWIGLU_ARCHS else "gelu"
 
     model_config: dict = {
         "layers": layers,
@@ -438,7 +465,7 @@ def build_model_config(meta: GGUFMetadata) -> dict:
             add_final_linear_bias=True,
             add_ffnbias=True,
         )
-    if arch in ("qwen2", "qwen3"):
+    if arch in ("qwen2", "qwen3", "qwen35"):
         model_config.update(add_qkvbias=True, add_final_linear_bias=False)
     if meta.use_parallel_residual:
         model_config["parallel_residual"] = True

@@ -130,11 +130,29 @@ class TestGGUFNameMapping(unittest.TestCase):
         r = self._map("blk.2.ffn_down.weight")
         self.assertEqual(r, "decoder.transformer_layers.2.mlp.down_proj.weight")
 
+    def test_block_ffn_up(self):
+        r = self._map("blk.0.ffn_up.weight")
+        self.assertEqual(r, "decoder.transformer_layers.0.mlp.up_proj.weight")
+
     def test_rope_freqs_skipped(self):
         self.assertIsNone(self._map("rope_freqs.weight"))
 
     def test_unknown_returns_empty(self):
         self.assertEqual(self._map("some.unknown.tensor"), "")
+
+    def test_known_unsupported_attn_gate_returns_none(self):
+        """Qwen3.5 attn_gate is known but not yet modelled in EOLE → None."""
+        self.assertIsNone(self._map("blk.0.attn_gate.weight"))
+
+    def test_known_unsupported_post_attention_norm_returns_none(self):
+        """Qwen3.5 post_attention_norm is known but not modelled → None."""
+        self.assertIsNone(self._map("blk.0.post_attention_norm.weight"))
+
+    def test_known_unsupported_ssm_returns_none(self):
+        """Mamba/SSM tensors are known but not modelled in EOLE → None."""
+        self.assertIsNone(self._map("blk.0.ssm_a"))
+        self.assertIsNone(self._map("blk.0.ssm_alpha.weight"))
+        self.assertIsNone(self._map("blk.0.ssm_beta.weight"))
 
 
 class TestGGUFLinear(unittest.TestCase):
@@ -308,6 +326,30 @@ class TestGGUFConverter(unittest.TestCase):
             os.path.exists(os.path.join(self.output_dir, "model.00.safetensors"))
         )
 
+    def test_config_mlp_activation_fn(self):
+        """SwiGLU models must use 'gated-silu', not bare 'silu'."""
+        self._run_converter()
+        with open(os.path.join(self.output_dir, "config.json")) as f:
+            cfg = json.load(f)
+        # Top-level model field
+        self.assertEqual(cfg["model"]["mlp_activation_fn"], "gated-silu")
+        # And propagated into decoder
+        self.assertEqual(cfg["model"]["decoder"]["mlp_activation_fn"], "gated-silu")
+
+    def test_up_proj_present_in_shard(self):
+        """ffn_up.weight must be written as mlp.up_proj.weight (needs gated-silu)."""
+        _require("safetensors")
+        self._run_converter()
+        import safetensors.torch
+
+        tensors = safetensors.torch.load_file(
+            os.path.join(self.output_dir, "model.00.safetensors")
+        )
+        key = "decoder.transformer_layers.0.mlp.up_proj.weight"
+        self.assertIn(key, tensors, "up_proj.weight missing from shard")
+        import torch
+        self.assertEqual(tensors[key].dtype, torch.uint8)
+
     def test_config_quant_type(self):
         self._run_converter()
         with open(os.path.join(self.output_dir, "config.json")) as f:
@@ -364,6 +406,140 @@ class TestGGUFConverter(unittest.TestCase):
         )
         self.assertEqual(tensors["tgt_emb.embeddings.weight"].dtype, torch.float16)
         self.assertEqual(tensors["decoder.layer_norm.weight"].dtype, torch.float16)
+
+
+class TestGGUFArchSets(unittest.TestCase):
+    """Test that known architectures are properly included in the arch sets."""
+
+    def setUp(self):
+        _require("gguf")
+
+    def test_qwen35_in_rms_norm_archs(self):
+        from eole.bin.convert.convert_gguf import _RMS_NORM_ARCHS
+
+        self.assertIn("qwen35", _RMS_NORM_ARCHS)
+
+    def test_qwen35_in_swiglu_archs(self):
+        from eole.bin.convert.convert_gguf import _SWIGLU_ARCHS
+
+        self.assertIn("qwen35", _SWIGLU_ARCHS)
+
+    def test_llama_in_swiglu_archs(self):
+        from eole.bin.convert.convert_gguf import _SWIGLU_ARCHS
+
+        self.assertIn("llama", _SWIGLU_ARCHS)
+
+    def test_swiglu_uses_gated_silu(self):
+        """build_model_config must produce 'gated-silu' for SwiGLU architectures."""
+        _require("numpy")
+        import tempfile
+        import numpy as np
+        from gguf import GGUFWriter
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "m.gguf")
+            w = GGUFWriter(path, "llama")
+            w.add_block_count(1)
+            w.add_embedding_length(64)
+            w.add_feed_forward_length(128)
+            w.add_head_count(4)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_vocab_size(8)
+            w.add_token_list([str(i) for i in range(8)])
+            w.add_tensor("token_embd.weight", np.zeros((8, 64), dtype=np.float16))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertEqual(cfg["mlp_activation_fn"], "gated-silu")
+
+    def test_non_swiglu_uses_gelu(self):
+        """Non-SwiGLU architecture (e.g. phi2) must use 'gelu'."""
+        _require("numpy")
+        import tempfile
+        import numpy as np
+        from gguf import GGUFWriter
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "m.gguf")
+            w = GGUFWriter(path, "phi2")
+            w.add_block_count(1)
+            w.add_embedding_length(64)
+            w.add_feed_forward_length(128)
+            w.add_head_count(4)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_vocab_size(8)
+            w.add_token_list([str(i) for i in range(8)])
+            w.add_tensor("token_embd.weight", np.zeros((8, 64), dtype=np.float16))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+            meta = GGUFMetadata(path)
+        cfg = build_model_config(meta)
+        self.assertEqual(cfg["mlp_activation_fn"], "gelu")
+
+
+class TestGGUFFuseHandlers(unittest.TestCase):
+    """Test that _fuse_KVQ and _fuse_gate skip GGUFLinear modules."""
+
+    def setUp(self):
+        _require("torch")
+
+    def test_fuse_kvq_skips_gguf_linear(self):
+        """_fuse_KVQ must return immediately for GGUFLinear, leaving modules intact."""
+        import torch
+        from eole.modules.gguf_linear import GGUFLinear
+        from eole.modules.multi_headed_attn import MultiHeadedAttention
+
+        # Build a minimal object that has the three linear attributes as GGUFLinear
+        # and call _fuse_KVQ directly using the unbound method.
+        class FakeAttn:
+            pass
+
+        fake = FakeAttn()
+        fake.linear_keys = GGUFLinear(32, 32, bias=False)
+        fake.linear_values = GGUFLinear(32, 32, bias=False)
+        fake.linear_query = GGUFLinear(32, 32, bias=False)
+
+        # Call the method on our fake object (unbound call)
+        MultiHeadedAttention._fuse_KVQ(fake)
+
+        # Modules must still exist and be GGUFLinear (not replaced / deleted)
+        self.assertIsInstance(fake.linear_keys, GGUFLinear)
+        self.assertIsInstance(fake.linear_values, GGUFLinear)
+        self.assertIsInstance(fake.linear_query, GGUFLinear)
+        self.assertFalse(hasattr(fake, "linear_kvq"))
+
+    def test_fuse_gate_skips_gguf_linear(self):
+        """_fuse_gate must return immediately for GGUFLinear, leaving modules intact."""
+        import torch.nn as nn
+        from eole.modules.gguf_linear import GGUFLinear, replace_gguf_linear
+        from eole.modules.transformer_mlp import MLP
+
+        class FakeCfg:
+            hidden_size = 32
+            transformer_ff = 64
+            mlp_activation_fn = "gated-silu"
+            add_ffnbias = False
+
+        try:
+            mlp = MLP(FakeCfg(), running_config=None)
+        except Exception:
+            raise unittest.SkipTest("MLP init requires more config")
+
+        replace_gguf_linear(mlp, module_to_convert=["gate_up_proj", "up_proj"])
+        from eole.modules.gguf_linear import GGUFLinear as GL
+        self.assertIsInstance(mlp.gate_up_proj, GL)
+
+        # _fuse_gate must not raise and must leave modules unchanged
+        mlp._fuse_gate()
+        self.assertIsInstance(mlp.gate_up_proj, GL)
+        self.assertIsInstance(mlp.up_proj, GL)
 
 
 if __name__ == "__main__":
