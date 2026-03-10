@@ -627,13 +627,16 @@ MODEL_OVERRIDES = {
         "encoder.patch_conv.bias": "model.visual.patch_embed.proj.bias",
         "encoder.pos_embed.weight": "model.visual.pos_embed.weight",
         "encoder": {
-            # Fused QKV → split into Q / K / V
-            ".self_attn.linear_query.weight": (".attn.qkv.weight", "[:hidden_size, :]"),
-            ".self_attn.linear_keys.weight": (".attn.qkv.weight", "[hidden_size:2*hidden_size, :]"),
-            ".self_attn.linear_values.weight": (".attn.qkv.weight", "[-hidden_size:, :]"),
-            ".self_attn.linear_query.bias": (".attn.qkv.bias", "[:hidden_size]"),
-            ".self_attn.linear_keys.bias": (".attn.qkv.bias", "[hidden_size:2*hidden_size]"),
-            ".self_attn.linear_values.bias": (".attn.qkv.bias", "[-hidden_size:]"),
+            # Fused QKV → split into Q / K / V.
+            # Use qkv_size (= w.shape[0]//3) rather than hidden_size because the
+            # vision encoder may use head_dim*num_heads != hidden_size
+            # (e.g. head_dim=256, num_heads=16 → proj=4096 vs hidden_size=1152).
+            ".self_attn.linear_query.weight": (".attn.qkv.weight", "[:qkv_size, :]"),
+            ".self_attn.linear_keys.weight": (".attn.qkv.weight", "[qkv_size:2*qkv_size, :]"),
+            ".self_attn.linear_values.weight": (".attn.qkv.weight", "[-qkv_size:, :]"),
+            ".self_attn.linear_query.bias": (".attn.qkv.bias", "[:qkv_size]"),
+            ".self_attn.linear_keys.bias": (".attn.qkv.bias", "[qkv_size:2*qkv_size]"),
+            ".self_attn.linear_values.bias": (".attn.qkv.bias", "[-qkv_size:]"),
             ".self_attn.final_linear.weight": ".attn.proj.weight",
             ".self_attn.final_linear.bias": ".attn.proj.bias",
             # Vision MLP: linear_fc1 → gate_up_proj, linear_fc2 → down_proj
@@ -695,12 +698,13 @@ MODEL_OVERRIDES = {
         "encoder.patch_conv.bias": "model.visual.patch_embed.proj.bias",
         "encoder.pos_embed.weight": "model.visual.pos_embed.weight",
         "encoder": {
-            ".self_attn.linear_query.weight": (".attn.qkv.weight", "[:hidden_size, :]"),
-            ".self_attn.linear_keys.weight": (".attn.qkv.weight", "[hidden_size:2*hidden_size, :]"),
-            ".self_attn.linear_values.weight": (".attn.qkv.weight", "[-hidden_size:, :]"),
-            ".self_attn.linear_query.bias": (".attn.qkv.bias", "[:hidden_size]"),
-            ".self_attn.linear_keys.bias": (".attn.qkv.bias", "[hidden_size:2*hidden_size]"),
-            ".self_attn.linear_values.bias": (".attn.qkv.bias", "[-hidden_size:]"),
+            # Use qkv_size (= w.shape[0]//3) — same reason as Qwen3_5ForConditionalGeneration
+            ".self_attn.linear_query.weight": (".attn.qkv.weight", "[:qkv_size, :]"),
+            ".self_attn.linear_keys.weight": (".attn.qkv.weight", "[qkv_size:2*qkv_size, :]"),
+            ".self_attn.linear_values.weight": (".attn.qkv.weight", "[-qkv_size:, :]"),
+            ".self_attn.linear_query.bias": (".attn.qkv.bias", "[:qkv_size]"),
+            ".self_attn.linear_keys.bias": (".attn.qkv.bias", "[qkv_size:2*qkv_size]"),
+            ".self_attn.linear_values.bias": (".attn.qkv.bias", "[-qkv_size:]"),
             ".self_attn.final_linear.weight": ".attn.proj.weight",
             ".self_attn.final_linear.bias": ".attn.proj.bias",
             ".mlp.gate_up_proj.": ".mlp.linear_fc1.",

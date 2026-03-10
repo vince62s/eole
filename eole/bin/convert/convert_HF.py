@@ -1081,6 +1081,11 @@ def build_shards(model_config, hf, args, params):
                                         {
                                             "w": w,
                                             "hidden_size": hidden_size,
+                                            # qkv_size: per-component size of a fused QKV tensor.
+                                            # Uses w.shape[0]//3 so it works even when
+                                            # head_dim * num_heads != hidden_size (e.g. Qwen3.5 VL
+                                            # vision encoder: proj=4096, hidden_size=1152).
+                                            "qkv_size": w.shape[0] // 3,
                                             "transformer_ff": model_config["transformer_ff"],
                                             "moe_transformer_ff": model_config.get("decoder", {}).get(
                                                 "moe_transformer_ff",
