@@ -937,12 +937,13 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         img_size, patch_size = 64, 8
         num_layers = 2
         spatial_size = img_size // patch_size  # 8
-        num_pos = 2 * spatial_size * spatial_size  # 128
+        num_pos = spatial_size * spatial_size   # 64  (one entry per patch, NOT 2x)
         projection_dim = 128  # clip.vision.projection_dim: decoder hidden size
         cls.hidden = hidden
         cls.ff = ff
         cls.patch_size = patch_size
         cls.num_layers = num_layers
+        cls.num_pos = num_pos
 
         w = GGUFWriter(cls.mmproj_path, "clip")
         w.add_uint32("clip.vision.block_count", num_layers)
@@ -959,8 +960,9 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         # patch embedding: (out_ch, in_ch, kH, kW)
         w.add_tensor("v.patch_embd.weight", np.ones((hidden, 3, patch_size, patch_size), dtype=np.float32))
         w.add_tensor("v.patch_embd.bias", np.zeros(hidden, dtype=np.float32))
-        # position embedding table
-        w.add_tensor("v.position_embd.weight", np.ones((hidden, num_pos), dtype=np.float32))
+        # position embedding table: shape (hidden, num_pos) in GGUF → (num_pos, hidden) after ne-reversal
+        # Use the name WITHOUT trailing 'd' (v.position_embed) to match real Qwen3.5 VL files.
+        w.add_tensor("v.position_embed.weight", np.ones((hidden, num_pos), dtype=np.float32))
         # merger norm (v.post_ln → adapter.norm)
         w.add_tensor("v.post_ln.weight", np.ones(hidden, dtype=np.float32))
         w.add_tensor("v.post_ln.bias", np.zeros(hidden, dtype=np.float32))
@@ -1021,12 +1023,105 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         import torch
         tensors = self._tensors()
         w = tensors["encoder.patch_conv.weight"]
-        # PyTorch Conv2d expects (out_channels, in_channels, kH, kW)
+        # Fixture only has v.patch_embd.weight (no .1) → Conv2d: (out, in, kH, kW)
         self.assertEqual(w.shape, torch.Size([self.hidden, 3, self.patch_size, self.patch_size]))
+        # No stray "encoder.patch_conv.weight.1" should remain
+        self.assertNotIn("encoder.patch_conv.weight.1", tensors)
+
+    def test_patch_conv_3d_stacking(self):
+        """Two temporal slices (weight + weight.1) must be stacked into a 5-D Conv3d weight."""
+        import torch
+        import tempfile, shutil, numpy as np
+        from gguf import GGUFWriter
+        from eole.bin.convert.convert_gguf import GGUFClipMetadata, _mmproj_to_eole_tensors
+
+        hidden, patch_size = 16, 4
+        tmpdir = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmpdir, "conv3d.gguf")
+            w_gguf = GGUFWriter(path, "clip")
+            w_gguf.add_uint32("clip.vision.block_count", 0)
+            w_gguf.add_uint32("clip.vision.embedding_length", hidden)
+            w_gguf.add_uint32("clip.vision.feed_forward_length", 32)
+            w_gguf.add_uint32("clip.vision.attention.head_count", 2)
+            w_gguf.add_uint32("clip.vision.image_size", 16)
+            w_gguf.add_uint32("clip.vision.patch_size", patch_size)
+            # Temporal patch conv: two 4-D slices
+            w_gguf.add_tensor("v.patch_embd.weight",
+                              np.zeros((hidden, 3, patch_size, patch_size), dtype=np.float32))
+            w_gguf.add_tensor("v.patch_embd.weight.1",
+                              np.ones((hidden, 3, patch_size, patch_size), dtype=np.float32))
+            w_gguf.write_header_to_file()
+            w_gguf.write_kv_data_to_file()
+            w_gguf.write_tensors_to_file()
+            w_gguf.close()
+
+            clip = GGUFClipMetadata(path)
+            tensors, skipped = _mmproj_to_eole_tensors(clip, torch.float32)
+
+            w = tensors.get("encoder.patch_conv.weight")
+            self.assertIsNotNone(w, "encoder.patch_conv.weight missing after Conv3d stacking")
+            # Expected 5-D shape: (out_ch, in_ch, temporal=2, kH, kW)
+            self.assertEqual(w.shape,
+                             torch.Size([hidden, 3, 2, patch_size, patch_size]),
+                             f"Conv3d weight wrong shape: {w.shape}")
+            # The stray ".1" key must NOT be present
+            self.assertNotIn("encoder.patch_conv.weight.1", tensors)
+            # Verify values: slice [:, :, 0, :, :] from t0 (zeros) and [:, :, 1, :, :] from t1 (ones)
+            self.assertTrue(w[:, :, 0, :, :].eq(0).all(), "t0 slice should be zeros")
+            self.assertTrue(w[:, :, 1, :, :].eq(1).all(), "t1 slice should be ones")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_pos_embed_weight_present(self):
         tensors = self._tensors()
         self.assertIn("encoder.pos_embed.weight", tensors)
+
+    def test_pos_embed_shape(self):
+        """encoder.pos_embed.weight must have shape (spatial^2, hidden_size).
+
+        This verifies the fix for the 2x size bug: num_pos = spatial^2, NOT
+        2 * spatial^2.  For img_size=64, patch_size=8: spatial=8, num_pos=64.
+        """
+        import torch
+        tensors = self._tensors()
+        w = tensors["encoder.pos_embed.weight"]
+        self.assertEqual(w.shape, torch.Size([self.num_pos, self.hidden]),
+                         f"pos_embed wrong shape: {w.shape} (expected num_pos={self.num_pos})")
+
+    def test_pos_embed_accepts_name_without_d(self):
+        """v.position_embed.weight (no trailing 'd') must also map to encoder.pos_embed."""
+        import torch
+        import tempfile, shutil, numpy as np
+        from gguf import GGUFWriter
+        from eole.bin.convert.convert_gguf import GGUFClipMetadata, _mmproj_to_eole_tensors
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmpdir, "nod.gguf")
+            hidden, num_pos = 16, 4
+            w = GGUFWriter(path, "clip")
+            w.add_uint32("clip.vision.block_count", 0)
+            w.add_uint32("clip.vision.embedding_length", hidden)
+            w.add_uint32("clip.vision.feed_forward_length", 32)
+            w.add_uint32("clip.vision.attention.head_count", 2)
+            w.add_uint32("clip.vision.image_size", 16)
+            w.add_uint32("clip.vision.patch_size", 8)
+            # Use name WITHOUT trailing 'd' – matches real Qwen3.5 VL GGUF
+            w.add_tensor("v.position_embed.weight", np.ones((hidden, num_pos), dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            clip = GGUFClipMetadata(path)
+            tensors, skipped = _mmproj_to_eole_tensors(clip, torch.float32)
+            self.assertIn("encoder.pos_embed.weight", tensors,
+                          "v.position_embed.weight (no 'd') must map to encoder.pos_embed.weight")
+            self.assertNotIn("v.position_embed.weight", skipped,
+                             "v.position_embed.weight must not be listed in skipped tensors")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_adapter_norm_maps_from_post_ln(self):
         """v.post_ln → adapter.norm (part of the Qwen3VL merger)."""
@@ -1099,6 +1194,10 @@ class TestGGUFMmprojConverter(unittest.TestCase):
         self.assertFalse(enc_cfg["layernorm_pre"])
         self.assertFalse(enc_cfg["layernorm_post"])
         self.assertEqual(enc_cfg["temporal_patch_size"], 2)
+        # num_position_embeddings must equal spatial^2 (NOT 2 * spatial^2).
+        # For img_size=64, patch_size=8: spatial=8, so num_pos=64.
+        self.assertEqual(enc_cfg["num_position_embeddings"], self.num_pos,
+                         "num_position_embeddings should be spatial^2, not 2*spatial^2")
 
 
 if __name__ == "__main__":

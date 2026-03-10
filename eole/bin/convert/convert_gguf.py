@@ -931,9 +931,12 @@ def _mmproj_to_eole_tensors(
     * ``v.blk.{i}.ffn_down.weight``  – MLP down projection → ``mlp.down_proj``
     * ``v.blk.{i}.ln1.*``            – pre-attention layer norm
     * ``v.blk.{i}.ln2.*``            – post-attention layer norm
-    * ``v.patch_embd.weight``        – patch convolution weights
-    * ``v.patch_embd.weight.1``      – second temporal patch conv (Qwen3.5 VL)
-    * ``v.position_embd.weight``     – absolute position embedding table
+    * ``v.patch_embd.weight``        – patch convolution weights (Conv2d or
+      first temporal slice of Conv3d)
+    * ``v.patch_embd.weight.1``      – second temporal slice of Conv3d
+      (Qwen3.5 VL); stacked with ``weight`` to form a 5-D Conv3d weight
+    * ``v.position_embd.weight`` or ``v.position_embed.weight`` – absolute
+      position embedding table (name varies across llama.cpp versions)
     * ``v.post_ln.weight/bias``      – post-encoder layer norm (part of merger)
     * ``mm.0.weight/bias``           – merger linear_fc1
     * ``mm.2.weight/bias``           – merger linear_fc2
@@ -943,29 +946,33 @@ def _mmproj_to_eole_tensors(
     written: dict[str, torch.Tensor] = {}
     skipped: list[str] = []
 
+    # Temporal patch conv: Qwen3.5 VL stores the Conv3d weight split across
+    # two tensors (one per temporal step).  Collect them here; they are
+    # combined after the main loop.
+    _patch_t0: Optional[torch.Tensor] = None
+    _patch_t1: Optional[torch.Tensor] = None
+
     for tensor in clip_meta.tensors:
         name = tensor.name
         t, _ = _tensor_to_torch(tensor, target_dtype)
 
         # --- Global vision-encoder tensors -----------------------------------
         if name == "v.patch_embd.weight":
-            # GGUF: stored as (out_ch, in_ch, kH, kW) after ne-reversal
-            # PyTorch Conv2d expects (out_channels, in_channels, kH, kW): already correct.
-            written["encoder.patch_conv.weight"] = t
+            # First temporal slice (or the only slice for Conv2d models).
+            # Shape after GGUF ne-reversal: (out_ch, in_ch, kH, kW).
+            _patch_t0 = t
             continue
 
         if name == "v.patch_embd.weight.1":
-            # Second temporal patch conv for Qwen3.5 VL Conv3d; stored as
-            # separate tensor next to weight.  Map to the ".1" sibling key
-            # that the HF converter also stores.
-            written["encoder.patch_conv.weight.1"] = t
+            # Second temporal slice for Qwen3.5 VL Conv3d.
+            _patch_t1 = t
             continue
 
         if name == "v.patch_embd.bias":
             written["encoder.patch_conv.bias"] = t
             continue
 
-        if name == "v.position_embd.weight":
+        if name in ("v.position_embd.weight", "v.position_embed.weight"):
             written["encoder.pos_embed.weight"] = t
             continue
 
@@ -1040,6 +1047,17 @@ def _mmproj_to_eole_tensors(
         else:
             skipped.append(name)
 
+    # --- Post-loop: assemble temporal patch conv weight ----------------------
+    if _patch_t0 is not None:
+        if _patch_t1 is not None:
+            # Qwen3.5 VL Conv3d: both temporal slices present.
+            # Each slice has shape (out_ch, in_ch, kH, kW).
+            # Stack along dim=2 → (out_ch, in_ch, 2, kH, kW) for Conv3d.
+            written["encoder.patch_conv.weight"] = torch.stack([_patch_t0, _patch_t1], dim=2)
+        else:
+            # Standard Conv2d: single (out_ch, in_ch, kH, kW) tensor.
+            written["encoder.patch_conv.weight"] = _patch_t0
+
     return written, skipped
 
 
@@ -1056,10 +1074,12 @@ def build_vision_encoder_config(clip_meta: "GGUFClipMetadata") -> dict:
     patch_size = clip_meta.vision_patch_size
     norm_eps = clip_meta.vision_norm_eps
 
-    # Number of patches along each spatial dimension (used for position table)
+    # Number of patches along each spatial dimension (used for position table).
+    # The position embedding table has one entry per patch: spatial_size^2.
+    # (Note: this is NOT 2×spatial^2 – the tensor shape in GGUF is
+    # [hidden_size, spatial^2] with ne-reversal giving (spatial^2, hidden_size).)
     spatial_size = img_size // patch_size
-    # Qwen3VL / Qwen3.5 VL: position table is 2×spatial×spatial to encode 2D
-    num_pos = 2 * spatial_size * spatial_size
+    num_pos = spatial_size * spatial_size
 
     return {
         "layers": clip_meta.vision_block_count,
