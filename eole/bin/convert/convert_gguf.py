@@ -1359,6 +1359,14 @@ def build_vision_encoder_config(clip_meta: "GGUFClipMetadata") -> dict:
         "temporal_patch_size": 2,  # Qwen3.5 VL uses Conv3d with kernel (2,patch,patch)
         "patch_conv_bias": True,
         "num_position_embeddings": num_pos,
+        # Vision encoder uses standard 2D RoPE (pixtral-style), NOT the decoder's
+        # multi-dimensional MRoPE.  rotary_interleave must be False and theta=10000
+        # (matches convert_HF.py for Qwen3_5ForConditionalGeneration).
+        "position_encoding_type": PositionEncodingType.Rotary,
+        "rope_config": {
+            "rotary_interleave": False,
+            "rotary_theta": 10000,
+        },
     }
 
 
