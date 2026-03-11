@@ -288,21 +288,14 @@ class TestGGUFLinear(unittest.TestCase):
         )
         self.assertIn("Q4_K", repr(layer))
 
-    def test_materialize_gguf_linear_replaces_with_nn_linear(self):
-        """materialize_gguf_linear must replace GGUFLinear with nn.Linear with
-        dequantized float16 weights, and inference must give the same result as
-        GGUFLinear.forward on the same input."""
-        _require("numpy")
+    def _make_gguf_layer(self, n_out, n_in, qtype_enum):
+        """Helper: create a GGUFLinear with real quantised weights via GGUFWriter."""
         import tempfile
         import os
         import numpy as np
         import torch
-        import torch.nn as nn
-        from gguf import GGMLQuantizationType, GGUFWriter, GGUFReader
-
-        from eole.modules.gguf_linear import GGUFLinear, materialize_gguf_linear
-
-        n_out, n_in = 8, 256
+        from gguf import GGUFWriter, GGUFReader
+        from eole.modules.gguf_linear import GGUFLinear
 
         with tempfile.TemporaryDirectory() as td:
             gpath = os.path.join(td, "tiny.gguf")
@@ -313,66 +306,62 @@ class TestGGUFLinear(unittest.TestCase):
             writer.add_tensor(
                 "test.weight",
                 np.random.randn(n_out, n_in).astype(np.float32),
-                raw_dtype=GGMLQuantizationType.Q4_K,
+                raw_dtype=qtype_enum,
             )
             writer.write_header_to_file()
             writer.write_kv_data_to_file()
             writer.write_tensors_to_file()
             writer.close()
-
             reader = GGUFReader(gpath)
             q_data = reader.tensors[0].data.copy()
 
-        class Tiny(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.linear_query = GGUFLinear(in_features=n_in, out_features=n_out, bias=False)
-                self.other = nn.Linear(n_in, n_out, bias=False)
-
-        model = Tiny()
-        model.linear_query.register_buffer("weight", torch.from_numpy(q_data))
-        model.linear_query.register_buffer(
+        layer = GGUFLinear(in_features=n_in, out_features=n_out, bias=False)
+        layer.register_buffer("weight", torch.from_numpy(q_data))
+        layer.register_buffer(
             "gguf_qtype",
-            torch.tensor([GGMLQuantizationType.Q4_K.value], dtype=torch.int32),
+            torch.tensor([qtype_enum.value], dtype=torch.int32),
         )
+        return layer
+
+    def _forward_matches_cpu_fallback(self, qtype_enum, n_out=8, n_in=256):
+        """GPU-native path must produce the same result as the CPU fallback."""
+        import torch
+        import torch.nn.functional as F
+        from gguf import dequantize
+
+        layer = self._make_gguf_layer(n_out, n_in, qtype_enum)
 
         x = torch.randn(2, 4, n_in)
-        # Record output from the slow GGUFLinear path
-        expected = model.linear_query(x)
 
-        # Materialize: all GGUFLinear layers should become nn.Linear
-        materialize_gguf_linear(model, dtype=torch.float32)
+        # Reference: CPU numpy path (the original fallback logic)
+        w_np = layer.weight.cpu().numpy()
+        dq_np = dequantize(w_np, qtype_enum)
+        w_ref = torch.from_numpy(dq_np).reshape(n_out, n_in).to(x.dtype)
+        expected = F.linear(x, w_ref)
 
-        self.assertIsInstance(model.linear_query, nn.Linear,
-                              "materialize_gguf_linear must replace GGUFLinear with nn.Linear")
-        # Non-GGUFLinear modules must be untouched
-        self.assertIsInstance(model.other, nn.Linear)
+        # Actual: GGUFLinear.forward (should hit GPU path for Q8_0/Q4_0/Q4_1)
+        actual = layer(x)
 
-        # The materialized layer must produce the same result as the GGUFLinear
-        # path.  Use a small tolerance to guard against any fp rounding in the
-        # dtype conversion chain (float32 case: should be bit-exact, but we stay
-        # conservative to avoid fragile zero-tolerance assertions).
-        actual = model.linear_query(x)
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        self.assertEqual(actual.shape, (2, 4, n_out))
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4, equal_nan=True)
 
-    def test_materialize_gguf_linear_no_gguf_layers(self):
-        """materialize_gguf_linear must be a no-op when no GGUFLinear layers exist."""
-        import torch.nn as nn
+    def test_forward_q8_0_matches_numpy(self):
+        """Q8_0 GPU-native dequantisation must match the numpy reference."""
+        _require("numpy")
+        from gguf import GGMLQuantizationType
+        self._forward_matches_cpu_fallback(GGMLQuantizationType.Q8_0)
 
-        from eole.modules.gguf_linear import materialize_gguf_linear
+    def test_forward_q4_0_matches_numpy(self):
+        """Q4_0 GPU-native dequantisation must match the numpy reference."""
+        _require("numpy")
+        from gguf import GGMLQuantizationType
+        self._forward_matches_cpu_fallback(GGMLQuantizationType.Q4_0)
 
-        class Plain(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.a = nn.Linear(8, 8)
-                self.b = nn.Linear(8, 4)
-
-        model = Plain()
-        orig_a = model.a
-        orig_b = model.b
-        materialize_gguf_linear(model)
-        self.assertIs(model.a, orig_a)
-        self.assertIs(model.b, orig_b)
+    def test_forward_q4_1_matches_numpy(self):
+        """Q4_1 GPU-native dequantisation must match the numpy reference."""
+        _require("numpy")
+        from gguf import GGMLQuantizationType
+        self._forward_matches_cpu_fallback(GGMLQuantizationType.Q4_1)
 
 
 class TestGGUFConverter(unittest.TestCase):

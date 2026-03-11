@@ -74,28 +74,110 @@ class GGUFLinear(nn.Module):
         else:
             self.bias = None
 
+    @staticmethod
+    def _decode_f16_col(blocks: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        """Reinterpret a uint8 byte slice as float16 scalars (little-endian).
+
+        Parameters
+        ----------
+        blocks:
+            2-D uint8 tensor of shape ``(n_blocks, type_size)``.
+        start, end:
+            Byte slice ``[start:end]`` within each block (must span exactly
+            ``(end - start) / 2`` float16 values, so ``end - start`` must be even).
+
+        Returns
+        -------
+        torch.Tensor
+            1-D float32 tensor of shape ``(n_blocks * (end - start) // 2,)``.
+        """
+        return blocks[:, start:end].contiguous().view(torch.float16).reshape(-1).to(torch.float32)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Dequantize weight on-the-fly, then apply linear transformation."""
+        """Dequantize weight on-the-fly, then apply linear transformation.
+
+        For **Q8_0**, **Q4_0**, and **Q4_1** quantisation types the
+        dequantisation is performed entirely on the same device as the weight
+        tensor (GPU or CPU) using PyTorch tensor operations, which avoids any
+        CPU round-trip when the model is on a CUDA device.
+
+        All other GGUF types (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ-family, …)
+        fall back to the ``gguf`` library's CPU path.  In those cases the
+        quantised weight buffer is briefly copied to the CPU for
+        dequantisation before the result is moved back to the compute device.
+
+        .. note::
+            A truly fused dequantise+GEMM CUDA kernel (analogous to Marlin
+            for GPTQ) would eliminate the intermediate float16 weight
+            allocation for K-quant types as well.  Until such a kernel is
+            available the GPU path already covers the most common
+            ``llama.cpp``-style Q8_0 / Q4_0 / Q4_1 conversions.
+        """
         try:
-            from gguf import dequantize, GGMLQuantizationType
+            from gguf import GGMLQuantizationType
         except ImportError:
             raise ImportError("Install 'gguf' to run inference with GGUF quantized models: pip install gguf")
 
-        qtype = GGMLQuantizationType(int(self.gguf_qtype.item()))
+        qtype_val = int(self.gguf_qtype.item())
+        qtype = GGMLQuantizationType(qtype_val)
+        target_dtype = x.dtype
+        device = self.weight.device
 
-        # Dequantize: weight is stored as (out_features, bytes_per_row) uint8
-        # or as a 1-D flat buffer.  Either way, gguf.dequantize produces a
-        # float32 numpy array with shape (out_features * in_features,) or
-        # (out_features, in_features).
+        # ------------------------------------------------------------------
+        # GPU-native paths: dequantise directly on-device with PyTorch ops.
+        # The quantised uint8 weight stays on the GPU; no CPU round-trip.
+        #
+        # Block layouts follow the GGUF spec (little-endian scalars):
+        #   Q8_0 – [d:f16 (2 B), qs:i8[32] (32 B)]          34 B / 32 elems
+        #   Q4_0 – [d:f16 (2 B), qs:u8[16] (16 B)]           18 B / 32 elems
+        #   Q4_1 – [d:f16 (2 B), m:f16 (2 B), qs:u8[16]]     20 B / 32 elems
+        # ------------------------------------------------------------------
+
+        if qtype == GGMLQuantizationType.Q8_0:
+            blocks = self.weight.reshape(-1, 34)  # (n_blocks, 34)
+            # First 2 bytes of each block = scale (f16, little-endian)
+            scales = self._decode_f16_col(blocks, 0, 2)  # (n_blocks,) float32
+            # Remaining 32 bytes = quantised values (int8)
+            qs = blocks[:, 2:].contiguous().view(torch.int8).to(torch.float32)  # (n_blocks, 32)
+            weight = (qs * scales.unsqueeze(1)).reshape(self.out_features, self.in_features).to(dtype=target_dtype)
+            return F.linear(x, weight, self.bias)
+
+        if qtype == GGMLQuantizationType.Q4_0:
+            blocks = self.weight.reshape(-1, 18)  # (n_blocks, 18)
+            scales = self._decode_f16_col(blocks, 0, 2)  # (n_blocks,) float32
+            qs_u8 = blocks[:, 2:]  # (n_blocks, 16) uint8
+            # Nibble order: low nibbles of bytes[0..15], then high nibbles
+            lo = qs_u8 & 0x0F         # low  nibbles, values 0–15
+            hi = (qs_u8 >> 4) & 0x0F  # high nibbles, values 0–15
+            qs = torch.cat([lo, hi], dim=1).to(torch.float32) - 8.0  # (n_blocks, 32), center at 0
+            weight = (qs * scales.unsqueeze(1)).reshape(self.out_features, self.in_features).to(dtype=target_dtype)
+            return F.linear(x, weight, self.bias)
+
+        if qtype == GGMLQuantizationType.Q4_1:
+            blocks = self.weight.reshape(-1, 20)  # (n_blocks, 20)
+            scales = self._decode_f16_col(blocks, 0, 2)  # (n_blocks,) float32
+            mins   = self._decode_f16_col(blocks, 2, 4)  # (n_blocks,) float32
+            qs_u8  = blocks[:, 4:]  # (n_blocks, 16) uint8
+            lo = qs_u8 & 0x0F
+            hi = (qs_u8 >> 4) & 0x0F
+            qs = torch.cat([lo, hi], dim=1).to(torch.float32)  # (n_blocks, 32), values 0–15 (no centering)
+            weight = (qs * scales.unsqueeze(1) + mins.unsqueeze(1)).reshape(self.out_features, self.in_features).to(dtype=target_dtype)
+            return F.linear(x, weight, self.bias)
+
+        # ------------------------------------------------------------------
+        # CPU fallback for K-quant and other complex GGUF types.
+        # The weight is copied to CPU for numpy-based dequantisation, then
+        # moved back to the compute device.
+        # ------------------------------------------------------------------
+        from gguf import dequantize
+
         w_np = self.weight.cpu().numpy()
-        dq_np = dequantize(w_np, qtype)  # → float32 ndarray
-
+        dq_np = dequantize(w_np, qtype)
         weight = (
             torch.from_numpy(dq_np)
             .reshape(self.out_features, self.in_features)
-            .to(dtype=x.dtype, device=x.device)
+            .to(dtype=target_dtype, device=device)
         )
-
         return F.linear(x, weight, self.bias)
 
     def extra_repr(self) -> str:
@@ -110,80 +192,6 @@ class GGUFLinear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, qtype={qtype_name}"
         )
-
-
-def materialize_gguf_linear(model: nn.Module, dtype: torch.dtype = torch.float16) -> nn.Module:
-    """Dequantize all :class:`GGUFLinear` modules and replace them with plain
-    :class:`~torch.nn.Linear` layers.
-
-    Called once after the model weights have been loaded from the safetensors
-    shard.  Dequantizing upfront eliminates the per-forward-call CPU round-trip
-    (``weight.cpu()`` → numpy dequantize → move back to GPU) that would make
-    inference intolerably slow for large models.
-
-    After this call every former :class:`GGUFLinear` becomes a standard
-    ``nn.Linear`` whose ``weight`` parameter holds the dequantized values in
-    *dtype* on the same device as the original quantized buffer.  The uint8
-    weight buffer and the ``gguf_qtype`` buffer are freed.
-
-    Parameters
-    ----------
-    model:
-        Root module to patch in-place.
-    dtype:
-        Target floating-point dtype for the materialized weights
-        (usually ``running_config.storage_dtype``).
-
-    Returns
-    -------
-    nn.Module
-        The same *model* object, modified in-place, returned for convenience
-        (allows chaining, e.g. ``model = materialize_gguf_linear(model)``).
-    """
-    for name, module in model.named_children():
-        if isinstance(module, GGUFLinear):
-            try:
-                from gguf import dequantize, GGMLQuantizationType
-            except ImportError:
-                raise ImportError(
-                    "Install 'gguf' to run inference with GGUF quantized models: pip install gguf"
-                )
-
-            device = module.weight.device
-            qtype = GGMLQuantizationType(int(module.gguf_qtype.item()))
-            w_np = module.weight.cpu().numpy()
-            dq_np = dequantize(w_np, qtype)
-
-            w_tensor = (
-                # copy() to take ownership of the numpy buffer before converting
-                torch.from_numpy(dq_np.copy())
-                .reshape(module.out_features, module.in_features)
-                .to(dtype=dtype, device=device)
-            )
-
-            linear = nn.Linear(
-                in_features=module.in_features,
-                out_features=module.out_features,
-                bias=module.bias is not None,
-                device=device,
-                dtype=dtype,
-            )
-            # requires_grad=False: this layer is inference-only; gradients are
-            # not needed and would waste memory / confuse optimizers.
-            linear.weight = nn.Parameter(w_tensor, requires_grad=False)
-            if module.bias is not None:
-                linear.bias = nn.Parameter(
-                    module.bias.to(dtype=dtype, device=device), requires_grad=False
-                )
-
-            model._modules[name] = linear
-
-            # Free the quantized buffers explicitly to reclaim GPU memory.
-            del module.weight
-            del module.gguf_qtype
-        else:
-            materialize_gguf_linear(module, dtype=dtype)
-    return model
 
 
 def replace_gguf_linear(
