@@ -525,6 +525,12 @@ _SWIGLU_ARCHS = frozenset(
 _QK_NORM_ARCHS = frozenset(
     "qwen3 qwen3moe qwen35 gemma3 deepseek2".split()
 )
+# Architectures whose attention uses gated queries (Qwen3.5 style).
+# The linear_query projection has doubled output size: first half is the
+# actual query, second half is the sigmoid gate.  Without q_gating=True the
+# GGUFLinear forward pass crashes because it tries to reshape (out=4096)
+# a dequantized buffer that has 8192*in_features elements.
+_Q_GATING_ARCHS = frozenset("qwen35".split())
 
 
 def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
@@ -631,6 +637,12 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
             query_norm=True,
             key_norm=True,
         )
+
+    # Architectures with gated query attention (Qwen3.5 style).
+    # linear_query has 2× output size; first half is query, second half is
+    # sigmoid gate.  Must go in the decoder sub-dict (same reason as QK norms).
+    if arch in _Q_GATING_ARCHS:
+        model_config.setdefault("decoder", {}).update(q_gating=True)
 
     # Hybrid models: add layer_types and GatedDeltaNet hyper-parameters.
     # These are decoder-specific fields (TransformerDecoderConfig), so they must

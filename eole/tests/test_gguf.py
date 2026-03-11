@@ -1716,6 +1716,30 @@ class TestGGUFQKNorm(unittest.TestCase):
         self.assertFalse(decoder.get("query_norm", False))
         self.assertFalse(decoder.get("key_norm", False))
 
+    def test_qwen35_has_q_gating(self):
+        """qwen35 must have q_gating=True in the decoder config.
+
+        Without it GGUFLinear.forward crashes at .reshape(out_features, in_features)
+        because the dequantized attn_q buffer has 2*out_features*in_features
+        elements (the projection is doubled for the gate), but out_features is
+        set to head_dim*heads (half the correct value).
+        """
+        cfg = self._cfg_for_arch("qwen35")
+        decoder = cfg.get("decoder", {})
+        self.assertTrue(decoder.get("q_gating"), "qwen35 must have q_gating=True in decoder config")
+
+    def test_llama_no_q_gating(self):
+        """llama does not use gated queries – must not have q_gating in config."""
+        cfg = self._cfg_for_arch("llama")
+        decoder = cfg.get("decoder", {})
+        self.assertFalse(decoder.get("q_gating", False))
+
+    def test_qwen3_no_q_gating(self):
+        """qwen3 does not use gated queries (only qwen35 does) – must not have q_gating."""
+        cfg = self._cfg_for_arch("qwen3")
+        decoder = cfg.get("decoder", {})
+        self.assertFalse(decoder.get("q_gating", False))
+
     def test_qk_norm_in_saved_config_json(self):
         """After a full conversion the config.json decoder section must include
         query_norm and key_norm for qwen35 models."""
