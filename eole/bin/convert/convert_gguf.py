@@ -179,8 +179,10 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_a.weight": "linear_attn.A_log",   # alternative naming in some GGUF files
     # ssm_alpha.weight / ssm_beta.weight are the in_proj_a / in_proj_b linear
     # projections.  gguf-python reverses GGUF ne when creating tensor.data, so
-    # the numpy array already has shape (out_features, in_features) matching the
-    # standard PyTorch/HF convention – no transposition is needed.
+    # the numpy array has shape (out_features, in_features) matching the
+    # standard PyTorch/HF convention.  However, llama.cpp _LinearAttentionVReorderBase
+    # reorders V heads to tiled order when num_k_heads != num_v_heads; we undo
+    # that in build_safetensors via _inverse_v_head_reorder_rows.
     "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
     "ssm_beta.weight": "linear_attn.in_proj_b.weight",
     "ssm_conv1d.weight": "linear_attn.conv1d.weight",
@@ -190,6 +192,96 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_out.weight": "linear_attn.out_proj.weight",
 }
 
+# ---------------------------------------------------------------------------
+# V-head reordering helpers
+# ---------------------------------------------------------------------------
+#
+# llama.cpp's _LinearAttentionVReorderBase (used for Qwen3.5 / Qwen3.5-MoE)
+# reorders V heads from **grouped-by-K-head** order (HF convention) to
+# **tiled** order when writing GGUF:
+#
+#   HF   grouped: [K0v0, K0v1, …, K0v{r-1},  K1v0, K1v1, …]
+#   GGUF   tiled: [K0v0, K1v0, …, Kn v0,    K0v1, K1v1, …]
+#   (r = num_v_per_k = num_v_heads // num_k_heads)
+#
+# This only applies when num_k_heads != num_v_heads.  Our reverse converter
+# must undo this reordering (tiled → grouped) so the weights match the format
+# that eole's GatedDeltaNet module expects (identical to HF convention).
+#
+# References:
+#   https://github.com/ggml-org/llama.cpp/blob/master/convert_hf_to_gguf.py
+#   class _LinearAttentionVReorderBase
+
+
+def _inverse_v_head_reorder_1d(
+    t: "torch.Tensor", num_k_heads: int, num_v_per_k: int
+) -> "torch.Tensor":
+    """Inverse V-head reordering for 1D tensors (A_log, dt_bias).
+
+    Converts tiled order ``[K0v0, K1v0, …, K0v1, K1v1, …]`` back to grouped
+    order ``[K0v0, K0v1, …, K1v0, K1v1, …]``.
+    """
+    if num_v_per_k <= 1:
+        return t
+    num_v_heads = num_k_heads * num_v_per_k
+    return (
+        t.view(num_v_per_k, num_k_heads)
+        .permute(1, 0)
+        .contiguous()
+        .view(num_v_heads)
+    )
+
+
+def _inverse_v_head_reorder_rows(
+    t: "torch.Tensor", num_k_heads: int, num_v_per_k: int, head_dim: int
+) -> "torch.Tensor":
+    """Inverse V-head row reordering for 2D tensors.
+
+    Works on both float tensors ``(total_rows, n_cols)`` and uint8 quantized
+    tensors ``(total_rows, bytes_per_row)`` where ``total_rows = num_v_heads *
+    head_dim``.
+
+    ``head_dim`` is:
+    * 1 for ``in_proj_a`` / ``in_proj_b`` (one scalar output per V head)
+    * ``head_v_dim`` for ``in_proj_z`` and the V-part of ``in_proj_qkv``
+    """
+    if num_v_per_k <= 1:
+        return t
+    num_v_heads = num_k_heads * num_v_per_k
+    total_rows, cols = t.shape
+    # Tiled layout stored in GGUF:  (num_v_per_k, num_k_heads, head_dim, cols)
+    # Target grouped layout (HF):   (num_k_heads, num_v_per_k, head_dim, cols)
+    t = t.view(num_v_per_k, num_k_heads, head_dim, cols)
+    t = t.permute(1, 0, 2, 3).contiguous()
+    t = t.view(total_rows, cols)
+    return t
+
+
+def _inverse_v_head_reorder_cols(
+    t: "torch.Tensor", num_k_heads: int, num_v_per_k: int
+) -> "torch.Tensor":
+    """Inverse V-head column reordering for 2D tensors (out_proj.weight).
+
+    Works on both float tensors ``(n_rows, total_cols)`` and uint8 tensors when
+    ``total_cols`` is divisible by ``num_v_heads`` (i.e. each V head's columns
+    are block-aligned, which holds when ``head_v_dim % 32 == 0``).
+    """
+    if num_v_per_k <= 1:
+        return t
+    num_v_heads = num_k_heads * num_v_per_k
+    n_rows, total_cols = t.shape
+    if total_cols % num_v_heads != 0:
+        raise ValueError(
+            f"Column count {total_cols} not divisible by num_v_heads={num_v_heads}; "
+            "cannot apply V-head column reordering"
+        )
+    cols_per_v_head = total_cols // num_v_heads
+    # Tiled: (n_rows, num_v_per_k, num_k_heads, cols_per_v_head)
+    # Grouped: (n_rows, num_k_heads, num_v_per_k, cols_per_v_head)
+    t = t.view(n_rows, num_v_per_k, num_k_heads, cols_per_v_head)
+    t = t.permute(0, 2, 1, 3).contiguous()
+    t = t.view(n_rows, total_cols)
+    return t
 
 
 def _gguf_to_eole_name(gguf_name: str, linear_blocks: frozenset = frozenset()) -> Optional[str]:
@@ -999,6 +1091,22 @@ def build_safetensors(
         else _MUST_DEQUANTIZE_NAMES_BASE
     )
 
+    # Compute V-head reordering parameters for linear-attention blocks.
+    # llama.cpp's _LinearAttentionVReorderBase reorders V heads from grouped
+    # (HF) to tiled order when writing GGUF files (only when num_k_heads !=
+    # num_v_heads, e.g. Qwen3.5-14B has num_k_heads=32, num_v_heads=64).
+    # We must apply the inverse transformation here.
+    _lin_cfg = _infer_linear_attn_config(meta, linear_blocks) if linear_blocks else {}
+    _num_k_heads = _lin_cfg.get("linear_num_key_heads", 0)
+    _num_v_heads = _lin_cfg.get("linear_num_value_heads", 0)
+    _head_v_dim = _lin_cfg.get("linear_value_head_dim", 0)
+    _head_k_dim = _lin_cfg.get("linear_key_head_dim", 0)
+    _needs_v_reorder = bool(
+        linear_blocks and _num_k_heads > 0 and _num_v_heads > 0
+        and _num_k_heads != _num_v_heads
+    )
+    _num_v_per_k = (_num_v_heads // _num_k_heads) if _num_k_heads > 0 else 1
+
     written: dict[str, torch.Tensor] = {}
 
     # Per-input-tensor accounting for the verbose summary.
@@ -1048,6 +1156,90 @@ def build_safetensors(
                     f"Tensor {gguf_name!r} (→ {eole_name!r}) is quantized "
                     f"({tensor.tensor_type.name}) and could not be dequantized: {exc}"
                 ) from exc
+
+        # -------------------------------------------------------------------
+        # Inverse V-head reordering for linear-attention blocks.
+        #
+        # llama.cpp's _LinearAttentionVReorderBase swaps V-head order from
+        # grouped (HF) to tiled when writing GGUF (only when num_k_heads !=
+        # num_v_heads).  We must undo that here.
+        #
+        # This works on both float tensors and uint8 quantized tensors:
+        # – Row reordering: simply reindex rows (or uint8 bytes-per-row).
+        # – Column reordering (out_proj): reindex column groups; requires the
+        #   columns to be divisible by num_v_heads (holds when head_v_dim%32==0,
+        #   which is always the case for standard Qwen3.5 heads).
+        # -------------------------------------------------------------------
+        if _needs_v_reorder:
+            m_blk = re.fullmatch(r"blk\.(\d+)\.(.*)", gguf_name)
+            if m_blk and int(m_blk.group(1)) in linear_blocks:
+                _blk_suffix = m_blk.group(2)
+                _qk_rows = _num_k_heads * _head_k_dim * 2
+
+                if _blk_suffix in ("ssm_a", "ssm_a.weight"):
+                    # A_log: 1D float tensor (num_v_heads,)
+                    if t.dim() == 1:
+                        t = _inverse_v_head_reorder_1d(t, _num_k_heads, _num_v_per_k)
+
+                elif _blk_suffix == "ssm_dt.bias":
+                    # dt_bias: 1D float tensor (num_v_heads,)
+                    if t.dim() == 1:
+                        t = _inverse_v_head_reorder_1d(t, _num_k_heads, _num_v_per_k)
+
+                elif _blk_suffix in ("ssm_alpha.weight", "ssm_beta.weight"):
+                    # in_proj_a / in_proj_b: (num_v_heads, hidden), head_dim=1
+                    if t.dim() == 2:
+                        t = _inverse_v_head_reorder_rows(t, _num_k_heads, _num_v_per_k, 1)
+
+                elif _blk_suffix == "attn_gate.weight":
+                    # in_proj_z: (num_v_heads * head_v_dim, hidden)
+                    if t.dim() == 2:
+                        t = _inverse_v_head_reorder_rows(
+                            t, _num_k_heads, _num_v_per_k, _head_v_dim
+                        )
+
+                elif _blk_suffix == "attn_qkv.weight":
+                    # in_proj_qkv: rows = Q+K (grouped, no reorder) + V (tiled)
+                    # Only the V-part rows need to be reordered.
+                    if t.dim() == 2 and t.shape[0] > _qk_rows:
+                        qk_part = t[:_qk_rows]
+                        v_part = t[_qk_rows:]
+                        v_part = _inverse_v_head_reorder_rows(
+                            v_part, _num_k_heads, _num_v_per_k, _head_v_dim
+                        )
+                        t = torch.cat([qk_part, v_part], dim=0)
+
+                elif _blk_suffix == "ssm_out.weight":
+                    # out_proj: (hidden, num_v_heads * head_v_dim) – column reorder
+                    if t.dim() == 2:
+                        try:
+                            t = _inverse_v_head_reorder_cols(
+                                t, _num_k_heads, _num_v_per_k
+                            )
+                        except ValueError:
+                            # Fallback: dequantize, reorder, keep as float.
+                            if qtype_t is not None:
+                                import numpy as _np2
+                                from gguf.quants import dequantize as _gguf_dq2
+                                dq2 = _gguf_dq2(tensor.data, tensor.tensor_type)
+                                t = torch.from_numpy(_np2.array(dq2, copy=True)).to(
+                                    target_dtype
+                                )
+                                qtype_t = None
+                            t = _inverse_v_head_reorder_cols(
+                                t, _num_k_heads, _num_v_per_k
+                            )
+
+                elif _blk_suffix == "ssm_conv1d.weight":
+                    # conv1d: (conv_dim, kernel_size) – only V channels need reorder.
+                    # Note: the unsqueeze(1) happens AFTER this block.
+                    if t.dim() == 2 and t.shape[0] > _qk_rows:
+                        qk_ch = t[:_qk_rows]
+                        v_ch = t[_qk_rows:]
+                        v_ch = _inverse_v_head_reorder_rows(
+                            v_ch, _num_k_heads, _num_v_per_k, _head_v_dim
+                        )
+                        t = torch.cat([qk_ch, v_ch], dim=0)
 
         # Conv1d weights: the gguf reader reverses GGUF ne, so data arrives as
         # (conv_dim, kernel_size) – i.e. shape[0]=kernel_size, shape[1]=conv_dim

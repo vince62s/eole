@@ -1742,6 +1742,371 @@ class TestGGUFHybridConverter(unittest.TestCase):
         self.assertIn("out_proj", ql)
 
 
+class TestGGUFVHeadReorderValues(unittest.TestCase):
+    """Verify that the inverse V-head reordering produces HF-convention tensors.
+
+    llama.cpp's _LinearAttentionVReorderBase reorders V heads from
+    grouped-by-K-head (HF) order to tiled order when writing GGUF files
+    (only when num_k_heads != num_v_heads).  This test writes tensors in
+    the GGUF tiled order and verifies that the converter restores them to
+    the HF grouped order.
+
+    Model dimensions:
+        hidden_size = 64
+        num_k_heads = 2, num_v_heads = 4  →  num_v_per_k = 2
+        head_v_dim = 16  →  value_dim = 64
+        head_k_dim = 16  →  key_dim = 32
+        conv_dim = key_dim*2 + value_dim = 64 + 64 = 128
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _require("gguf")
+        _require("numpy")
+        _require("safetensors")
+
+        import numpy as np
+        from gguf import GGUFWriter
+
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.gguf_path = os.path.join(cls.tmpdir, "vhead.gguf")
+        cls.output_dir = os.path.join(cls.tmpdir, "vhead_out")
+
+        hidden = 64
+        num_heads, heads_kv, n_vocab = 4, 2, 32
+        num_v_heads, head_v_dim = 4, 16   # value_dim = 64
+        num_k_heads, head_k_dim = 2, 16   # key_dim = 32, num_v_per_k = 2
+        conv_dim = num_k_heads * head_k_dim * 2 + num_v_heads * head_v_dim  # 128
+        kernel_size = 4
+        ff = 128
+
+        # --- HF grouped-order reference values ----------------------------
+        # Row / element index encodes the V-head identity so we can check
+        # that reordering is undone:
+        #   HF grouped:  [K0v0, K0v1, K1v0, K1v1]  indices [0, 1, 2, 3]
+        #   GGUF tiled:  [K0v0, K1v0, K0v1, K1v1]  indices [0, 2, 1, 3]
+
+        def _mk_grouped(nrows, ncols, *, scalar=True):
+            """Return (grouped_arr, tiled_arr) with marker values."""
+            if scalar:
+                # 1-D: element i = float(i)
+                grouped = np.arange(nrows, dtype=np.float32)
+                # tiled: permute rows (num_v_per_k=2, num_k_heads=2) → swap
+                tiled = grouped.reshape(num_v_per_k, num_k_heads).T.reshape(nrows)
+            else:
+                # 2-D: row i filled with float(i)
+                grouped = np.tile(np.arange(nrows, dtype=np.float32)[:, None], (1, ncols))
+                tiled = grouped.reshape(num_v_per_k, num_k_heads, ncols)
+                tiled = tiled.transpose(1, 0, 2).reshape(nrows, ncols)
+            return grouped, tiled
+
+        num_v_per_k = num_v_heads // num_k_heads   # 2
+
+        # 1-D ssm_a  (A_log): shape (num_v_heads,) = (4,)
+        a_log_grp, a_log_tld = _mk_grouped(num_v_heads, 0, scalar=True)
+        # 1-D dt_bias: shape (num_v_heads,) = (4,)
+        dt_bias_grp, dt_bias_tld = _mk_grouped(num_v_heads, 0, scalar=True)
+
+        # 2-D ssm_alpha (in_proj_a): shape (num_v_heads, hidden) = (4, 64)
+        alpha_grp, alpha_tld = _mk_grouped(num_v_heads, hidden, scalar=False)
+        # 2-D ssm_beta  (in_proj_b): shape (num_v_heads, hidden) = (4, 64)
+        beta_grp, beta_tld = _mk_grouped(num_v_heads, hidden, scalar=False)
+
+        # 2-D attn_gate (in_proj_z): shape (num_v_heads*head_v_dim, hidden)
+        # Each "V-head block" is head_v_dim consecutive rows, all with the
+        # same marker (so we can check that entire blocks are moved together).
+        attn_gate_grp = np.tile(
+            np.repeat(np.arange(num_v_heads, dtype=np.float32), head_v_dim)[:, None],
+            (1, hidden),
+        )
+        # tiled order: swap k-head and v-per-k groups
+        attn_gate_tld = attn_gate_grp.reshape(
+            num_v_per_k, num_k_heads, head_v_dim, hidden
+        ).transpose(1, 0, 2, 3).reshape(num_v_heads * head_v_dim, hidden)
+
+        # 2-D attn_qkv (in_proj_qkv):
+        #   QK rows (first key_dim*2 rows): marker = -1 (unchanged)
+        #   V  rows (next  value_dim rows): tiled like attn_gate
+        qk_rows = num_k_heads * head_k_dim * 2   # 64
+        qk_part = np.full((qk_rows, hidden), -1.0, dtype=np.float32)
+        v_part_grp = attn_gate_grp.copy()
+        v_part_tld = attn_gate_tld.copy()
+        attn_qkv_grp = np.concatenate([qk_part, v_part_grp], axis=0)  # (128, 64)
+        attn_qkv_tld = np.concatenate([qk_part, v_part_tld], axis=0)  # (128, 64)
+
+        # 2-D ssm_out (out_proj): shape (hidden, value_dim) = (64, 64)
+        # Column groups (each head_v_dim=16 cols) carry marker float(i).
+        # HF grouped: col groups in order [K0v0, K0v1, K1v0, K1v1]
+        out_grp = np.tile(
+            np.repeat(np.arange(num_v_heads, dtype=np.float32), head_v_dim)[None, :],
+            (hidden, 1),
+        )
+        # GGUF tiled: col groups in order [K0v0, K1v0, K0v1, K1v1]
+        out_tld = out_grp.reshape(
+            hidden, num_v_per_k, num_k_heads, head_v_dim
+        ).transpose(0, 2, 1, 3).reshape(hidden, num_v_heads * head_v_dim)
+
+        # store grouped references for assertions
+        cls.a_log_grp = a_log_grp
+        cls.dt_bias_grp = dt_bias_grp
+        cls.alpha_grp = alpha_grp
+        cls.beta_grp = beta_grp
+        cls.attn_gate_grp = attn_gate_grp
+        cls.attn_qkv_grp = attn_qkv_grp
+        cls.out_grp = out_grp
+
+        writer = GGUFWriter(cls.gguf_path, "qwen35")
+        writer.add_block_count(1)
+        writer.add_context_length(128)
+        writer.add_embedding_length(hidden)
+        writer.add_feed_forward_length(ff)
+        writer.add_head_count(num_heads)
+        writer.add_head_count_kv(heads_kv)
+        writer.add_layer_norm_rms_eps(1e-5)
+        writer.add_rope_freq_base(10000.0)
+        writer.add_vocab_size(n_vocab)
+        writer.add_token_list([str(i) for i in range(n_vocab)])
+        writer.add_bos_token_id(1)
+        writer.add_eos_token_id(2)
+
+        writer.add_tensor("token_embd.weight", np.zeros((n_vocab, hidden), dtype=np.float32))
+        writer.add_tensor("output_norm.weight", np.ones(hidden, dtype=np.float32))
+
+        # blk.0: linear attention block – all tensors in GGUF tiled order
+        writer.add_tensor("blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32))
+        writer.add_tensor("blk.0.post_attention_norm.weight", np.ones(hidden, dtype=np.float32))
+        writer.add_tensor("blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
+
+        # Write linear-attn tensors in GGUF tiled order (as llama.cpp would)
+        writer.add_tensor("blk.0.ssm_a", a_log_tld)
+        writer.add_tensor("blk.0.ssm_dt.bias", dt_bias_tld)
+        writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32))
+        writer.add_tensor("blk.0.ssm_alpha.weight", alpha_tld.astype(np.float32))
+        writer.add_tensor("blk.0.ssm_beta.weight", beta_tld.astype(np.float32))
+        writer.add_tensor("blk.0.attn_gate.weight", attn_gate_tld.astype(np.float32))
+        writer.add_tensor("blk.0.attn_qkv.weight", attn_qkv_tld.astype(np.float32))
+        writer.add_tensor("blk.0.ssm_out.weight", out_tld.astype(np.float32))
+        writer.add_tensor(
+            "blk.0.ssm_conv1d.weight",
+            np.random.randn(conv_dim, kernel_size).astype(np.float32),
+        )
+        for suffix, shape in [
+            ("ffn_gate", (ff, hidden)),
+            ("ffn_up", (ff, hidden)),
+            ("ffn_down", (hidden, ff)),
+        ]:
+            writer.add_tensor(
+                f"blk.0.{suffix}.weight",
+                np.random.randn(*shape).astype(np.float32),
+            )
+
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _run_converter(self):
+        from argparse import Namespace
+        from eole.bin.convert.convert_gguf import GGUFConverter
+
+        args = Namespace(
+            gguf_path=self.gguf_path,
+            output=self.output_dir,
+            dtype="fp32",
+            tokenizer="hf",
+            hf_tokenizer=None,
+        )
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+        GGUFConverter.run(args)
+
+    def _tensors(self):
+        import safetensors.torch
+        return safetensors.torch.load_file(
+            os.path.join(self.output_dir, "model.00.safetensors")
+        )
+
+    def _assert_close(self, actual, expected_np, msg=""):
+        import torch
+        import numpy as np
+        expected = torch.from_numpy(expected_np)
+        self.assertTrue(
+            torch.allclose(actual.float(), expected.float()),
+            f"{msg}\nExpected:\n{expected}\nGot:\n{actual}",
+        )
+
+    def test_a_log_inverse_reordered(self):
+        """ssm_a (A_log) values must be restored from tiled to grouped order."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.A_log"
+        self.assertIn(key, tensors)
+        self._assert_close(tensors[key], self.a_log_grp, msg="A_log tiled→grouped")
+
+    def test_dt_bias_inverse_reordered(self):
+        """ssm_dt.bias values must be restored from tiled to grouped order."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.dt_bias"
+        self.assertIn(key, tensors)
+        self._assert_close(tensors[key], self.dt_bias_grp, msg="dt_bias tiled→grouped")
+
+    def test_ssm_alpha_inverse_reordered(self):
+        """ssm_alpha.weight (in_proj_a) rows must be restored from tiled to grouped."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_a.weight"
+        self.assertIn(key, tensors)
+        self._assert_close(tensors[key], self.alpha_grp, msg="in_proj_a tiled→grouped")
+
+    def test_ssm_beta_inverse_reordered(self):
+        """ssm_beta.weight (in_proj_b) rows must be restored from tiled to grouped."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_b.weight"
+        self.assertIn(key, tensors)
+        self._assert_close(tensors[key], self.beta_grp, msg="in_proj_b tiled→grouped")
+
+    def test_attn_gate_inverse_reordered(self):
+        """attn_gate.weight (in_proj_z) V-head blocks restored from tiled to grouped."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_z.weight"
+        self.assertIn(key, tensors)
+        self._assert_close(tensors[key], self.attn_gate_grp, msg="in_proj_z tiled→grouped")
+
+    def test_attn_qkv_v_part_inverse_reordered(self):
+        """attn_qkv.weight: QK rows unchanged, V rows restored from tiled to grouped."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.in_proj_qkv.weight"
+        self.assertIn(key, tensors)
+        self._assert_close(tensors[key], self.attn_qkv_grp, msg="in_proj_qkv tiled→grouped")
+
+    def test_ssm_out_col_inverse_reordered(self):
+        """ssm_out.weight (out_proj) column groups restored from tiled to grouped."""
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.out_proj.weight"
+        self.assertIn(key, tensors)
+        self._assert_close(tensors[key], self.out_grp, msg="out_proj tiled→grouped")
+
+
+class TestGGUFVHeadReorderHelpers(unittest.TestCase):
+    """Unit tests for the _inverse_v_head_reorder_* helper functions."""
+
+    def setUp(self):
+        _require("torch")
+
+    def _make_grouped(self, num_k_heads, num_v_per_k, head_dim, extra_dim):
+        """Create a grouped (HF-convention) tensor with identifiable row markers."""
+        import torch
+        num_v_heads = num_k_heads * num_v_per_k
+        total = num_v_heads * head_dim
+        # row i filled with float(i // head_dim) so we can trace V-head blocks
+        t = torch.zeros(total, extra_dim)
+        for i in range(total):
+            t[i] = float(i // head_dim)
+        return t
+
+    def _apply_fwd_row(self, t, num_k_heads, num_v_per_k, head_dim):
+        """Forward (HF grouped → GGUF tiled) for row-type tensors."""
+        import torch
+        total, cols = t.shape
+        t = t.view(num_k_heads, num_v_per_k, head_dim, cols)
+        t = t.permute(1, 0, 2, 3).contiguous()
+        t = t.view(total, cols)
+        return t
+
+    def _apply_fwd_col(self, t, num_k_heads, num_v_per_k):
+        """Forward (HF grouped → GGUF tiled) for column-type tensors (out_proj)."""
+        import torch
+        n_rows, total_cols = t.shape
+        num_v_heads = num_k_heads * num_v_per_k
+        cols_per_v_head = total_cols // num_v_heads
+        t = t.view(n_rows, num_k_heads, num_v_per_k, cols_per_v_head)
+        t = t.permute(0, 2, 1, 3).contiguous()
+        t = t.view(n_rows, total_cols)
+        return t
+
+    def test_inverse_row_reorder_1_head_dim(self):
+        """Roundtrip: fwd(grouped) → inv(tiled) = grouped, head_dim=1."""
+        import torch
+        from eole.bin.convert.convert_gguf import _inverse_v_head_reorder_rows
+        nk, nr, hd = 3, 2, 1
+        grouped = self._make_grouped(nk, nr, hd, 32)
+        tiled = self._apply_fwd_row(grouped, nk, nr, hd)
+        restored = _inverse_v_head_reorder_rows(tiled, nk, nr, hd)
+        self.assertTrue(
+            torch.allclose(restored, grouped),
+            "Roundtrip failed for head_dim=1",
+        )
+
+    def test_inverse_row_reorder_head_dim_gt1(self):
+        """Roundtrip: fwd(grouped) → inv(tiled) = grouped, head_dim=8."""
+        import torch
+        from eole.bin.convert.convert_gguf import _inverse_v_head_reorder_rows
+        nk, nr, hd = 2, 3, 8
+        grouped = self._make_grouped(nk, nr, hd, 64)
+        tiled = self._apply_fwd_row(grouped, nk, nr, hd)
+        restored = _inverse_v_head_reorder_rows(tiled, nk, nr, hd)
+        self.assertTrue(
+            torch.allclose(restored, grouped),
+            "Roundtrip failed for head_dim=8",
+        )
+
+    def test_inverse_col_reorder(self):
+        """Roundtrip for column reordering (out_proj)."""
+        import torch
+        from eole.bin.convert.convert_gguf import _inverse_v_head_reorder_cols
+        nk, nr = 2, 3
+        num_v_heads = nk * nr
+        # (hidden, value_dim): each column group has a distinct marker
+        grouped = torch.zeros(16, num_v_heads * 8)
+        for i in range(num_v_heads):
+            grouped[:, i * 8: (i + 1) * 8] = float(i)
+        tiled = self._apply_fwd_col(grouped, nk, nr)
+        restored = _inverse_v_head_reorder_cols(tiled, nk, nr)
+        self.assertTrue(
+            torch.allclose(restored, grouped),
+            "Column roundtrip failed",
+        )
+
+    def test_inverse_1d_reorder(self):
+        """Roundtrip for 1D tensors (A_log, dt_bias)."""
+        import torch
+        from eole.bin.convert.convert_gguf import _inverse_v_head_reorder_1d
+        nk, nr = 2, 3
+        num_v_heads = nk * nr
+        # grouped: [K0v0, K0v1, K0v2, K1v0, K1v1, K1v2]
+        grouped = torch.arange(num_v_heads, dtype=torch.float32)
+        # tiled: [K0v0, K1v0, K0v1, K1v1, K0v2, K1v2]
+        tiled = grouped.view(nk, nr).t().contiguous().view(num_v_heads)
+        restored = _inverse_v_head_reorder_1d(tiled, nk, nr)
+        self.assertTrue(
+            torch.allclose(restored, grouped),
+            "1D roundtrip failed",
+        )
+
+    def test_noop_when_v_per_k_is_1(self):
+        """When num_v_per_k=1, reordering is a no-op."""
+        import torch
+        from eole.bin.convert.convert_gguf import (
+            _inverse_v_head_reorder_rows,
+            _inverse_v_head_reorder_cols,
+            _inverse_v_head_reorder_1d,
+        )
+        t2 = torch.randn(8, 32)
+        self.assertTrue(torch.equal(_inverse_v_head_reorder_rows(t2, 8, 1, 1), t2))
+        t1 = torch.randn(8)
+        self.assertTrue(torch.equal(_inverse_v_head_reorder_1d(t1, 8, 1), t1))
+        tc = torch.randn(16, 64)
+        self.assertTrue(torch.equal(_inverse_v_head_reorder_cols(tc, 8, 1), tc))
+
+
 class TestGGUFMmprojConverter(unittest.TestCase):
     """Test conversion of a clip mmproj GGUF (vision encoder) file."""
 
