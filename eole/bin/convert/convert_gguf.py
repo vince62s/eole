@@ -578,8 +578,19 @@ _Q_GATING_ARCHS = frozenset("qwen35".split())
 # weight).  Must match HF_mappings.LN_TABLE.
 _GEMMA_RMS_ARCHS = frozenset("gemma2 gemma3 qwen35 qwen35moe".split())
 # Architectures that use MRoPE (multi-dimensional rotary positional encoding)
-# and require rotary_interleave=True in the EOLE rope_config.
-_MROPE_INTERLEAVE_ARCHS = frozenset("qwen35 qwen35moe qwen2vl qwen3vl qwen3vlmoe".split())
+# with interleaved rotation and therefore require rotary_interleave=True in
+# the EOLE rope_config.
+#
+# Only *vision-language* architectures are listed here: their GGUF arch names
+# are unambiguously VL models and always carry mrope_interleaved=True in the
+# corresponding HF config.
+#
+# qwen35 / qwen35moe are intentionally *not* in this set: those arch names are
+# shared between text-only models (no MRoPE) and the text-decoder portion of
+# Qwen3.5-VL GGUF files (which does use MRoPE).  For qwen35/qwen35moe we
+# detect the VL case via the presence of rope.dimension_sections metadata
+# (set only in VL models) and handle it conditionally in build_model_config.
+_MROPE_INTERLEAVE_ARCHS = frozenset("qwen2vl qwen3vl qwen3vlmoe".split())
 
 
 def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
@@ -667,7 +678,12 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
         model_config["rope_config"]["xdrope_section"] = rope_dim_sections
 
     # Architectures that use interleaved MRoPE (mrope_interleaved=True in HF config).
-    if arch in _MROPE_INTERLEAVE_ARCHS:
+    # For always-VL archs (qwen2vl, qwen3vl, qwen3vlmoe) interleaving is always on.
+    # For qwen35/qwen35moe the arch name is shared between text-only and VL; we detect
+    # the VL case by the presence of rope.dimension_sections (absent in text-only GGUF).
+    if arch in _MROPE_INTERLEAVE_ARCHS or (
+        arch in ("qwen35", "qwen35moe") and rope_dim_sections is not None
+    ):
         model_config["rope_config"]["rotary_interleave"] = True
 
     # Rope scaling (e.g. yarn, linear) from GGUF rope.scaling.* metadata.
