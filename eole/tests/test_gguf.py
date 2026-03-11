@@ -1209,6 +1209,70 @@ class TestGGUFArchSets(unittest.TestCase):
 
         self.assertIn("qwen35", _SWIGLU_ARCHS)
 
+    def test_qwen35_in_mrope_interleave_archs(self):
+        """qwen35 is a VL model that always uses interleaved MRoPE."""
+        from eole.bin.convert.convert_gguf import _MROPE_INTERLEAVE_ARCHS
+
+        self.assertIn("qwen35", _MROPE_INTERLEAVE_ARCHS)
+
+    def test_qwen35moe_in_mrope_interleave_archs(self):
+        """qwen35moe is a VL model that always uses interleaved MRoPE."""
+        from eole.bin.convert.convert_gguf import _MROPE_INTERLEAVE_ARCHS
+
+        self.assertIn("qwen35moe", _MROPE_INTERLEAVE_ARCHS)
+
+    def test_rope_dim_sections_strips_trailing_zeros(self):
+        """rope_dim_sections must strip GGUF null-padding zeros.
+
+        The Qwen3.5-9B GGUF stores ``qwen35.rope.dimension_sections`` as
+        ``[11, 11, 10, 0]`` (4 elements) instead of the expected 3-element
+        ``[11, 11, 10]`` that matches HF's mrope_section.  The trailing
+        zero must be stripped so that xdrope_section has exactly 3 elements
+        for correct T/H/W position-ID indexing in apply_rotary_pos_emb_xdrope.
+        """
+        _require("numpy")
+        import tempfile
+        import numpy as np
+        from gguf import GGUFWriter
+        from eole.bin.convert.convert_gguf import GGUFMetadata, build_model_config
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "qwen35_rope.gguf")
+            w = GGUFWriter(path, "qwen35")
+            w.add_block_count(1)
+            w.add_embedding_length(64)
+            w.add_feed_forward_length(128)
+            w.add_head_count(4)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_rope_freq_base(1000000.0)
+            w.add_vocab_size(8)
+            w.add_token_list([str(i) for i in range(8)])
+            # Write rope.dimension_sections with a trailing zero (as seen in
+            # real Qwen3.5-9B GGUF files).
+            try:
+                w.add_array("qwen35.rope.dimension_sections", [11, 11, 10, 0])
+            except (AttributeError, TypeError):
+                # Older gguf-py versions may not have add_array; skip gracefully.
+                raise unittest.SkipTest("GGUFWriter.add_array not supported in this gguf version")
+            w.add_tensor("token_embd.weight", np.zeros((8, 64), dtype=np.float16))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+            meta = GGUFMetadata(path)
+
+        sections = meta.rope_dim_sections
+        self.assertIsNotNone(sections, "rope_dim_sections should not be None")
+        self.assertEqual(sections, [11, 11, 10],
+                         "Trailing zero must be stripped: expected [11, 11, 10], "
+                         f"got {sections}")
+        # Verify build_model_config propagates the cleaned sections.
+        cfg = build_model_config(meta)
+        self.assertEqual(cfg["rope_config"].get("xdrope_section"), [11, 11, 10])
+        # qwen35 always gets rotary_interleave=True regardless of sections.
+        self.assertTrue(cfg["rope_config"].get("rotary_interleave"),
+                        "qwen35 must always have rotary_interleave=True")
+
     def test_llama_in_swiglu_archs(self):
         from eole.bin.convert.convert_gguf import _SWIGLU_ARCHS
 

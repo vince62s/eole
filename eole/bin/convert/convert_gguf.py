@@ -445,12 +445,22 @@ class GGUFMetadata:
         Present in Qwen3.5-VL and similar multi-modal models that apply
         different RoPE frequencies to each section of the head dimension.
         Maps to ``xdrope_section`` in the EOLE ``rope_config``.
+
+        GGUF arrays are sometimes padded with trailing zeros (e.g. the
+        Qwen3.5-9B GGUF stores ``[11, 11, 10, 0]`` instead of
+        ``[11, 11, 10]``).  Trailing zeros are stripped so that
+        ``xdrope_section`` matches the three-element T/H/W layout expected
+        by :func:`~eole.modules.rope.apply_rotary_pos_emb_xdrope`.
         """
         field = self._get_field(self._a("{arch}.rope.dimension_sections"))
         if field is None:
             return None
         try:
-            return field.parts[field.data[-1]].tolist()
+            sections = field.parts[field.data[-1]].tolist()
+            # Strip trailing zeros (GGUF null-padding artefact).
+            while sections and sections[-1] == 0:
+                sections.pop()
+            return sections if sections else None
         except Exception:
             return None
 
@@ -581,16 +591,13 @@ _GEMMA_RMS_ARCHS = frozenset("gemma2 gemma3 qwen35 qwen35moe".split())
 # with interleaved rotation and therefore require rotary_interleave=True in
 # the EOLE rope_config.
 #
-# Only *vision-language* architectures are listed here: their GGUF arch names
-# are unambiguously VL models and always carry mrope_interleaved=True in the
-# corresponding HF config.
-#
-# qwen35 / qwen35moe are intentionally *not* in this set: those arch names are
-# shared between text-only models (no MRoPE) and the text-decoder portion of
-# Qwen3.5-VL GGUF files (which does use MRoPE).  For qwen35/qwen35moe we
-# detect the VL case via the presence of rope.dimension_sections metadata
-# (set only in VL models) and handle it conditionally in build_model_config.
-_MROPE_INTERLEAVE_ARCHS = frozenset("qwen2vl qwen3vl qwen3vlmoe".split())
+# qwen35 / qwen35moe are vision-language models whose text decoder always uses
+# the interleaved MRoPE defined in Qwen3_5TextRotaryEmbedding.apply_interleaved_mrope
+# (see transformers/models/qwen3_5/modeling_qwen3_5.py).  Even in text-only
+# inference, position_ids are expanded to 3 dimensions and the interleaved
+# layout is applied — so rotary_interleave=True must be set for all qwen35 GGUF
+# files, regardless of whether rope.dimension_sections metadata is present.
+_MROPE_INTERLEAVE_ARCHS = frozenset("qwen35 qwen35moe qwen2vl qwen3vl qwen3vlmoe".split())
 
 
 def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
@@ -678,12 +685,7 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
         model_config["rope_config"]["xdrope_section"] = rope_dim_sections
 
     # Architectures that use interleaved MRoPE (mrope_interleaved=True in HF config).
-    # For always-VL archs (qwen2vl, qwen3vl, qwen3vlmoe) interleaving is always on.
-    # For qwen35/qwen35moe the arch name is shared between text-only and VL; we detect
-    # the VL case by the presence of rope.dimension_sections (absent in text-only GGUF).
-    if arch in _MROPE_INTERLEAVE_ARCHS or (
-        arch in ("qwen35", "qwen35moe") and rope_dim_sections is not None
-    ):
+    if arch in _MROPE_INTERLEAVE_ARCHS:
         model_config["rope_config"]["rotary_interleave"] = True
 
     # Rope scaling (e.g. yarn, linear) from GGUF rope.scaling.* metadata.
