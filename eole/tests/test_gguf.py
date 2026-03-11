@@ -1535,7 +1535,9 @@ class TestGGUFHybridConverter(unittest.TestCase):
         # Use -1.0 (valid negative value: log(-(-1)) = log(1) = 0).
         writer.add_tensor("blk.0.ssm_a", -np.ones(num_v_heads, dtype=np.float32))
         writer.add_tensor("blk.0.ssm_dt.bias", np.ones(num_v_heads, dtype=np.float32))
-        writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32))
+        # ssm_norm.weight: llama.cpp adds +1 to ALL norm.weight tensors (blanket match).
+        # Write 2.0 = HF original 1.0 + 1 (the converter must subtract 1 → 1.0).
+        writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32) + 1.0)
         writer.add_tensor(
             "blk.0.ssm_conv1d.weight",
             # Real GGUF (llama.cpp): stored as (conv_dim, kernel_size); the gguf
@@ -1921,8 +1923,11 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
         # converter can invert both the V-head reorder and the -exp transform.
         writer.add_tensor("blk.0.ssm_a", ssm_a_tld)
         writer.add_tensor("blk.0.ssm_dt.bias", dt_bias_tld)
-        # ssm_norm.weight is NOT subject to the +1 shift (excluded by llama.cpp)
-        writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32))
+        # ssm_norm.weight: llama.cpp adds +1 to ALL norm.weight tensors (blanket
+        # match), including ssm_norm.weight.  Write 2.0 to simulate llama.cpp
+        # storing HF's original 1.0 + 1 = 2.0.  The converter must subtract 1
+        # → restored value = 1.0 (identity scale for RMSNormGated).
+        writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32) + 1.0)
         writer.add_tensor("blk.0.ssm_alpha.weight", alpha_tld.astype(np.float32))
         writer.add_tensor("blk.0.ssm_beta.weight", beta_tld.astype(np.float32))
         writer.add_tensor("blk.0.attn_gate.weight", attn_gate_tld.astype(np.float32))
@@ -2063,12 +2068,15 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
             self.assertIn(name, tensors, f"Missing: {name}")
             self._assert_close(tensors[name], zeros, msg=f"{name} must be 0.0 after -1 correction")
 
-    def test_ssm_norm_weight_not_corrected(self):
-        """linear_attn.norm.weight must NOT have 1 subtracted.
+    def test_ssm_norm_weight_is_corrected(self):
+        """linear_attn.norm.weight must have 1 subtracted (same as all other norm weights).
 
-        llama.cpp explicitly excludes ssm_norm.weight (linear_attn.norm.weight)
-        from its +1 shift.  It maps to the plain RMSNormGated inside GatedDeltaNet,
-        not a GemmaRMSNorm.  The written value (1.0) must be preserved as-is.
+        llama.cpp uses a blanket ``if name.endswith("norm.weight")`` check that adds
+        +1 to ALL norm weights, including ssm_norm.weight (which maps to
+        linear_attn.norm.weight).  Although linear_attn.norm uses RMSNormGated
+        (not GemmaRMSNorm), the +1 is still present in the GGUF file and must be
+        reversed.  The test writes 2.0 (= HF's original 1.0 + llama.cpp's +1) and
+        expects the converter to restore 1.0.
         """
         import torch
         import numpy as np
@@ -2077,7 +2085,7 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
         key = "decoder.transformer_layers.0.linear_attn.norm.weight"
         self.assertIn(key, tensors)
         ones = np.ones(self.head_v_dim, dtype=np.float32)
-        self._assert_close(tensors[key], ones, msg="linear_attn.norm.weight must stay 1.0")
+        self._assert_close(tensors[key], ones, msg="linear_attn.norm.weight must be 1.0 after -1 correction")
 
 
 class TestGGUFVHeadReorderHelpers(unittest.TestCase):

@@ -1292,19 +1292,19 @@ def build_safetensors(
             t = torch.log(-t)
 
         # GemmaRMSNorm layernorm1p correction: for architectures in _GEMMA_RMS_ARCHS
-        # (gemma2, gemma3, qwen35, qwen35moe), llama.cpp adds +1 to all norm weights
-        # during HF→GGUF conversion so ggml's standard RMSNorm produces the same
-        # result as HF's layernorm1p (which stores weight as deviation from 1 and
-        # computes (1+weight)*x/rms(x)).  EOLE's GemmaRMSNorm also uses (1+weight),
-        # so the +1 would be applied twice.  Subtract 1 here to restore the
-        # "deviation-from-1" convention expected by GemmaRMSNorm.
-        # Exception: linear_attn.norm.weight is a plain RMSNormGated (not GemmaRMSNorm)
-        # and was explicitly excluded from the +1 by llama.cpp's Qwen3NextModel.
+        # (gemma2, gemma3, qwen35, qwen35moe), llama.cpp adds +1 to ALL norm weights
+        # (including ssm_norm.weight / linear_attn.norm.weight) during HF→GGUF
+        # conversion using a blanket `if name.endswith("norm.weight")` check.
+        # For regular attention norms (GemmaRMSNorm): EOLE uses (1+weight)*x/rms(x)
+        # while ggml uses weight*x/rms(x), so +1 is needed for ggml — we must undo
+        # it to restore the "deviation-from-1" convention expected by GemmaRMSNorm.
+        # For linear_attn.norm.weight (RMSNormGated): EOLE uses weight*x/rms(x),
+        # same as ggml, but llama.cpp still adds +1 (blanket match).  We must also
+        # subtract 1 here so that RMSNormGated loads the original HF scale factor.
         if (
             meta.arch in _GEMMA_RMS_ARCHS
             and qtype_t is None  # float tensors only; norm weights are never quantized
             and eole_name.endswith("norm.weight")
-            and not eole_name.endswith("linear_attn.norm.weight")
         ):
             t = t - 1.0
 
