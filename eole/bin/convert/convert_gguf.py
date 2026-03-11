@@ -178,11 +178,9 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_a": "linear_attn.A_log",          # log-scale A decay factor
     "ssm_a.weight": "linear_attn.A_log",   # alternative naming in some GGUF files
     # ssm_alpha.weight / ssm_beta.weight are the in_proj_a / in_proj_b linear
-    # projections.  In GGUF (Qwen3.5 / llama.cpp) these are stored transposed
-    # relative to the eole/HF convention: the GGUF tensor has ne[0]=out_features
-    # (the small dim, e.g. 32) instead of the standard ne[0]=in_features (4096).
-    # The same transposition applies to attn_qkv, attn_gate and ssm_out.
-    # They are handled by _LINEAR_ATTN_TRANSPOSE_EOLE_SUFFIXES below.
+    # projections.  gguf-python reverses GGUF ne when creating tensor.data, so
+    # the numpy array already has shape (out_features, in_features) matching the
+    # standard PyTorch/HF convention – no transposition is needed.
     "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
     "ssm_beta.weight": "linear_attn.in_proj_b.weight",
     "ssm_conv1d.weight": "linear_attn.conv1d.weight",
@@ -192,18 +190,6 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_out.weight": "linear_attn.out_proj.weight",
 }
 
-# EOLE tensor-name suffixes whose data is stored *transposed* in GGUF files
-# produced by llama.cpp for hybrid (GatedDeltaNet) models.
-# When one of these suffixes is detected the converter dequantizes the tensor
-# (if quantized) and transposes it so that the on-disk layout matches the
-# [out_features, in_features] convention expected by nn.Linear / GGUFLinear.
-_LINEAR_ATTN_TRANSPOSE_EOLE_SUFFIXES: frozenset[str] = frozenset({
-    "linear_attn.in_proj_a.weight",
-    "linear_attn.in_proj_b.weight",
-    "linear_attn.in_proj_qkv.weight",
-    "linear_attn.in_proj_z.weight",
-    "linear_attn.out_proj.weight",
-})
 
 
 def _gguf_to_eole_name(gguf_name: str, linear_blocks: frozenset = frozenset()) -> Optional[str]:
@@ -1063,38 +1049,6 @@ def build_safetensors(
                     f"({tensor.tensor_type.name}) and could not be dequantized: {exc}"
                 ) from exc
 
-        # Linear-attention weights (in_proj_a/b, in_proj_qkv, in_proj_z, out_proj)
-        # are stored *transposed* in GGUF files produced by llama.cpp for hybrid
-        # (GatedDeltaNet / Qwen3.5) models: the GGUF ne[0] corresponds to the
-        # out_features dimension instead of the usual in_features, so gguf-python
-        # returns data with shape (in_features, ...) rather than (out_features, ...).
-        # Dequantize (if still quantised) and transpose to restore [out, in] order.
-        _needs_transpose = any(
-            eole_name.endswith(sfx)
-            for sfx in _LINEAR_ATTN_TRANSPOSE_EOLE_SUFFIXES
-        )
-        if _needs_transpose:
-            if qtype_t is not None:
-                # Must dequantize before transposing – raw quantised blocks cannot
-                # be transposed in-place because the block structure encodes rows.
-                orig_bytes = tensor.data.nbytes
-                try:
-                    import numpy as _np
-                    from gguf.quants import dequantize as _gguf_dequantize
-                    dq = _gguf_dequantize(tensor.data, tensor.tensor_type)
-                    t = torch.from_numpy(_np.array(dq, copy=True)).to(target_dtype)
-                    qtype_t = None
-                    dequant_overhead_bytes += t.nbytes - orig_bytes
-                    n_dequant_weight += 1
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Tensor {gguf_name!r} (→ {eole_name!r}) is quantized "
-                        f"({tensor.tensor_type.name}) and could not be dequantized "
-                        f"for transposition: {exc}"
-                    ) from exc
-            if t.dim() == 2:
-                t = t.T.contiguous()
-
         # Conv1d weights: the gguf reader reverses GGUF ne, so data arrives as
         # (conv_dim, kernel_size) – i.e. shape[0]=kernel_size, shape[1]=conv_dim
         # in tensor.shape, but data.shape=(conv_dim, kernel_size) in NumPy order.
@@ -1815,13 +1769,7 @@ class GGUFConverter(BaseBin):
         ]
         if linear_blocks:
             # GatedDeltaNet linear layers that may carry quantised weights.
-            # Note: in_proj_a, in_proj_b, in_proj_qkv, in_proj_z and out_proj
-            # are dequantised and transposed during conversion (they are stored
-            # transposed in GGUF relative to the eole/PyTorch convention) and
-            # therefore end up as plain float tensors – NOT GGUFLinear buffers.
-            # Do NOT add them to quant_layers_all to avoid GGUFLinear being
-            # instantiated for modules that carry plain float weights.
-            pass
+            quant_layers_all += ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]
         if clip_meta is None:
             # Plain text model: replace_gguf_linear targets the whole model
             # (quant_target = self), so self.generator is reachable and can be

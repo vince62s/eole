@@ -1516,7 +1516,7 @@ class TestGGUFHybridConverter(unittest.TestCase):
         # which is larger than our synthetic hidden=64 / conv_dim=128 dimensions)
         writer.add_tensor(
             "blk.0.attn_qkv.weight",
-            np.random.randn(hidden, conv_dim).astype(np.float32),
+            np.random.randn(conv_dim, hidden).astype(np.float32),
             raw_dtype=GGMLQuantizationType.Q8_0,
         )
         writer.add_tensor(
@@ -1535,23 +1535,19 @@ class TestGGUFHybridConverter(unittest.TestCase):
             # data.shape=(conv_dim, kernel_size) in NumPy order.
             np.random.randn(conv_dim, kernel_size).astype(np.float32),
         )
-        # ssm_alpha / ssm_beta: in real Qwen3.5 GGUFs these are stored *transposed*
-        # relative to the eole/PyTorch convention.  The GGUF ne[0] (innermost dim)
-        # is the out_features dimension (num_v_heads), not in_features (hidden).
-        # We simulate that here by writing numpy arrays with shape (hidden, num_v_heads)
-        # so that the GGUF ne = (num_v_heads, hidden) → ne[0]=num_v_heads (fast dim).
-        # Using F32 avoids the Q8_0 block_size=32 constraint on the innermost dim
-        # when num_v_heads < 32.
-        # The converter must dequantize (no-op for F32) and transpose these tensors.
+        # ssm_alpha / ssm_beta: in_proj_a / in_proj_b projections.
+        # gguf-python reverses GGUF ne when creating tensor.data, so the data
+        # arrives with shape (out_features, in_features) = (num_v_heads, hidden).
+        # Write numpy arrays in (out, in) = (num_v_heads, hidden) order, which is
+        # how llama.cpp stores them.  No transposition is needed in the converter.
+        # Using F32 keeps the test simple (avoids Q8_0 block-size constraints).
         writer.add_tensor(
             "blk.0.ssm_alpha.weight",
-            # Transposed storage: shape (hidden, num_v_heads) = (in, out) convention
-            np.random.randn(hidden, num_v_heads).astype(np.float32),
+            np.random.randn(num_v_heads, hidden).astype(np.float32),
         )
         writer.add_tensor(
             "blk.0.ssm_beta.weight",
-            # Same transposed storage as ssm_alpha.
-            np.random.randn(hidden, num_v_heads).astype(np.float32),
+            np.random.randn(num_v_heads, hidden).astype(np.float32),
         )
         writer.add_tensor(
             "blk.0.ssm_out.weight",
@@ -1627,13 +1623,11 @@ class TestGGUFHybridConverter(unittest.TestCase):
         self.assertNotIn(1, linear)
 
     def test_ssm_out_weight_mapped(self):
-        """ssm_out.weight must appear as linear_attn.out_proj.weight as a float tensor."""
+        """ssm_out.weight must appear as linear_attn.out_proj.weight."""
         self._run_converter()
-        import torch
         tensors = self._tensors()
         key = "decoder.transformer_layers.0.linear_attn.out_proj.weight"
         self.assertIn(key, tensors, f"Missing key: {key}")
-        self.assertNotEqual(tensors[key].dtype, torch.uint8, "out_proj.weight must be float")
 
     def test_ssm_a_mapped_to_A_log(self):
         """ssm_a must appear as linear_attn.A_log (float, not uint8)."""
@@ -1651,14 +1645,14 @@ class TestGGUFHybridConverter(unittest.TestCase):
         tensors = self._tensors()
         key = "decoder.transformer_layers.0.linear_attn.in_proj_a.weight"
         self.assertIn(key, tensors)
-        # Must be stored as float (dequantized + transposed during conversion).
+        # Written as F32 with shape (num_v_heads=4, hidden=64) → stored as float.
         self.assertNotEqual(tensors[key].dtype, torch.uint8, "in_proj_a.weight must be float")
         # Shape must be [out_features, in_features] = [num_v_heads, hidden] = [4, 64].
         self.assertEqual(tensors[key].shape, (4, 64),
-                         "in_proj_a.weight must be transposed from GGUF (hidden, num_v_heads) → (num_v_heads, hidden)")
+                         "in_proj_a.weight shape must be [out_features, in_features] = [num_v_heads, hidden]")
 
     def test_ssm_beta_mapped_to_in_proj_b(self):
-        """ssm_beta.weight must map to in_proj_b.weight as a transposed float tensor."""
+        """ssm_beta.weight must map to in_proj_b.weight as a float tensor."""
         self._run_converter()
         import torch
         tensors = self._tensors()
@@ -1666,29 +1660,30 @@ class TestGGUFHybridConverter(unittest.TestCase):
         self.assertIn(key, tensors)
         self.assertNotEqual(tensors[key].dtype, torch.uint8, "in_proj_b.weight must be float")
         self.assertEqual(tensors[key].shape, (4, 64),
-                         "in_proj_b.weight must be transposed from GGUF (hidden, num_v_heads) → (num_v_heads, hidden)")
+                         "in_proj_b.weight shape must be [out_features, in_features] = [num_v_heads, hidden]")
 
     def test_attn_qkv_in_linear_block_goes_to_in_proj_qkv(self):
-        """attn_qkv.weight in linear block must map to in_proj_qkv as a transposed float tensor."""
+        """attn_qkv.weight in linear block must map to in_proj_qkv as a quantized tensor."""
         self._run_converter()
         import torch
         tensors = self._tensors()
         key = "decoder.transformer_layers.0.linear_attn.in_proj_qkv.weight"
         self.assertIn(key, tensors)
-        # Must be stored as float (dequantized + transposed).
-        self.assertNotEqual(tensors[key].dtype, torch.uint8, "in_proj_qkv.weight must be float")
-        # Shape: written as (hidden=64, conv_dim=128) → transposed → (conv_dim=128, hidden=64).
-        self.assertEqual(tensors[key].shape, (128, 64),
-                         "in_proj_qkv.weight must be transposed from GGUF (hidden, conv_dim) → (conv_dim, hidden)")
+        # Stored as quantized uint8 (GGUFLinear buffer) since it is Q8_0.
+        self.assertEqual(tensors[key].dtype, torch.uint8, "in_proj_qkv.weight must be uint8 (GGUFLinear)")
+        # First dim = out_features = conv_dim = 128.
+        self.assertEqual(tensors[key].shape[0], 128,
+                         "in_proj_qkv.weight first dim must be out_features=conv_dim=128")
 
     def test_attn_gate_goes_to_in_proj_z(self):
-        """attn_gate.weight must map to in_proj_z as a transposed float tensor."""
+        """attn_gate.weight must map to in_proj_z as a quantized tensor."""
         self._run_converter()
         import torch
         tensors = self._tensors()
         key = "decoder.transformer_layers.0.linear_attn.in_proj_z.weight"
         self.assertIn(key, tensors)
-        self.assertNotEqual(tensors[key].dtype, torch.uint8, "in_proj_z.weight must be float")
+        # Stored as quantized uint8 (GGUFLinear buffer) since it is Q8_0.
+        self.assertEqual(tensors[key].dtype, torch.uint8, "in_proj_z.weight must be uint8 (GGUFLinear)")
 
     def test_conv1d_weight_is_3d(self):
         """conv1d.weight must be reshaped to 3-D (conv_dim, 1, kernel_size) for PyTorch Conv1d."""
