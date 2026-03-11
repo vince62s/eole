@@ -1536,9 +1536,10 @@ class TestGGUFHybridConverter(unittest.TestCase):
             np.random.randn(conv_dim, kernel_size).astype(np.float32),
         )
         writer.add_tensor(
-            "blk.0.ssm_alpha.weight",
+            "blk.0.ssm_dt.weight",
             # in_proj_a: Linear(hidden → num_v_heads); weight shape (num_v_heads, hidden)
             # so the innermost GGUF dim is hidden=64, which is a valid Q8_0 row size.
+            # Real Qwen3.5 GGUFs use ssm_dt.weight for the dt projection (in_proj_a).
             np.random.randn(num_v_heads, hidden).astype(np.float32),
             raw_dtype=GGMLQuantizationType.Q8_0,
         )
@@ -1636,7 +1637,8 @@ class TestGGUFHybridConverter(unittest.TestCase):
         self.assertIn(key, tensors)
         self.assertNotEqual(tensors[key].dtype, torch.uint8, "A_log should be float")
 
-    def test_ssm_alpha_mapped_to_in_proj_a(self):
+    def test_ssm_dt_weight_mapped_to_in_proj_a(self):
+        """ssm_dt.weight (real Qwen3.5 GGUF name for the dt projection) must map to in_proj_a."""
         self._run_converter()
         tensors = self._tensors()
         key = "decoder.transformer_layers.0.linear_attn.in_proj_a.weight"

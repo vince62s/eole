@@ -177,7 +177,11 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     # GatedDeltaNet SSM weights
     "ssm_a": "linear_attn.A_log",          # log-scale A decay factor
     "ssm_a.weight": "linear_attn.A_log",   # alternative naming in some GGUF files
-    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+    # ssm_dt.weight is the delta-time (dt) linear projection → in_proj_a.
+    # ssm_alpha.weight is a *different* tensor in actual Qwen3.5 GGUF files
+    # (not the dt projection); skip it silently to avoid loading wrong data.
+    "ssm_dt.weight": "linear_attn.in_proj_a.weight",
+    "ssm_alpha.weight": None,              # not the dt projection – skip silently
     "ssm_beta.weight": "linear_attn.in_proj_b.weight",
     "ssm_conv1d.weight": "linear_attn.conv1d.weight",
     "ssm_conv1d.bias": "linear_attn.conv1d.bias",
