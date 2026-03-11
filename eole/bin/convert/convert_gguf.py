@@ -175,7 +175,9 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "attn_gate.weight": "linear_attn.in_proj_z.weight",
     "attn_gate.bias": "linear_attn.in_proj_z.bias",
     # GatedDeltaNet SSM weights
-    "ssm_a": "linear_attn.A_log",          # log-scale A decay factor
+    # NOTE: llama.cpp's Qwen3NextModel.modify_tensors converts A_log → -exp(A_log)
+    # before writing ssm_a to GGUF.  build_safetensors inverts this with log(-t).
+    "ssm_a": "linear_attn.A_log",          # log-scale A decay factor (needs inversion)
     "ssm_a.weight": "linear_attn.A_log",   # alternative naming in some GGUF files
     # ssm_alpha.weight / ssm_beta.weight are the in_proj_a / in_proj_b linear
     # projections.  gguf-python reverses GGUF ne when creating tensor.data, so
@@ -190,6 +192,13 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_dt.bias": "linear_attn.dt_bias",
     "ssm_norm.weight": "linear_attn.norm.weight",
     "ssm_out.weight": "linear_attn.out_proj.weight",
+    # post_attention_norm is applied to the raw attention output BEFORE the
+    # residual add in Qwen3.5's hybrid blocks.  EOLE's _forward_linear_attn
+    # does not have this step (it corresponds architecturally to ffn_norm, not
+    # post_attention_norm).  Map to None so it is silently skipped instead of
+    # incorrectly overwriting post_attention_layernorm with the wrong tensor.
+    "post_attention_norm.weight": None,
+    "post_attention_norm.bias": None,
 }
 
 # ---------------------------------------------------------------------------
@@ -349,53 +358,87 @@ def _detect_linear_attention_blocks(tensors) -> frozenset:
 def _infer_linear_attn_config(meta, linear_blocks: frozenset) -> dict:
     """Infer :class:`~eole.modules.gated_delta_net.GatedDeltaNet` hyper-parameters.
 
-    Parameters are read from GGUF metadata when available, and fall back to
-    inference from tensor shapes.  The returned dict contains the keys expected
-    by ``TransformerDecoderConfig`` (``layer_types``, ``linear_num_value_heads``,
-    ``linear_value_head_dim``, ``linear_num_key_heads``, ``linear_key_head_dim``,
+    Parameters are read from GGUF metadata when available (preferred), and
+    fall back to inference from tensor shapes.  The returned dict contains
+    the keys expected by ``TransformerDecoderConfig`` (``layer_types``,
+    ``linear_num_value_heads``, ``linear_value_head_dim``,
+    ``linear_num_key_heads``, ``linear_key_head_dim``,
     ``linear_conv_kernel_dim``).
+
+    GGUF metadata mapping (written by llama.cpp's Qwen3NextModel):
+      ``{arch}.ssm.state_size``     → ``linear_key_head_dim``
+      ``{arch}.ssm.group_count``    → ``linear_num_key_heads``
+      ``{arch}.ssm.time_step_rank`` → ``linear_num_value_heads``
+      ``{arch}.ssm.inner_size``     → ``linear_value_head_dim * linear_num_value_heads``
+      ``{arch}.ssm.conv_kernel``    → ``linear_conv_kernel_dim``
     """
     if not linear_blocks:
         return {}
 
     cfg: dict = {}
 
-    # Build a block_idx → shape lookup from the first linear-attention block.
+    arch = meta.arch  # e.g. "qwen35", "qwen3next"
+
+    # ---------- Read from GGUF metadata (preferred) -----------------------
+    # llama.cpp's Qwen3NextModel.set_gguf_parameters writes these keys.
+    meta_state_size = meta._scalar(f"{arch}.ssm.state_size")       # = linear_key_head_dim
+    meta_group_count = meta._scalar(f"{arch}.ssm.group_count")     # = linear_num_key_heads
+    meta_time_step = meta._scalar(f"{arch}.ssm.time_step_rank")    # = linear_num_value_heads
+    meta_inner_size = meta._scalar(f"{arch}.ssm.inner_size")       # = value_dim
+    meta_conv_kernel = meta._scalar(f"{arch}.ssm.conv_kernel")     # = conv kernel size
+
+    if meta_state_size is not None:
+        cfg["linear_key_head_dim"] = int(meta_state_size)
+    if meta_group_count is not None:
+        cfg["linear_num_key_heads"] = int(meta_group_count)
+    if meta_time_step is not None:
+        cfg["linear_num_value_heads"] = int(meta_time_step)
+    if meta_inner_size is not None and meta_time_step is not None and int(meta_time_step) > 0:
+        cfg["linear_value_head_dim"] = int(meta_inner_size) // int(meta_time_step)
+    if meta_conv_kernel is not None:
+        cfg["linear_conv_kernel_dim"] = int(meta_conv_kernel)
+
+    # ---------- Fall back to shape inference for missing fields -----------
     block_idx = min(linear_blocks)
     shapes: dict[str, list] = {t.name: list(t.shape) for t in meta.tensors}
 
-    # ---------- num_value_heads ----------------------------------------
-    # ssm_a has shape (num_v_heads,) [1-D tensor] in the GGUF file; after the
-    # gguf reader reverses dims, shape[0] = num_v_heads.
-    ssm_a_shape = shapes.get(f"blk.{block_idx}.ssm_a") or shapes.get(f"blk.{block_idx}.ssm_dt.bias")
-    if ssm_a_shape:
-        cfg["linear_num_value_heads"] = int(ssm_a_shape[0])
+    if "linear_num_value_heads" not in cfg:
+        # ssm_a / ssm_dt.bias have shape (num_v_heads,) in the GGUF file.
+        # GGUFReader tensor.shape is the GGUF ne array (reversed from numpy).
+        # For a 1-D tensor, ne = [num_v_heads], so shape[0] = num_v_heads.
+        ssm_a_shape = (
+            shapes.get(f"blk.{block_idx}.ssm_a")
+            or shapes.get(f"blk.{block_idx}.ssm_dt.bias")
+        )
+        if ssm_a_shape:
+            cfg["linear_num_value_heads"] = int(ssm_a_shape[0])
 
-    # ---------- head_value_dim -----------------------------------------
-    # ssm_norm.weight has shape (head_v_dim,).
-    ssm_norm_shape = shapes.get(f"blk.{block_idx}.ssm_norm.weight")
-    if ssm_norm_shape:
-        cfg["linear_value_head_dim"] = int(ssm_norm_shape[0])
+    if "linear_value_head_dim" not in cfg:
+        # ssm_norm.weight has shape (head_v_dim,).
+        ssm_norm_shape = shapes.get(f"blk.{block_idx}.ssm_norm.weight")
+        if ssm_norm_shape:
+            cfg["linear_value_head_dim"] = int(ssm_norm_shape[0])
 
-    # ---------- conv_kernel_dim and key dimensions ----------------------
-    # ssm_conv1d.weight is stored with GGUF ne=[conv_dim, kernel_size]; after
-    # the gguf reader reverses the ne array, shape=[kernel_size, conv_dim].
-    # (Verified against real Qwen3.5 GGUF files: shape[0]=kernel_size, shape[1]=conv_dim.)
-    ssm_conv1d_shape = shapes.get(f"blk.{block_idx}.ssm_conv1d.weight")
-    if ssm_conv1d_shape and len(ssm_conv1d_shape) >= 2:
-        kernel_size = int(ssm_conv1d_shape[0])   # shape[0] = kernel_size (typically 4)
-        conv_dim = int(ssm_conv1d_shape[1])       # shape[1] = conv_dim = key_dim*2 + value_dim
-        cfg["linear_conv_kernel_dim"] = kernel_size
-
-        num_v_heads = cfg.get("linear_num_value_heads", 32)
-        head_v_dim = cfg.get("linear_value_head_dim", 128)
-        value_dim = num_v_heads * head_v_dim
-        key_dim = (conv_dim - value_dim) // 2
-        # Assume key_head_dim == value_head_dim (standard in Qwen3.5).
-        head_k_dim = head_v_dim
-        cfg["linear_key_head_dim"] = head_k_dim
-        if head_k_dim > 0:
-            cfg["linear_num_key_heads"] = key_dim // head_k_dim
+    if "linear_conv_kernel_dim" not in cfg or "linear_key_head_dim" not in cfg:
+        # ssm_conv1d.weight: GGUFReader reverses GGUF ne, so shape = [kernel_size, conv_dim].
+        # (Verified: shape[0]=kernel_size, shape[1]=conv_dim for Qwen3.5 GGUF files.)
+        ssm_conv1d_shape = shapes.get(f"blk.{block_idx}.ssm_conv1d.weight")
+        if ssm_conv1d_shape and len(ssm_conv1d_shape) >= 2:
+            kernel_size = int(ssm_conv1d_shape[0])   # shape[0] = kernel_size (typically 4)
+            conv_dim = int(ssm_conv1d_shape[1])       # shape[1] = conv_dim = key_dim*2 + value_dim
+            if "linear_conv_kernel_dim" not in cfg:
+                cfg["linear_conv_kernel_dim"] = kernel_size
+            if "linear_num_key_heads" not in cfg or "linear_key_head_dim" not in cfg:
+                num_v_heads = cfg.get("linear_num_value_heads", 32)
+                head_v_dim = cfg.get("linear_value_head_dim", 128)
+                value_dim = num_v_heads * head_v_dim
+                key_dim = (conv_dim - value_dim) // 2
+                # Assume key_head_dim == value_head_dim (standard in Qwen3.5).
+                head_k_dim = head_v_dim
+                if "linear_key_head_dim" not in cfg:
+                    cfg["linear_key_head_dim"] = head_k_dim
+                if "linear_num_key_heads" not in cfg and head_k_dim > 0:
+                    cfg["linear_num_key_heads"] = key_dim // head_k_dim
 
     # ---------- layer_types list ----------------------------------------
     n_layers = meta.block_count
@@ -1240,6 +1283,30 @@ def build_safetensors(
                             v_ch, _num_k_heads, _num_v_per_k, _head_v_dim
                         )
                         t = torch.cat([qk_ch, v_ch], dim=0)
+
+        # A_log inverse transform: llama.cpp's Qwen3NextModel.modify_tensors converts
+        # the HF A_log (log-scale) to -exp(A_log) before writing ssm_a to GGUF.
+        # EOLE's GatedDeltaNet.forward() computes A = -exp(self.A_log), so it expects
+        # A_log in log-scale.  Restore: A_log = log(-ssm_a).
+        if eole_name.endswith(".A_log") and t.dim() == 1:
+            t = torch.log(-t)
+
+        # GemmaRMSNorm layernorm1p correction: for architectures in _GEMMA_RMS_ARCHS
+        # (gemma2, gemma3, qwen35, qwen35moe), llama.cpp adds +1 to all norm weights
+        # during HF→GGUF conversion so ggml's standard RMSNorm produces the same
+        # result as HF's layernorm1p (which stores weight as deviation from 1 and
+        # computes (1+weight)*x/rms(x)).  EOLE's GemmaRMSNorm also uses (1+weight),
+        # so the +1 would be applied twice.  Subtract 1 here to restore the
+        # "deviation-from-1" convention expected by GemmaRMSNorm.
+        # Exception: linear_attn.norm.weight is a plain RMSNormGated (not GemmaRMSNorm)
+        # and was explicitly excluded from the +1 by llama.cpp's Qwen3NextModel.
+        if (
+            meta.arch in _GEMMA_RMS_ARCHS
+            and qtype_t is None  # float tensors only; norm weights are never quantized
+            and eole_name.endswith("norm.weight")
+            and not eole_name.endswith("linear_attn.norm.weight")
+        ):
+            t = t - 1.0
 
         # Conv1d weights: the gguf reader reverses GGUF ne, so data arrives as
         # (conv_dim, kernel_size) – i.e. shape[0]=kernel_size, shape[1]=conv_dim

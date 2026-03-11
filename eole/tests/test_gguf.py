@@ -145,10 +145,16 @@ class TestGGUFNameMapping(unittest.TestCase):
         r = self._map("blk.3.post_attention_norm.weight")
         self.assertEqual(r, "decoder.transformer_layers.3.post_attention_layernorm.weight")
 
-    def test_post_attention_norm_maps_for_linear_attention_block(self):
-        """post_attention_norm is also present in linear-attention blocks."""
+    def test_post_attention_norm_skipped_for_linear_attention_block(self):
+        """post_attention_norm must be skipped (None) for linear-attention blocks.
+
+        EOLE's _forward_linear_attn uses post_attention_layernorm as the pre-FFN
+        norm (= ffn_norm in Qwen3.5), NOT as the post-attention output norm.
+        Loading post_attention_norm into post_attention_layernorm would overwrite
+        ffn_norm with the wrong tensor.
+        """
         r = self._map("blk.0.post_attention_norm.weight", linear_blocks=frozenset({0}))
-        self.assertEqual(r, "decoder.transformer_layers.0.post_attention_layernorm.weight")
+        self.assertIsNone(r, "post_attention_norm.weight must be skipped for linear-attn blocks")
 
     # ------------------------------------------------------------------
     # Linear-attention block mappings (SSM / GatedDeltaNet)
@@ -1525,7 +1531,9 @@ class TestGGUFHybridConverter(unittest.TestCase):
             raw_dtype=GGMLQuantizationType.Q8_0,
         )
         # SSM params (float)
-        writer.add_tensor("blk.0.ssm_a", np.ones(num_v_heads, dtype=np.float32))
+        # ssm_a stores -exp(A_log_hf) in GGUF format (llama.cpp applies -exp transform).
+        # Use -1.0 (valid negative value: log(-(-1)) = log(1) = 0).
+        writer.add_tensor("blk.0.ssm_a", -np.ones(num_v_heads, dtype=np.float32))
         writer.add_tensor("blk.0.ssm_dt.bias", np.ones(num_v_heads, dtype=np.float32))
         writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32))
         writer.add_tensor(
@@ -1630,13 +1638,25 @@ class TestGGUFHybridConverter(unittest.TestCase):
         self.assertIn(key, tensors, f"Missing key: {key}")
 
     def test_ssm_a_mapped_to_A_log(self):
-        """ssm_a must appear as linear_attn.A_log (float, not uint8)."""
+        """ssm_a must appear as linear_attn.A_log (float, not uint8).
+
+        Also verifies the inverse -exp transform: llama.cpp stores ssm_a = -exp(A_log),
+        so we write ssm_a = -1.0 and expect A_log = log(1.0) = 0.0.
+        """
         self._run_converter()
         import torch
+        import math
         tensors = self._tensors()
         key = "decoder.transformer_layers.0.linear_attn.A_log"
         self.assertIn(key, tensors)
         self.assertNotEqual(tensors[key].dtype, torch.uint8, "A_log should be float")
+        # ssm_a = -1.0 (written in setUpClass) → A_log = log(-(-1.0)) = log(1.0) = 0.0
+        expected_a_log = 0.0
+        atol = 1e-5  # absolute tolerance for float32 round-trip
+        self.assertTrue(
+            all(abs(v - expected_a_log) < atol for v in tensors[key].float().tolist()),
+            f"A_log values should be log(1.0)=0.0 (got {tensors[key].tolist()})",
+        )
 
     def test_ssm_alpha_mapped_to_in_proj_a(self):
         """ssm_alpha.weight (real Qwen3.5 GGUF name for the alpha projection) must map to in_proj_a."""
@@ -1698,7 +1718,11 @@ class TestGGUFHybridConverter(unittest.TestCase):
         self.assertEqual(t.shape[2], 4, "last dim must be kernel_size=4")
 
     def test_post_attention_norm_both_blocks(self):
-        """post_attention_norm maps to post_attention_layernorm for both block types."""
+        """post_attention_layernorm exists for both block types.
+
+        For linear-attention blocks: comes from ffn_norm (post_attention_norm is skipped).
+        For full-attention blocks: comes from post_attention_norm or ffn_norm.
+        """
         self._run_converter()
         tensors = self._tensors()
         for blk in (0, 1):
@@ -1803,7 +1827,15 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
         num_v_per_k = num_v_heads // num_k_heads   # 2
 
         # 1-D ssm_a  (A_log): shape (num_v_heads,) = (4,)
+        # a_log_grp holds the expected HF-format A_log values after conversion.
+        # GGUF stores ssm_a = -exp(A_log), so we write -exp(a_log_tld) to the
+        # GGUF file and expect a_log_grp = [0.0, 1.0, 2.0, 3.0] after the
+        # converter undoes both V-head reordering and the -exp transform.
         a_log_grp, a_log_tld = _mk_grouped(num_v_heads, 0, scalar=True)
+        ssm_a_tld = -np.exp(a_log_tld)   # GGUF format: ssm_a = -exp(A_log),
+        # written in the V-head tiled order (K0v0, K1v0, K0v1, K1v1) that
+        # llama.cpp's _LinearAttentionVReorderBase applies before writing GGUF.
+        # The converter must undo both the V-head reorder and the -exp transform.
         # 1-D dt_bias: shape (num_v_heads,) = (4,)
         dt_bias_grp, dt_bias_tld = _mk_grouped(num_v_heads, 0, scalar=True)
 
@@ -1847,6 +1879,8 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
         ).transpose(0, 2, 1, 3).reshape(hidden, num_v_heads * head_v_dim)
 
         # store grouped references for assertions
+        cls.hidden = hidden
+        cls.head_v_dim = head_v_dim
         cls.a_log_grp = a_log_grp
         cls.dt_bias_grp = dt_bias_grp
         cls.alpha_grp = alpha_grp
@@ -1870,16 +1904,24 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
         writer.add_eos_token_id(2)
 
         writer.add_tensor("token_embd.weight", np.zeros((n_vocab, hidden), dtype=np.float32))
+        # Norm weights: llama.cpp adds +1 to all norm weights for qwen35 (layernorm1p).
+        # Write realistic GGUF values (1.0 = identity after the +1 shift, meaning
+        # HF weight was 0.0).  The converter must subtract 1 to restore the
+        # "deviation-from-1" convention that GemmaRMSNorm expects.
         writer.add_tensor("output_norm.weight", np.ones(hidden, dtype=np.float32))
 
         # blk.0: linear attention block – all tensors in GGUF tiled order
         writer.add_tensor("blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32))
+        # post_attention_norm: present in linear-attn block but must be SKIPPED.
         writer.add_tensor("blk.0.post_attention_norm.weight", np.ones(hidden, dtype=np.float32))
         writer.add_tensor("blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
 
-        # Write linear-attn tensors in GGUF tiled order (as llama.cpp would)
-        writer.add_tensor("blk.0.ssm_a", a_log_tld)
+        # Write linear-attn tensors in GGUF tiled order (as llama.cpp would).
+        # ssm_a: llama.cpp stores -exp(A_log); write -exp(a_log_tld) so the
+        # converter can invert both the V-head reorder and the -exp transform.
+        writer.add_tensor("blk.0.ssm_a", ssm_a_tld)
         writer.add_tensor("blk.0.ssm_dt.bias", dt_bias_tld)
+        # ssm_norm.weight is NOT subject to the +1 shift (excluded by llama.cpp)
         writer.add_tensor("blk.0.ssm_norm.weight", np.ones(head_v_dim, dtype=np.float32))
         writer.add_tensor("blk.0.ssm_alpha.weight", alpha_tld.astype(np.float32))
         writer.add_tensor("blk.0.ssm_beta.weight", beta_tld.astype(np.float32))
@@ -1939,12 +1981,17 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
         )
 
     def test_a_log_inverse_reordered(self):
-        """ssm_a (A_log) values must be restored from tiled to grouped order."""
+        """ssm_a (A_log) values must be restored from tiled to grouped order and
+        the -exp transform applied by llama.cpp must be inverted (log(-t)).
+
+        The GGUF stores ssm_a = -exp(a_log_tld); after conversion the output
+        must be a_log_grp = [0.0, 1.0, 2.0, 3.0] (the original HF A_log values).
+        """
         self._run_converter()
         tensors = self._tensors()
         key = "decoder.transformer_layers.0.linear_attn.A_log"
         self.assertIn(key, tensors)
-        self._assert_close(tensors[key], self.a_log_grp, msg="A_log tiled→grouped")
+        self._assert_close(tensors[key], self.a_log_grp, msg="A_log tiled→grouped + log(-t)")
 
     def test_dt_bias_inverse_reordered(self):
         """ssm_dt.bias values must be restored from tiled to grouped order."""
@@ -1993,6 +2040,44 @@ class TestGGUFVHeadReorderValues(unittest.TestCase):
         key = "decoder.transformer_layers.0.linear_attn.out_proj.weight"
         self.assertIn(key, tensors)
         self._assert_close(tensors[key], self.out_grp, msg="out_proj tiled→grouped")
+
+    def test_norm_weight_layernorm1p_correction(self):
+        """Norm weights must have 1 subtracted (GemmaRMSNorm layernorm1p correction).
+
+        llama.cpp adds +1 to all norm weights for qwen35 so ggml can use its
+        standard RMSNorm.  EOLE's GemmaRMSNorm computes (1+weight)*x/rms(x),
+        so the converter must subtract 1 to restore the deviation-from-1 format.
+        The GGUF writes 1.0 (all-ones) for the norm weights, so after -1
+        correction the stored values must be 0.0.
+        """
+        import torch
+        import numpy as np
+        self._run_converter()
+        tensors = self._tensors()
+        zeros = np.zeros(self.hidden, dtype=np.float32)
+        for name in (
+            "decoder.layer_norm.weight",
+            "decoder.transformer_layers.0.input_layernorm.weight",
+            "decoder.transformer_layers.0.post_attention_layernorm.weight",
+        ):
+            self.assertIn(name, tensors, f"Missing: {name}")
+            self._assert_close(tensors[name], zeros, msg=f"{name} must be 0.0 after -1 correction")
+
+    def test_ssm_norm_weight_not_corrected(self):
+        """linear_attn.norm.weight must NOT have 1 subtracted.
+
+        llama.cpp explicitly excludes ssm_norm.weight (linear_attn.norm.weight)
+        from its +1 shift.  It maps to the plain RMSNormGated inside GatedDeltaNet,
+        not a GemmaRMSNorm.  The written value (1.0) must be preserved as-is.
+        """
+        import torch
+        import numpy as np
+        self._run_converter()
+        tensors = self._tensors()
+        key = "decoder.transformer_layers.0.linear_attn.norm.weight"
+        self.assertIn(key, tensors)
+        ones = np.ones(self.head_v_dim, dtype=np.float32)
+        self._assert_close(tensors[key], ones, msg="linear_attn.norm.weight must stay 1.0")
 
 
 class TestGGUFVHeadReorderHelpers(unittest.TestCase):
