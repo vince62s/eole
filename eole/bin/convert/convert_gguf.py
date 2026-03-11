@@ -591,13 +591,15 @@ _GEMMA_RMS_ARCHS = frozenset("gemma2 gemma3 qwen35 qwen35moe".split())
 # with interleaved rotation and therefore require rotary_interleave=True in
 # the EOLE rope_config.
 #
-# qwen35 / qwen35moe are vision-language models whose text decoder always uses
-# the interleaved MRoPE defined in Qwen3_5TextRotaryEmbedding.apply_interleaved_mrope
-# (see transformers/models/qwen3_5/modeling_qwen3_5.py).  Even in text-only
-# inference, position_ids are expanded to 3 dimensions and the interleaved
-# layout is applied — so rotary_interleave=True must be set for all qwen35 GGUF
-# files, regardless of whether rope.dimension_sections metadata is present.
-_MROPE_INTERLEAVE_ARCHS = frozenset("qwen35 qwen35moe qwen2vl qwen3vl qwen3vlmoe".split())
+# NOTE: qwen35 / qwen35moe are intentionally EXCLUDED here.  HF Qwen3.5
+# applies rotate_half (halves rotation) — identical to eole's
+# rotary_interleave=False — after baking the T/H/W positional interleaving
+# into the cos/sin tables via apply_interleaved_mrope.  Setting
+# rotary_interleave=True would use GPT-J pairs rotation which gives different
+# results and produces garbage output.  The xdrope_section field (from
+# rope.dimension_sections) is sufficient to handle the T/H/W frequency
+# assignment for visual tokens without needing rotary_interleave.
+_MROPE_INTERLEAVE_ARCHS = frozenset("qwen2vl qwen3vl qwen3vlmoe".split())
 
 
 def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
@@ -1334,11 +1336,19 @@ def _mmproj_to_eole_tensors(
     return written, skipped
 
 
-def build_vision_encoder_config(clip_meta: "GGUFClipMetadata") -> dict:
+def build_vision_encoder_config(
+    clip_meta: "GGUFClipMetadata",
+    meta: "GGUFMetadata | None" = None,
+) -> dict:
     """Build the EOLE ``encoder`` sub-config dict from clip metadata.
 
     The returned dict is suitable for passing as the ``encoder`` key inside
     a :class:`~eole.config.models.VisionTransformerLMModelConfig` dict.
+
+    Args:
+        clip_meta: Parsed GGUF clip/vision encoder metadata.
+        meta: Parsed main GGUF metadata (text decoder), used to look up the
+            image placeholder token ID from the tokeniser vocabulary.
     """
     hidden = clip_meta.vision_embedding_length
     heads = clip_meta.vision_head_count
@@ -1353,6 +1363,20 @@ def build_vision_encoder_config(clip_meta: "GGUFClipMetadata") -> dict:
     # [hidden_size, spatial^2] with ne-reversal giving (spatial^2, hidden_size).)
     spatial_size = img_size // patch_size
     num_pos = spatial_size * spatial_size
+
+    # Image placeholder token ID.
+    # For Qwen3.5 VL the placeholder is <|image_pad|> (token 151655 in the
+    # standard Qwen3.5 vocabulary).  Search the GGUF token list first so the
+    # correct ID is used if the vocabulary differs; fall back to the known
+    # Qwen3.5 default if meta is unavailable or the token is not found.
+    _QWEN35VL_IMAGE_TOKEN_ID = 151655
+    image_token_id = _QWEN35VL_IMAGE_TOKEN_ID
+    if meta is not None:
+        _IMAGE_PAD_TOKENS = {"<|image_pad|>", "<image_pad>"}
+        for tok_id, tok_str in enumerate(meta.tokens):
+            if tok_str in _IMAGE_PAD_TOKENS:
+                image_token_id = tok_id
+                break
 
     return {
         "layers": clip_meta.vision_block_count,
@@ -1385,6 +1409,9 @@ def build_vision_encoder_config(clip_meta: "GGUFClipMetadata") -> dict:
             "rotary_interleave": False,
             "rotary_theta": 10000,
         },
+        # Image placeholder token ID: embed_vision_language_features uses this
+        # to separate image tokens from text tokens in the combined sequence.
+        "image_token_id": image_token_id,
     }
 
 
@@ -1710,7 +1737,7 @@ class GGUFConverter(BaseBin):
         # When a vision encoder was provided, inject the encoder config and
         # adapter type so that VisionTransformerLMModelConfig is produced.
         if clip_meta is not None:
-            model_config_dict["encoder"] = build_vision_encoder_config(clip_meta)
+            model_config_dict["encoder"] = build_vision_encoder_config(clip_meta, meta)
             model_config_dict["adapter"] = "qwen3_5vl"
             # spatial_merge_size controls how many vision patches are grouped
             # before projection.  Qwen3.5 VL uses spatial_merge_size=2, giving

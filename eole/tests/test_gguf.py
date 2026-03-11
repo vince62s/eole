@@ -1209,17 +1209,24 @@ class TestGGUFArchSets(unittest.TestCase):
 
         self.assertIn("qwen35", _SWIGLU_ARCHS)
 
-    def test_qwen35_in_mrope_interleave_archs(self):
-        """qwen35 is a VL model that always uses interleaved MRoPE."""
+    def test_qwen35_not_in_mrope_interleave_archs(self):
+        """qwen35 must NOT be in _MROPE_INTERLEAVE_ARCHS.
+
+        HF Qwen3.5 uses rotate_half (halves rotation), which is eole's
+        rotary_interleave=False.  Setting rotary_interleave=True would apply
+        GPT-J pairs rotation instead, producing garbage text output.
+        The T/H/W positional interleaving for visual tokens is handled
+        separately by xdrope_section (from rope.dimension_sections).
+        """
         from eole.bin.convert.convert_gguf import _MROPE_INTERLEAVE_ARCHS
 
-        self.assertIn("qwen35", _MROPE_INTERLEAVE_ARCHS)
+        self.assertNotIn("qwen35", _MROPE_INTERLEAVE_ARCHS)
 
-    def test_qwen35moe_in_mrope_interleave_archs(self):
-        """qwen35moe is a VL model that always uses interleaved MRoPE."""
+    def test_qwen35moe_not_in_mrope_interleave_archs(self):
+        """qwen35moe must NOT be in _MROPE_INTERLEAVE_ARCHS (same reason as qwen35)."""
         from eole.bin.convert.convert_gguf import _MROPE_INTERLEAVE_ARCHS
 
-        self.assertIn("qwen35moe", _MROPE_INTERLEAVE_ARCHS)
+        self.assertNotIn("qwen35moe", _MROPE_INTERLEAVE_ARCHS)
 
     def test_rope_dim_sections_strips_trailing_zeros(self):
         """rope_dim_sections must strip GGUF null-padding zeros.
@@ -2029,6 +2036,12 @@ class TestGGUFMmprojConverter(unittest.TestCase):
                          f"encoder head_dim should be {expected_head_dim} "
                          f"(hidden={self.hidden} // heads={self.heads}), "
                          "not the text decoder's head_dim")
+        # image_token_id must always be present (falls back to 151655 when
+        # meta=None, i.e. no main GGUF decoder to search).
+        self.assertIn("image_token_id", enc_cfg,
+                      "build_vision_encoder_config must always include image_token_id")
+        self.assertEqual(enc_cfg["image_token_id"], 151655,
+                         "Default image_token_id (meta=None) must be 151655")
 
 
 class TestGGUFMmprojBF16Handling(unittest.TestCase):
