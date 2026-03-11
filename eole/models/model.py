@@ -179,6 +179,12 @@ class BaseModel(nn.Module):
 
             post_init_autoround_linear(self)
 
+        if getattr(running_config, "quant_type", "") == "gguf":
+            from eole.modules.gguf_linear import materialize_gguf_linear
+
+            storage_dtype = getattr(running_config, "storage_dtype", torch.float16)
+            materialize_gguf_linear(self, dtype=storage_dtype)
+
         self.eval()
         for name, module in self.named_modules():
             if hasattr(module, "dropout_p"):

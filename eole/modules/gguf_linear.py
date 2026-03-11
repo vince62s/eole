@@ -112,6 +112,80 @@ class GGUFLinear(nn.Module):
         )
 
 
+def materialize_gguf_linear(model: nn.Module, dtype: torch.dtype = torch.float16) -> nn.Module:
+    """Dequantize all :class:`GGUFLinear` modules and replace them with plain
+    :class:`~torch.nn.Linear` layers.
+
+    Called once after the model weights have been loaded from the safetensors
+    shard.  Dequantizing upfront eliminates the per-forward-call CPU round-trip
+    (``weight.cpu()`` → numpy dequantize → move back to GPU) that would make
+    inference intolerably slow for large models.
+
+    After this call every former :class:`GGUFLinear` becomes a standard
+    ``nn.Linear`` whose ``weight`` parameter holds the dequantized values in
+    *dtype* on the same device as the original quantized buffer.  The uint8
+    weight buffer and the ``gguf_qtype`` buffer are freed.
+
+    Parameters
+    ----------
+    model:
+        Root module to patch in-place.
+    dtype:
+        Target floating-point dtype for the materialized weights
+        (usually ``running_config.storage_dtype``).
+
+    Returns
+    -------
+    nn.Module
+        The same *model* object, modified in-place, returned for convenience
+        (allows chaining, e.g. ``model = materialize_gguf_linear(model)``).
+    """
+    for name, module in model.named_children():
+        if isinstance(module, GGUFLinear):
+            try:
+                from gguf import dequantize, GGMLQuantizationType
+            except ImportError:
+                raise ImportError(
+                    "Install 'gguf' to run inference with GGUF quantized models: pip install gguf"
+                )
+
+            device = module.weight.device
+            qtype = GGMLQuantizationType(int(module.gguf_qtype.item()))
+            w_np = module.weight.cpu().numpy()
+            dq_np = dequantize(w_np, qtype)
+
+            w_tensor = (
+                # copy() to take ownership of the numpy buffer before converting
+                torch.from_numpy(dq_np.copy())
+                .reshape(module.out_features, module.in_features)
+                .to(dtype=dtype, device=device)
+            )
+
+            linear = nn.Linear(
+                in_features=module.in_features,
+                out_features=module.out_features,
+                bias=module.bias is not None,
+                device=device,
+                dtype=dtype,
+            )
+            # requires_grad=False: this layer is inference-only; gradients are
+            # not needed and would waste memory / confuse optimizers.
+            linear.weight = nn.Parameter(w_tensor, requires_grad=False)
+            if module.bias is not None:
+                linear.bias = nn.Parameter(
+                    module.bias.to(dtype=dtype, device=device), requires_grad=False
+                )
+
+            model._modules[name] = linear
+
+            # Free the quantized buffers explicitly to reclaim GPU memory.
+            del module.weight
+            del module.gguf_qtype
+        else:
+            materialize_gguf_linear(module, dtype=dtype)
+    return model
+
+
 def replace_gguf_linear(
     model: nn.Module,
     module_to_convert: list[str],

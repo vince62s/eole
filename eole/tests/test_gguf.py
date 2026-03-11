@@ -288,6 +288,92 @@ class TestGGUFLinear(unittest.TestCase):
         )
         self.assertIn("Q4_K", repr(layer))
 
+    def test_materialize_gguf_linear_replaces_with_nn_linear(self):
+        """materialize_gguf_linear must replace GGUFLinear with nn.Linear with
+        dequantized float16 weights, and inference must give the same result as
+        GGUFLinear.forward on the same input."""
+        _require("numpy")
+        import tempfile
+        import os
+        import numpy as np
+        import torch
+        import torch.nn as nn
+        from gguf import GGMLQuantizationType, GGUFWriter, GGUFReader
+
+        from eole.modules.gguf_linear import GGUFLinear, materialize_gguf_linear
+
+        n_out, n_in = 8, 256
+
+        with tempfile.TemporaryDirectory() as td:
+            gpath = os.path.join(td, "tiny.gguf")
+            writer = GGUFWriter(gpath, "llama")
+            writer.add_block_count(1)
+            writer.add_embedding_length(n_in)
+            writer.add_vocab_size(n_out)
+            writer.add_tensor(
+                "test.weight",
+                np.random.randn(n_out, n_in).astype(np.float32),
+                raw_dtype=GGMLQuantizationType.Q4_K,
+            )
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+
+            reader = GGUFReader(gpath)
+            q_data = reader.tensors[0].data.copy()
+
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear_query = GGUFLinear(in_features=n_in, out_features=n_out, bias=False)
+                self.other = nn.Linear(n_in, n_out, bias=False)
+
+        model = Tiny()
+        model.linear_query.register_buffer("weight", torch.from_numpy(q_data))
+        model.linear_query.register_buffer(
+            "gguf_qtype",
+            torch.tensor([GGMLQuantizationType.Q4_K.value], dtype=torch.int32),
+        )
+
+        x = torch.randn(2, 4, n_in)
+        # Record output from the slow GGUFLinear path
+        expected = model.linear_query(x)
+
+        # Materialize: all GGUFLinear layers should become nn.Linear
+        materialize_gguf_linear(model, dtype=torch.float32)
+
+        self.assertIsInstance(model.linear_query, nn.Linear,
+                              "materialize_gguf_linear must replace GGUFLinear with nn.Linear")
+        # Non-GGUFLinear modules must be untouched
+        self.assertIsInstance(model.other, nn.Linear)
+
+        # The materialized layer must produce the same result as the GGUFLinear
+        # path.  Use a small tolerance to guard against any fp rounding in the
+        # dtype conversion chain (float32 case: should be bit-exact, but we stay
+        # conservative to avoid fragile zero-tolerance assertions).
+        actual = model.linear_query(x)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_materialize_gguf_linear_no_gguf_layers(self):
+        """materialize_gguf_linear must be a no-op when no GGUFLinear layers exist."""
+        import torch.nn as nn
+
+        from eole.modules.gguf_linear import materialize_gguf_linear
+
+        class Plain(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(8, 8)
+                self.b = nn.Linear(8, 4)
+
+        model = Plain()
+        orig_a = model.a
+        orig_b = model.b
+        materialize_gguf_linear(model)
+        self.assertIs(model.a, orig_a)
+        self.assertIs(model.b, orig_b)
+
 
 class TestGGUFConverter(unittest.TestCase):
     """Integration test for the full GGUF → EOLE conversion pipeline."""
