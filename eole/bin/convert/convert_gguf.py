@@ -87,11 +87,24 @@ _GLOBAL_MAP: dict[str, Optional[str]] = {
 #  • The output projection / generator – when a vision encoder is present,
 #    replace_gguf_linear targets only self.decoder, not self.generator, so the
 #    generator remains a plain nn.Linear and cannot load uint8 weights.
-_MUST_DEQUANTIZE_NAMES: frozenset[str] = frozenset({
+#
+# For plain text models (no vision encoder) the generator IS reachable by
+# replace_gguf_linear (quant_target = self), so generator.weight can stay
+# quantized.  build_safetensors accepts a has_vision_encoder flag and adds
+# "generator.weight" to the active must-dequantize set only when needed.
+_MUST_DEQUANTIZE_NAMES_BASE: frozenset[str] = frozenset({
+    "tgt_emb.embeddings.weight",
+    "src_emb.embeddings.weight",
+})
+# Used for models where the generator cannot be GGUFLinear (VLM / any model
+# where replace_gguf_linear does not reach self.generator).
+_MUST_DEQUANTIZE_NAMES_WITH_GENERATOR: frozenset[str] = frozenset({
     "tgt_emb.embeddings.weight",
     "src_emb.embeddings.weight",
     "generator.weight",
 })
+# Keep backwards-compatible module-level name (used in tests).
+_MUST_DEQUANTIZE_NAMES = _MUST_DEQUANTIZE_NAMES_WITH_GENERATOR
 
 # Per-block suffix → EOLE decoder-layer suffix.
 # A value of None means "known tensor but not yet modelled in EOLE – skip silently".
@@ -800,6 +813,15 @@ def _tensor_to_torch(tensor, target_dtype: torch.dtype) -> torch.Tensor:
 
     For float types (F16, BF16, F32) the tensor is cast to *target_dtype*.
 
+    **BF16 special case**: gguf-python returns BF16 tensors as raw ``uint8``
+    bytes (block_size=1, type_size=2) rather than a native float dtype,
+    because NumPy has no bfloat16 type.  The resulting tensor has shape
+    ``(out_features, in_features * 2)`` with dtype ``uint8``.  We reinterpret
+    every consecutive pair of bytes as a ``bfloat16`` value (identical to how
+    vLLM's ``gguf_quant_weights_iterator`` handles this case) and then cast to
+    *target_dtype*.  Without this fix the raw bytes would be stored as-is and
+    loaded back as garbage float values.
+
     Returns ``(tensor, qtype_tensor_or_None)``.
     ``qtype_tensor_or_None`` is a ``torch.int32`` scalar when the tensor is
     quantised; ``None`` for float tensors.
@@ -811,6 +833,12 @@ def _tensor_to_torch(tensor, target_dtype: torch.dtype) -> torch.Tensor:
 
     if _is_float_type(tname):
         t = torch.from_numpy(data.copy())
+        if not t.is_floating_point() and tname == "BF16":
+            # gguf-python returns BF16 data as raw uint8 bytes.
+            # Reinterpret each consecutive pair of bytes as bfloat16, then
+            # cast to the requested target dtype.  Matches vLLM's handling in
+            # gguf_quant_weights_iterator.
+            t = t.contiguous().view(torch.bfloat16)
         if t.is_floating_point():
             t = t.to(target_dtype)
         return t, None
@@ -835,6 +863,7 @@ def build_safetensors(
     target_dtype: torch.dtype,
     linear_blocks: frozenset = frozenset(),
     extra_tensors: Optional[dict] = None,
+    has_vision_encoder: bool = False,
 ) -> tuple[dict, list[str]]:
     """Convert all tensors from the GGUF and write ``model.00.safetensors``.
 
@@ -847,6 +876,15 @@ def build_safetensors(
         extra_tensors: Optional dict of additional tensors (already converted
             to torch) to merge into the safetensors shard.  Used when an
             mmproj GGUF has been separately converted.
+        has_vision_encoder: When True (VLM model with a separate vision
+            encoder), ``replace_gguf_linear`` at load time targets only
+            ``self.decoder`` and does not reach ``self.generator``.  In that
+            case ``generator.weight`` must be dequantised to float so that it
+            can be loaded by the plain ``nn.Linear`` generator.
+            When False (plain text model), ``replace_gguf_linear`` is applied
+            to the whole model (``quant_target = self``) and *will* replace
+            ``self.generator`` with a :class:`~eole.modules.gguf_linear.GGUFLinear`,
+            so ``generator.weight`` can safely remain as quantised ``uint8``.
 
     Returns ``(written_tensor_dict, quant_layers)`` where *quant_layers* is the
     list of EOLE leaf-module names (e.g. ``"linear_query"``) that carry
@@ -856,10 +894,25 @@ def build_safetensors(
     if safetensors_save_file is None:
         raise ImportError("Install safetensors: pip install safetensors")
 
+    # Choose the correct must-dequantize set based on the model topology.
+    # For VLM models, replace_gguf_linear targets self.decoder at load time
+    # (not self.generator), so generator.weight must be a plain float tensor.
+    # For plain text models, replace_gguf_linear targets self (the whole
+    # model), which does include self.generator, so it can stay quantized.
+    must_deq = (
+        _MUST_DEQUANTIZE_NAMES_WITH_GENERATOR
+        if has_vision_encoder
+        else _MUST_DEQUANTIZE_NAMES_BASE
+    )
+
     written: dict[str, torch.Tensor] = {}
     skipped: list[str] = []
 
     quant_layers, dominant_qtype = _detect_quant_layers(meta.tensors)
+
+    quant_bytes = 0
+    dequant_bytes = 0
+    float_bytes = 0
 
     for tensor in meta.tensors:
         gguf_name = tensor.name
@@ -877,13 +930,15 @@ def build_safetensors(
         # Some EOLE modules cannot hold uint8 quantized data (nn.Embedding,
         # generator/lm-head nn.Linear when not covered by replace_gguf_linear).
         # Dequantize these to target_dtype so they can be loaded normally.
-        if qtype_t is not None and eole_name in _MUST_DEQUANTIZE_NAMES:
+        if qtype_t is not None and eole_name in must_deq:
+            orig_bytes = tensor.data.nbytes
             try:
                 import numpy as _np
                 from gguf.quants import dequantize as _gguf_dequantize
                 dq = _gguf_dequantize(tensor.data, tensor.tensor_type)
                 t = torch.from_numpy(_np.array(dq, copy=True)).to(target_dtype)
                 qtype_t = None  # no companion gguf_qtype – it's plain float now
+                dequant_bytes += t.nbytes - orig_bytes
             except Exception as exc:
                 raise RuntimeError(
                     f"Tensor {gguf_name!r} (→ {eole_name!r}) is quantized "
@@ -906,6 +961,9 @@ def build_safetensors(
             # Derive the companion gguf_qtype key: replace ".weight" → ".gguf_qtype"
             qtype_key = eole_name.rsplit(".weight", 1)[0] + ".gguf_qtype"
             written[qtype_key] = qtype_t
+            quant_bytes += t.nbytes
+        else:
+            float_bytes += t.nbytes
 
     # Merge in any extra tensors from the vision encoder (mmproj)
     if extra_tensors:
@@ -914,10 +972,17 @@ def build_safetensors(
     shard_path = os.path.join(output_dir, "model.00.safetensors")
     safetensors_save_file(written, shard_path)
 
+    shard_size_mb = os.path.getsize(shard_path) / 1024 / 1024
     n_quant = sum(1 for k in written if k.endswith(".gguf_qtype"))
     n_float = sum(1 for k in written if k.endswith(".weight") and not k.replace(".weight", ".gguf_qtype") in written)
-    print(f"Wrote {len(written)} tensors to {shard_path}")
-    print(f"  {n_quant} quantised weight tensors (uint8)  +  {n_float} float weight tensors")
+    print(f"Wrote {len(written)} tensors to {shard_path}  ({shard_size_mb:.0f} MB)")
+    print(f"  {n_quant} quantised weight tensors (uint8, {quant_bytes / 1024**2:.0f} MB)")
+    print(f"  {n_float} float weight tensors ({float_bytes / 1024**2:.0f} MB)")
+    if dequant_bytes > 0:
+        print(
+            f"  NOTE: {dequant_bytes / 1024**2:.0f} MB size increase from dequantising "
+            f"embedding/generator tensors (nn.Embedding cannot hold uint8 data)."
+        )
     if skipped:
         print(f"  Skipped {len(skipped)} unrecognised tensor(s): {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
 
@@ -1500,6 +1565,7 @@ class GGUFConverter(BaseBin):
         written, quant_layers = build_safetensors(
             meta, args.output, target_dtype, linear_blocks,
             extra_tensors=mmproj_tensors or None,
+            has_vision_encoder=(clip_meta is not None),
         )
 
         # ------------------------------------------------------------------
@@ -1533,6 +1599,14 @@ class GGUFConverter(BaseBin):
         if linear_blocks:
             # GatedDeltaNet linear layers that may carry quantised weights.
             quant_layers_all += ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]
+        if clip_meta is None:
+            # Plain text model: replace_gguf_linear targets the whole model
+            # (quant_target = self), so self.generator is reachable and can be
+            # replaced with GGUFLinear.  Include it in quant_layers so the
+            # quantised generator.weight is loaded correctly without
+            # dequantising to float (which would inflate the file size by ~3x
+            # for models with large vocabularies quantised to Q4_K).
+            quant_layers_all += ["generator"]
 
         training_config_dict: dict = {
             "quant_type": "gguf" if quant_layers else "",

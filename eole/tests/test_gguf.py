@@ -902,6 +902,296 @@ class TestGGUFConverter(unittest.TestCase):
         self.assertEqual(tensors["tgt_emb.embeddings.weight"].dtype, torch.float16)
         self.assertEqual(tensors["decoder.layer_norm.weight"].dtype, torch.float16)
 
+    def test_generator_in_quant_layers_for_text_model(self):
+        """Plain text models (no vision encoder) include 'generator' in quant_layers."""
+        self._run_converter()
+        with open(os.path.join(self.output_dir, "config.json")) as f:
+            cfg = json.load(f)
+        self.assertIn("generator", cfg["training"]["quant_layers"])
+
+    def test_generator_weight_uint8_for_text_model(self):
+        """generator.weight stays as uint8 for plain text model (no mmproj).
+
+        For text-only models, replace_gguf_linear targets self (the whole
+        model), so self.generator is reachable.  Keeping it quantized avoids
+        the large float dequantization overhead for big-vocabulary models.
+        """
+        _require("safetensors")
+        _require("numpy")
+        _require("torch")
+        import numpy as np
+        import torch
+        from gguf import GGMLQuantizationType, GGUFWriter
+
+        # Build a minimal GGUF that has a separate output.weight (not tied).
+        tmpdir = tempfile.mkdtemp()
+        try:
+            gguf_path = os.path.join(tmpdir, "model.gguf")
+            output_dir = os.path.join(tmpdir, "eole")
+            n_vocab, hidden, heads, ff = 32, 256, 4, 512
+
+            writer = GGUFWriter(gguf_path, "llama")
+            writer.add_block_count(1)
+            writer.add_context_length(128)
+            writer.add_embedding_length(hidden)
+            writer.add_feed_forward_length(ff)
+            writer.add_head_count(heads)
+            writer.add_head_count_kv(heads)
+            writer.add_layer_norm_rms_eps(1e-5)
+            writer.add_vocab_size(n_vocab)
+            writer.add_token_list([str(i) for i in range(n_vocab)])
+            writer.add_tensor(
+                "token_embd.weight",
+                np.random.randn(n_vocab, hidden).astype(np.float32),
+            )
+            writer.add_tensor("output_norm.weight", np.ones(hidden, dtype=np.float32))
+            # Separate output.weight (no weight tying): should stay quantized.
+            writer.add_tensor(
+                "output.weight",
+                np.random.randn(n_vocab, hidden).astype(np.float32),
+                raw_dtype=GGMLQuantizationType.Q4_K,
+            )
+            writer.add_tensor(
+                "blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32)
+            )
+            writer.add_tensor(
+                "blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32)
+            )
+            for suffix, shape in [
+                ("attn_q", (hidden, hidden)),
+                ("attn_k", (hidden, hidden)),
+                ("attn_v", (hidden, hidden)),
+                ("attn_output", (hidden, hidden)),
+                ("ffn_gate", (ff, hidden)),
+                ("ffn_up", (ff, hidden)),
+                ("ffn_down", (hidden, ff)),
+            ]:
+                writer.add_tensor(
+                    f"blk.0.{suffix}.weight",
+                    np.random.randn(*shape).astype(np.float32),
+                    raw_dtype=GGMLQuantizationType.Q4_K,
+                )
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+
+            from argparse import Namespace
+            from eole.bin.convert.convert_gguf import GGUFConverter
+
+            args = Namespace(
+                gguf_path=gguf_path,
+                output=output_dir,
+                dtype="fp16",
+                tokenizer="hf",
+                hf_tokenizer=None,
+            )
+            GGUFConverter.run(args)
+
+            import safetensors.torch
+            tensors = safetensors.torch.load_file(
+                os.path.join(output_dir, "model.00.safetensors")
+            )
+            # generator.weight must be uint8 (kept quantized for text model)
+            self.assertIn("generator.weight", tensors)
+            self.assertEqual(
+                tensors["generator.weight"].dtype,
+                torch.uint8,
+                "generator.weight should be quantized uint8 for plain text model",
+            )
+            # companion gguf_qtype must be present
+            self.assertIn("generator.gguf_qtype", tensors)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestGGUFBF16Conversion(unittest.TestCase):
+    """Tests for BF16 tensor handling in _tensor_to_torch.
+
+    BF16 data from gguf-python arrives as raw uint8 bytes (the gguf library
+    has no bfloat16 numpy dtype, so BF16 tensors fall through to the
+    block_size=1 / type_size=2 uint8 path).  Without the BF16 fix the raw
+    bytes would be written to safetensors and interpreted as garbage float
+    values when loaded back by the model.
+    """
+
+    def setUp(self):
+        _require("gguf")
+        _require("numpy")
+        _require("ml_dtypes")
+
+    def _make_bf16_gguf(self, tmpdir: str) -> str:
+        """Create a minimal GGUF file with BF16-typed norm weights."""
+        import ml_dtypes
+        import numpy as np
+        from gguf import GGMLQuantizationType, GGUFWriter
+
+        gguf_path = os.path.join(tmpdir, "bf16.gguf")
+        hidden = 256
+        writer = GGUFWriter(gguf_path, "llama")
+        writer.add_block_count(1)
+        writer.add_context_length(128)
+        writer.add_embedding_length(hidden)
+        writer.add_feed_forward_length(512)
+        writer.add_head_count(4)
+        writer.add_head_count_kv(4)
+        writer.add_layer_norm_rms_eps(1e-5)
+        writer.add_vocab_size(16)
+        writer.add_token_list([str(i) for i in range(16)])
+
+        # Float embedding (F32)
+        writer.add_tensor(
+            "token_embd.weight",
+            np.ones((16, hidden), dtype=np.float32),
+        )
+        # BF16 norm weights (the key regression case: must become float16,
+        # not garbage uint8 bytes)
+        ones_f32 = np.ones(hidden, dtype=np.float32)
+        writer.add_tensor(
+            "output_norm.weight",
+            ones_f32.astype(ml_dtypes.bfloat16),
+            raw_dtype=GGMLQuantizationType.BF16,
+        )
+        writer.add_tensor(
+            "blk.0.attn_norm.weight",
+            ones_f32.astype(ml_dtypes.bfloat16),
+            raw_dtype=GGMLQuantizationType.BF16,
+        )
+        writer.add_tensor(
+            "blk.0.ffn_norm.weight",
+            ones_f32.astype(ml_dtypes.bfloat16),
+            raw_dtype=GGMLQuantizationType.BF16,
+        )
+        for suffix, shape in [
+            ("attn_q", (hidden, hidden)),
+            ("attn_k", (hidden, hidden)),
+            ("attn_v", (hidden, hidden)),
+            ("attn_output", (hidden, hidden)),
+            ("ffn_gate", (512, hidden)),
+            ("ffn_up", (512, hidden)),
+            ("ffn_down", (hidden, 512)),
+        ]:
+            writer.add_tensor(
+                f"blk.0.{suffix}.weight",
+                np.random.randn(*shape).astype(np.float32),
+                raw_dtype=GGMLQuantizationType.Q4_K,
+            )
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        return gguf_path
+
+    def test_bf16_tensor_to_torch_dtype(self):
+        """_tensor_to_torch must return float16 (not uint8) for BF16 tensors."""
+        _require("torch")
+        import torch
+        from gguf import GGUFReader
+
+        from eole.bin.convert.convert_gguf import _tensor_to_torch
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            gguf_path = self._make_bf16_gguf(tmpdir)
+            reader = GGUFReader(gguf_path)
+            for t in reader.tensors:
+                if t.tensor_type.name == "BF16":
+                    result, qtype_t = _tensor_to_torch(t, torch.float16)
+                    self.assertTrue(
+                        result.is_floating_point(),
+                        f"BF16 tensor '{t.name}' must be floating-point after conversion, "
+                        f"got dtype={result.dtype}",
+                    )
+                    self.assertEqual(
+                        result.dtype,
+                        torch.float16,
+                        f"BF16 tensor '{t.name}' must be float16 after conversion",
+                    )
+                    self.assertIsNone(
+                        qtype_t,
+                        "BF16 is a float type, qtype_t must be None",
+                    )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_bf16_tensor_shape_correct(self):
+        """BF16 tensor after conversion must have the logical (out, in) shape.
+
+        gguf-python returns BF16 as uint8 of shape (out, in*2).  After the
+        fix the view(bfloat16) halves the last dimension back to in.
+        """
+        _require("torch")
+        import torch
+        from gguf import GGUFReader
+
+        from eole.bin.convert.convert_gguf import _tensor_to_torch
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            gguf_path = self._make_bf16_gguf(tmpdir)
+            reader = GGUFReader(gguf_path)
+            for t in reader.tensors:
+                if t.tensor_type.name == "BF16" and t.data.ndim == 1:
+                    # 1-D BF16 norm weight: gguf returns uint8 of shape (hidden*2,);
+                    # after fix should be float16 of shape (hidden,).
+                    result, _ = _tensor_to_torch(t, torch.float16)
+                    raw_bytes = t.data.nbytes
+                    expected_elements = raw_bytes // 2  # 2 bytes per bfloat16
+                    self.assertEqual(
+                        result.numel(),
+                        expected_elements,
+                        f"BF16 1-D tensor '{t.name}': expected {expected_elements} "
+                        f"elements but got {result.numel()}",
+                    )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_bf16_norm_stored_as_float16_in_safetensors(self):
+        """BF16 norm weights must appear as float16 in the converted safetensors."""
+        _require("safetensors")
+        _require("torch")
+        import torch
+        from argparse import Namespace
+
+        from eole.bin.convert.convert_gguf import GGUFConverter
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            gguf_path = self._make_bf16_gguf(tmpdir)
+            output_dir = os.path.join(tmpdir, "eole")
+            args = Namespace(
+                gguf_path=gguf_path,
+                output=output_dir,
+                dtype="fp16",
+                tokenizer="hf",
+                hf_tokenizer=None,
+            )
+            GGUFConverter.run(args)
+
+            import safetensors.torch
+            tensors = safetensors.torch.load_file(
+                os.path.join(output_dir, "model.00.safetensors")
+            )
+            for key in ("decoder.layer_norm.weight",
+                        "decoder.transformer_layers.0.input_layernorm.weight",
+                        "decoder.transformer_layers.0.post_attention_layernorm.weight"):
+                if key in tensors:
+                    self.assertEqual(
+                        tensors[key].dtype,
+                        torch.float16,
+                        f"BF16 norm '{key}' must be float16 in safetensors, "
+                        f"got {tensors[key].dtype}",
+                    )
+                    # Also verify values are sensible (all-ones BF16 → ~1.0 in float16)
+                    vals = tensors[key].float()
+                    self.assertTrue(
+                        torch.allclose(vals, torch.ones_like(vals), atol=0.01),
+                        f"BF16 norm '{key}' values wrong: expected ~1.0, "
+                        f"got min={vals.min().item():.4f} max={vals.max().item():.4f}",
+                    )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class TestGGUFArchSets(unittest.TestCase):
     """Test that known architectures are properly included in the arch sets."""
