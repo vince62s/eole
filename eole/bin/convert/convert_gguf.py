@@ -906,12 +906,19 @@ def build_safetensors(
     )
 
     written: dict[str, torch.Tensor] = {}
-    skipped: list[str] = []
+
+    # Per-input-tensor accounting for the verbose summary.
+    n_input = 0           # total GGUF tensors read (excluding explicitly-None mapped ones)
+    n_filtered = 0        # eole_name is None  (rope_freqs, etc.)
+    skipped: list[str] = []  # eole_name == "" (unmapped)
+    n_quant_weight = 0    # stored as uint8 (GGUFLinear)
+    n_dequant_weight = 0  # quantized in GGUF but dequantized to float (embeddings)
+    n_float_tensor = 0    # already-float (norms, biases, …)
 
     quant_layers, dominant_qtype = _detect_quant_layers(meta.tensors)
 
     quant_bytes = 0
-    dequant_bytes = 0
+    dequant_overhead_bytes = 0
     float_bytes = 0
 
     for tensor in meta.tensors:
@@ -920,7 +927,9 @@ def build_safetensors(
 
         if eole_name is None:
             # Explicitly skipped (e.g. rope_freqs)
+            n_filtered += 1
             continue
+        n_input += 1
         if eole_name == "":
             skipped.append(gguf_name)
             continue
@@ -938,7 +947,8 @@ def build_safetensors(
                 dq = _gguf_dequantize(tensor.data, tensor.tensor_type)
                 t = torch.from_numpy(_np.array(dq, copy=True)).to(target_dtype)
                 qtype_t = None  # no companion gguf_qtype – it's plain float now
-                dequant_bytes += t.nbytes - orig_bytes
+                dequant_overhead_bytes += t.nbytes - orig_bytes
+                n_dequant_weight += 1
             except Exception as exc:
                 raise RuntimeError(
                     f"Tensor {gguf_name!r} (→ {eole_name!r}) is quantized "
@@ -962,10 +972,20 @@ def build_safetensors(
             qtype_key = eole_name.rsplit(".weight", 1)[0] + ".gguf_qtype"
             written[qtype_key] = qtype_t
             quant_bytes += t.nbytes
+            n_quant_weight += 1
         else:
             float_bytes += t.nbytes
+            # n_dequant_weight was already incremented above for tensors that were
+            # quantized in the GGUF but forced to float.  Only count here tensors
+            # that were native float types (F32/F16/BF16) in the GGUF.
+            if _is_float_type(tensor.tensor_type.name):
+                n_float_tensor += 1
+            # (else: quantized → dequantized → already counted in n_dequant_weight)
+
+    n_mapped = n_input - len(skipped)  # tensors that produced an eole key
 
     # Merge in any extra tensors from the vision encoder (mmproj)
+    n_vision = len(extra_tensors) if extra_tensors else 0
     if extra_tensors:
         written.update(extra_tensors)
 
@@ -973,18 +993,27 @@ def build_safetensors(
     safetensors_save_file(written, shard_path)
 
     shard_size_mb = os.path.getsize(shard_path) / 1024 / 1024
-    n_quant = sum(1 for k in written if k.endswith(".gguf_qtype"))
-    n_float = sum(1 for k in written if k.endswith(".weight") and not k.replace(".weight", ".gguf_qtype") in written)
-    print(f"Wrote {len(written)} tensors to {shard_path}  ({shard_size_mb:.0f} MB)")
-    print(f"  {n_quant} quantised weight tensors (uint8, {quant_bytes / 1024**2:.0f} MB)")
-    print(f"  {n_float} float weight tensors ({float_bytes / 1024**2:.0f} MB)")
-    if dequant_bytes > 0:
-        print(
-            f"  NOTE: {dequant_bytes / 1024**2:.0f} MB size increase from dequantising "
-            f"embedding/generator tensors (nn.Embedding cannot hold uint8 data)."
-        )
+    # Identity check: n_mapped == n_quant_weight + n_dequant_weight + n_float_tensor
+    # Safetensors entries from decoder == n_mapped + n_quant_weight (the gguf_qtype scalars)
+    n_written_total = len(written)
+    expected_decoder_entries = n_mapped + n_quant_weight
+
+    print(f"Decoder GGUF  ({len(meta.tensors)} input tensors):")
+    print(f"  {n_filtered} filtered (rope_freqs, etc.) → not written")
+    print(f"  {len(skipped)} unmapped (no EOLE key) → not written")
     if skipped:
-        print(f"  Skipped {len(skipped)} unrecognised tensor(s): {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+        print(f"    {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+    print(f"  {n_quant_weight} quantized weights → stored as uint8 ({quant_bytes / 1024**2:.0f} MB)")
+    if n_dequant_weight:
+        print(f"  {n_dequant_weight} quantized embeddings → dequantized to float16 "
+              f"(+{dequant_overhead_bytes / 1024**2:.0f} MB overhead vs packed)")
+    print(f"  {n_float_tensor} native float tensors (norms, biases, …) ({float_bytes / 1024**2:.0f} MB)")
+    print(f"  = {n_mapped} tensor EOLE keys + {n_quant_weight} gguf_qtype scalars "
+          f"= {expected_decoder_entries} decoder safetensors entries")
+    if n_vision:
+        print(f"  + {n_vision} vision encoder entries (from mmproj)")
+    print(f"Shard: {shard_path}")
+    print(f"  {n_written_total} total entries  ({shard_size_mb:.0f} MB)")
 
     return written, quant_layers
 
@@ -1414,6 +1443,7 @@ class GGUFConverter(BaseBin):
             print(f"  KV heads     : {meta.head_count_kv}")
         if meta.expert_count:
             print(f"  Experts      : {meta.expert_count} (used: {meta.expert_used_count})")
+        print(f"  Tensors in GGUF : {len(meta.tensors)}")
 
         # ------------------------------------------------------------------
         # Optional vision encoder (mmproj GGUF)
@@ -1427,8 +1457,9 @@ class GGUFConverter(BaseBin):
             print(f"  Enc layers   : {clip_meta.vision_block_count}")
             print(f"  Enc hidden   : {clip_meta.vision_embedding_length}")
             print(f"  Image size   : {clip_meta.vision_image_size}")
+            print(f"  Tensors in GGUF : {len(clip_meta.tensors)}")
             mmproj_tensors, mmproj_skipped = _mmproj_to_eole_tensors(clip_meta, target_dtype)
-            print(f"  Converted {len(mmproj_tensors)} vision tensors")
+            print(f"  Converted {len(mmproj_tensors)} vision tensors → EOLE keys")
             if mmproj_skipped:
                 print(f"  Skipped {len(mmproj_skipped)}: {mmproj_skipped[:5]}")
 
@@ -1632,10 +1663,18 @@ class GGUFConverter(BaseBin):
         with open(config_path, "w", encoding="utf-8") as fh:
             json.dump(config_dict, fh, indent=2, ensure_ascii=False)
 
+        # Safetensors entry breakdown: weight + gguf_qtype scalars + vision
+        n_qtype_scalars = sum(1 for k in written if k.endswith(".gguf_qtype"))
+        n_vision_entries = len(mmproj_tensors) if mmproj_tensors else 0
+        n_decoder_entries = len(written) - n_vision_entries
         print(f"\nConversion complete → {args.output}")
         print("  config.json")
         if src_vocab is not None:
             print("  vocab.json / vocab.txt")
-        print(f"  model.00.safetensors  ({len(written)} tensors)")
+        print(f"  model.00.safetensors  ({len(written)} total entries):")
+        print(f"    {n_decoder_entries} decoder entries "
+              f"(includes {n_qtype_scalars} gguf_qtype scalars for quantized layers)")
+        if n_vision_entries:
+            print(f"    {n_vision_entries} vision encoder entries")
         if quant_layers:
-            print(f"  Quantised layers ({len(quant_layers)}): {', '.join(quant_layers)}")
+            print(f"  Quantized layers ({len(quant_layers)}): {', '.join(quant_layers)}")
