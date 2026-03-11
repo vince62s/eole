@@ -451,12 +451,20 @@ class GGUFMetadata:
         ``[11, 11, 10]``).  Trailing zeros are stripped so that
         ``xdrope_section`` matches the three-element T/H/W layout expected
         by :func:`~eole.modules.rope.apply_rotary_pos_emb_xdrope`.
+
+        **Implementation note**: for GGUF ARRAY fields, gguf-python stores one
+        index per element in ``field.data``, each pointing to a separate 1-element
+        numpy array in ``field.parts``.  Reading only ``field.parts[field.data[-1]]``
+        would give just the *last* element (the trailing zero), so we must iterate
+        over *all* indices in ``field.data``.
         """
         field = self._get_field(self._a("{arch}.rope.dimension_sections"))
         if field is None:
             return None
         try:
-            sections = field.parts[field.data[-1]].tolist()
+            # Collect all element values: each field.data[i] is an index into
+            # field.parts pointing to a 1-element numpy array for that element.
+            sections = [pv for idx in field.data for pv in field.parts[idx].tolist()]
             # Strip trailing zeros (GGUF null-padding artefact).
             while sections and sections[-1] == 0:
                 sections.pop()
@@ -591,15 +599,13 @@ _GEMMA_RMS_ARCHS = frozenset("gemma2 gemma3 qwen35 qwen35moe".split())
 # with interleaved rotation and therefore require rotary_interleave=True in
 # the EOLE rope_config.
 #
-# NOTE: qwen35 / qwen35moe are intentionally EXCLUDED here.  HF Qwen3.5
-# applies rotate_half (halves rotation) — identical to eole's
-# rotary_interleave=False — after baking the T/H/W positional interleaving
-# into the cos/sin tables via apply_interleaved_mrope.  Setting
-# rotary_interleave=True would use GPT-J pairs rotation which gives different
-# results and produces garbage output.  The xdrope_section field (from
-# rope.dimension_sections) is sufficient to handle the T/H/W frequency
-# assignment for visual tokens without needing rotary_interleave.
-_MROPE_INTERLEAVE_ARCHS = frozenset("qwen2vl qwen3vl qwen3vlmoe".split())
+# qwen35 / qwen35moe are vision-language models whose text decoder always uses
+# the interleaved MRoPE defined in Qwen3_5TextRotaryEmbedding.apply_interleaved_mrope
+# (see transformers/models/qwen3_5/modeling_qwen3_5.py).  Even in text-only
+# inference, position_ids are expanded to 3 dimensions and the interleaved
+# layout is applied — so rotary_interleave=True must be set for all qwen35 GGUF
+# files, regardless of whether rope.dimension_sections metadata is present.
+_MROPE_INTERLEAVE_ARCHS = frozenset("qwen35 qwen35moe qwen2vl qwen3vl qwen3vlmoe".split())
 
 
 def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
