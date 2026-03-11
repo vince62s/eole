@@ -12,27 +12,22 @@ safetensors shard.  Both buffers are loaded automatically by
 
 GPU fast-paths (priority order)
 --------------------------------
-1. **vLLM CUDA kernels** (``vllm._custom_ops`` / ``vllm._C``): when vLLM is
-   installed and the weight is on a CUDA device, the three kernels ported from
-   ``ggml_quants.cu`` handle *all* GGUF quantisation types — including Q4_K/M,
-   Q5_K, Q6_K, Q3_K, Q2_K and all IQ-family types — without any CPU
-   round-trip.  The module tries ``vllm._custom_ops`` first (vLLM ≥ 0.5.x)
-   and falls back to ``vllm._C`` for older builds:
+1. **vLLM fused op** (``torch.ops.vllm._fused_mul_mat_gguf``): when vLLM is
+   installed and the weight is on a CUDA device, the single fused op
+   registered by ``vllm/model_executor/layers/quantization/gguf.py`` handles
+   *all* GGUF quantisation types — including Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K
+   and all IQ-family types — without any CPU round-trip.
 
-   * ``ggml_mul_mat_vec_a8`` – fused MMVQ (matrix-vector) for small batches.
-   * ``ggml_mul_mat_a8``     – fused MMQ  (matrix-matrix) for larger batches
-     (standard + K-quant types only).
-   * ``ggml_dequantize``     – GPU dequantise then standard ``x @ W.T`` for
-     IQ types with large batch where MMQ is not yet available.
+   The fused op contains the exact same dispatch logic as vLLM uses for its
+   own GGUF linear layers:
 
-   .. note::
-       The MMVQ and MMQ kernels use ``half*`` (float16) internally.
-       Activations are **always cast to float16** before the kernel call.
-       Passing bfloat16 or float32 bits directly would cause the kernel to
-       misinterpret them and produce garbage output.
+   * ``ggml_mul_mat_vec_a8`` (MMVQ) for small batch sizes.
+   * ``ggml_mul_mat_a8`` (MMQ) for larger batches on standard + K-quant types.
+   * ``ggml_dequantize`` + ``x @ W.T`` for IQ types with large batches.
+   * Direct ``x @ W.T`` for unquantized (F16/BF16/F32) weight types.
 
-   This replicates the strategy used in
-   ``vllm/model_executor/layers/quantization/gguf.py``.
+   The op handles dtype dispatch internally and preserves the activation dtype
+   in the output — no manual float16 cast is required or applied.
 
 2. **Triton fused kernel** (Q4_0 only): when Triton is installed but vLLM is
    not, dequantises Q4_0 weights in GPU registers, never writing an fp16
@@ -70,57 +65,28 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Optional vLLM GGUF CUDA ops.
 #
-# When ``vllm._C`` is importable the three kernels compiled from
-# ggml_quants.cu are available and handle ALL ggml quantisation types on GPU.
-# The kernel selection logic mirrors
-# ``vllm/model_executor/layers/quantization/gguf.py::_fused_mul_mat_gguf``.
+# ---------------------------------------------------------------------------
+# Optional vLLM GGUF support via ``torch.ops.vllm._fused_mul_mat_gguf``.
+#
+# vLLM registers a single fused op that encapsulates the full MMVQ/MMQ/
+# dequantize dispatch logic used by vLLM's own GGUF linear layers:
+#   vllm/model_executor/layers/quantization/gguf.py::_fused_mul_mat_gguf
+#
+# Importing that module triggers the op registration and provides a direct
+# callable handle.  The op handles all quant types and preserves the input
+# activation dtype in the output.
 # ---------------------------------------------------------------------------
 
 _VLLM_GGUF_OPS_AVAILABLE = False
-_vllm_ggml_dequantize = None
-_vllm_ggml_mul_mat_vec_a8 = None
-_vllm_ggml_mul_mat_a8 = None
-
-# Type-ID sets that drive kernel selection (integer values of the enum).
-# Built from the gguf library; empty frozensets if gguf is not installed.
-_VLLM_MMQ_TYPE_IDS: frozenset[int] = frozenset()      # standard + K-quants
-_VLLM_IMATRIX_TYPE_IDS: frozenset[int] = frozenset()  # IQ-family
+_vllm_fused_mul_mat_gguf = None
 
 try:
-    from gguf import GGMLQuantizationType as _GQT
-
-    _standard_names = {"Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q8_1"}
-    _kquant_names = {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"}
-    _imatrix_names = {
-        "IQ1_M", "IQ1_S", "IQ2_XXS", "IQ2_XS", "IQ2_S",
-        "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL",
-    }
-
-    def _type_ids(*names: str) -> frozenset:
-        return frozenset(_GQT[n].value for n in names if hasattr(_GQT, n))
-
-    _VLLM_MMQ_TYPE_IDS = _type_ids(*(_standard_names | _kquant_names))
-    _VLLM_IMATRIX_TYPE_IDS = _type_ids(*_imatrix_names)
-
-    del _type_ids, _standard_names, _kquant_names, _imatrix_names, _GQT
-except ImportError:
-    pass
-
-try:
-    # vLLM ≥ 0.5.x reorganised the CUDA extension: the GGUF ops moved from
-    # the monolithic ``vllm._C`` module into ``vllm._custom_ops``.  Try the
-    # newer path first; fall back to ``_C`` for older vLLM installations.
-    try:
-        import vllm._custom_ops as _vllm_c
-    except ImportError:
-        import vllm._C as _vllm_c  # older vLLM versions
-
-    _vllm_ggml_dequantize = _vllm_c.ggml_dequantize
-    _vllm_ggml_mul_mat_vec_a8 = _vllm_c.ggml_mul_mat_vec_a8
-    _vllm_ggml_mul_mat_a8 = _vllm_c.ggml_mul_mat_a8
+    from vllm.model_executor.layers.quantization.gguf import (
+        fused_mul_mat_gguf as _vllm_fused_mul_mat_gguf,
+    )
     _VLLM_GGUF_OPS_AVAILABLE = True
 except Exception:
-    _VLLM_GGUF_OPS_AVAILABLE = False
+    pass
 
 
 def _vllm_gguf_linear(
@@ -130,24 +96,18 @@ def _vllm_gguf_linear(
     out_features: int,
     in_features: int,
 ) -> torch.Tensor:
-    """vLLM-style fused GGUF dequantize+matmul using ``ggml_quants.cu`` kernels.
+    """vLLM-backed GGUF linear using ``torch.ops.vllm._fused_mul_mat_gguf``.
 
-    Replicates the kernel-selection logic from
-    ``vllm/model_executor/layers/quantization/gguf.py::_fused_mul_mat_gguf``:
+    Delegates entirely to vLLM's single fused op, which owns the full dispatch
+    logic mirroring ``vllm/model_executor/layers/quantization/gguf.py``:
 
-    * ``ggml_mul_mat_vec_a8`` (MMVQ) for small batch sizes (≤ 2 or 6).
-    * ``ggml_mul_mat_a8`` (MMQ) for larger batches — standard + K-quant types.
+    * ``ggml_mul_mat_vec_a8`` (MMVQ) for small batch sizes.
+    * ``ggml_mul_mat_a8`` (MMQ) for larger batches on standard/K-quant types.
     * ``ggml_dequantize`` + ``x @ W.T`` for IQ types with large batches.
+    * Direct ``x @ W.T`` for unquantized (F16/BF16/F32) weight types.
 
-    .. important::
-
-        The MMVQ and MMQ CUDA kernels from ``ggml_quants.cu`` use ``half*``
-        (float16) internally.  Activations are therefore **always cast to
-        float16** before the kernel call, regardless of the model dtype
-        (bfloat16 or float32).  Passing bfloat16 or float32 bits directly
-        causes the kernel to misinterpret them as float16 and produce garbage
-        output.  The caller (``GGUFLinear.forward``) casts the result back to
-        the original dtype after this function returns.
+    The fused op handles dtype dispatch internally and preserves the input
+    activation dtype in the output.
 
     Parameters
     ----------
@@ -163,8 +123,7 @@ def _vllm_gguf_linear(
     Returns
     -------
     torch.Tensor
-        Output of shape ``(*, out_features)`` in **float16**.  The caller is
-        responsible for casting back to the desired compute dtype.
+        Output of shape ``(*, out_features)``, same dtype as *x*.
     """
     try:
         from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
@@ -175,8 +134,6 @@ def _vllm_gguf_linear(
 
     block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType(qtype_val)]
     bytes_per_row = in_features // block_size * type_size
-    # The ggml CUDA kernels read the weight as a row-major uint8 matrix.
-    # Contiguous memory layout is required to avoid reading from wrong offsets.
     weight_2d = weight_u8.reshape(out_features, bytes_per_row).contiguous()
 
     orig_shape = x.shape
@@ -186,47 +143,7 @@ def _vllm_gguf_linear(
     if N == 0:
         return torch.empty(*orig_shape[:-1], out_features, dtype=x.dtype, device=x.device)
 
-    is_imatrix = qtype_val in _VLLM_IMATRIX_TYPE_IDS
-
-    # MMVQ batch-size thresholds mirror vLLM's _fused_mul_mat_gguf heuristic:
-    #   - IQ types tolerate larger MMVQ batch because MMQ is not yet available
-    #     for them; the "large model" boundary (> 5120 output rows) drops the
-    #     threshold to conserve shared memory.
-    #   - Standard / K-quant types use a much lower threshold because MMQ
-    #     (ggml_mul_mat_a8) is available and more efficient for any N > 2/6.
-    if is_imatrix:
-        # IQ types: MMVQ for N ≤ 8 (large model) or N ≤ 16 (small model).
-        _IMATRIX_MMVQ_MAX_LARGE = 8   # out_features > 5120
-        _IMATRIX_MMVQ_MAX_SMALL = 16  # out_features ≤ 5120
-        mmvq_safe = _IMATRIX_MMVQ_MAX_LARGE if out_features > 5120 else _IMATRIX_MMVQ_MAX_SMALL
-    else:
-        # Standard / K-quant types: MMVQ for N ≤ 2 (large) or N ≤ 6 (small).
-        _STANDARD_MMVQ_MAX_LARGE = 2
-        _STANDARD_MMVQ_MAX_SMALL = 6
-        mmvq_safe = _STANDARD_MMVQ_MAX_LARGE if out_features > 5120 else _STANDARD_MMVQ_MAX_SMALL
-
-    # The ggml MMVQ / MMQ CUDA kernels (mul_mat_q / mul_mat_vec_q families)
-    # use float16 (half) for activations internally.  Passing bfloat16 or
-    # float32 bits directly causes the kernel to misinterpret them as float16,
-    # producing garbage results.  Cast x to float16 here; the caller casts the
-    # output back to the original dtype.
-    x_fp16 = x_2d.to(torch.float16)
-
-    if N <= mmvq_safe:
-        # MMVQ: fused quantised mat-vec (all types).
-        y = _vllm_ggml_mul_mat_vec_a8(weight_2d, x_fp16, qtype_val, out_features)
-    elif not is_imatrix:
-        # MMQ: fused quantised mat-mat (standard + K-quant types).
-        y = _vllm_ggml_mul_mat_a8(weight_2d, x_fp16, qtype_val, out_features)
-    else:
-        # I-quant with large batch: dequantise on GPU then standard matmul.
-        # ggml_dequantize accepts any output dtype, so we preserve x's dtype
-        # to avoid an extra cast on the multiply-accumulate path.
-        weight_dq = _vllm_ggml_dequantize(
-            weight_2d, qtype_val, out_features, in_features, x.dtype
-        )
-        y = x_2d @ weight_dq.T
-
+    y = _vllm_fused_mul_mat_gguf(x_2d, weight_2d, qtype_val)
     return y.reshape(*orig_shape[:-1], out_features)
 
 
@@ -500,13 +417,11 @@ class GGUFLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Dequantize weight on-the-fly, then apply linear transformation.
 
-        **vLLM CUDA kernels (all types, CUDA + vLLM installed)** — the three
-        kernels compiled from ``ggml_quants.cu`` handle every GGUF quantisation
-        type, including Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K, and all IQ-family
-        types.  Activations are **cast to float16** before the kernel call
-        because the ggml MMVQ/MMQ kernels use ``half*`` internally — passing
-        bfloat16 or float32 bits directly produces garbage.  The result is cast
-        back to the model's compute dtype before returning.
+        **vLLM fused op (all types, CUDA + vLLM installed)** — delegates to
+        ``torch.ops.vllm._fused_mul_mat_gguf``, which is the same op used by
+        vLLM's own GGUF linear layers.  It handles every GGUF quantisation
+        type (Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K, IQ-family, …) and owns all
+        MMVQ/MMQ/dequantize dispatch and dtype logic internally.
 
         **Triton fused kernel (Q4_0, CUDA + Triton, no vLLM)** — dequantises
         Q4_0 weights in GPU registers and accumulates directly into the output.

@@ -685,22 +685,19 @@ class TestGGUFLinearVLLM(unittest.TestCase):
         self.assertEqual(vllm_calls["n"], 1, "vLLM path was not invoked")
         self.assertEqual(triton_calls["n"], 0, "Triton was used even though vLLM is available")
 
-    def test_vllm_activations_cast_to_float16(self):
-        """_vllm_gguf_linear must cast x to float16 before MMVQ/MMQ kernels.
+    def test_vllm_delegates_to_fused_op(self):
+        """_vllm_gguf_linear must call _vllm_fused_mul_mat_gguf without dtype cast.
 
-        The ggml CUDA kernels use ``half*`` (float16) internally.  Passing
-        bfloat16 or float32 without casting would cause them to misinterpret
-        the bytes and produce garbage output.  This test verifies that:
-        1. The kernel is called with a float16 tensor, not the original dtype.
-        2. GGUFLinear.forward() returns a tensor in the original dtype.
+        vLLM's fused op owns all dispatch and dtype logic internally.  Our
+        wrapper must pass (x_2d, weight_2d, qtype_val) directly — no manual
+        float16 cast — and the output dtype must match the input dtype.
         """
         import torch
         from unittest.mock import patch
 
         from eole.modules.gguf_linear import (
             _VLLM_GGUF_OPS_AVAILABLE,
-            _vllm_ggml_mul_mat_a8,
-            _vllm_ggml_mul_mat_vec_a8,
+            _vllm_fused_mul_mat_gguf,
         )
         from gguf import GGMLQuantizationType
 
@@ -710,34 +707,25 @@ class TestGGUFLinearVLLM(unittest.TestCase):
         layer = self._make_gguf_layer_cuda(32, 128, GGMLQuantizationType.Q4_0)
 
         for input_dtype in (torch.float16, torch.bfloat16, torch.float32):
-            kernel_input_dtypes = []
+            calls = []
+            real_fused = _vllm_fused_mul_mat_gguf
 
-            def spy_mmvq(W, X, qtype, row, **kw):
-                kernel_input_dtypes.append(X.dtype)
-                return _vllm_ggml_mul_mat_vec_a8(W, X, qtype, row)
+            def spy(x_arg, w_arg, qtype_arg):
+                calls.append({"x_dtype": x_arg.dtype, "x_shape": tuple(x_arg.shape)})
+                return real_fused(x_arg, w_arg, qtype_arg)
 
-            def spy_mmq(W, X, qtype, row, **kw):
-                kernel_input_dtypes.append(X.dtype)
-                return _vllm_ggml_mul_mat_a8(W, X, qtype, row)
+            x = torch.randn(2, 128, dtype=input_dtype, device="cuda")
 
-            # Use batch size = 1 so MMVQ path is taken; test the cast regardless.
-            x = torch.randn(1, 128, dtype=input_dtype, device="cuda")
-
-            with (
-                patch("eole.modules.gguf_linear._vllm_ggml_mul_mat_vec_a8", side_effect=spy_mmvq),
-                patch("eole.modules.gguf_linear._vllm_ggml_mul_mat_a8", side_effect=spy_mmq),
-            ):
+            with patch("eole.modules.gguf_linear._vllm_fused_mul_mat_gguf", side_effect=spy):
                 out = layer(x)
 
-            # The kernel must have received float16 activations.
-            if kernel_input_dtypes:
-                for dtype in kernel_input_dtypes:
-                    self.assertEqual(
-                        dtype, torch.float16,
-                        f"Kernel received {dtype} instead of float16 for input_dtype={input_dtype}",
-                    )
-
-            # The output must be in the original input dtype.
+            self.assertEqual(len(calls), 1, "fused op must be called exactly once")
+            # The fused op must receive the original activation dtype — no cast.
+            self.assertEqual(
+                calls[0]["x_dtype"], input_dtype,
+                f"Fused op received {calls[0]['x_dtype']} instead of {input_dtype}",
+            )
+            # Output dtype must equal the input dtype.
             self.assertEqual(
                 out.dtype, input_dtype,
                 f"Expected output dtype {input_dtype}, got {out.dtype}",
