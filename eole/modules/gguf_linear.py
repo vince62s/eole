@@ -10,11 +10,31 @@ and stored alongside the quantized weight buffer (``weight``, uint8) in the
 safetensors shard.  Both buffers are loaded automatically by
 :meth:`~eole.models.model.BaseModel.load_safe_state_dict`.
 
-For Q4_0 on CUDA, a Triton kernel is used when available to perform a fused
-dequantize+matmul that keeps weights quantised throughout, reading only
-M*(K//32)*18 bytes from HBM instead of materialising the M*K fp16 weight
-matrix.  The Triton path is automatically skipped on CPU or when Triton is not
-installed.
+GPU fast-paths (priority order)
+--------------------------------
+1. **vLLM CUDA kernels** (``vllm._C``): when vLLM is installed and the weight
+   is on a CUDA device, the three kernels ported from ``ggml_quants.cu``
+   handle *all* GGUF quantisation types — including Q4_K/M, Q5_K, Q6_K, Q3_K,
+   Q2_K and all IQ-family types — without any CPU round-trip:
+
+   * ``ggml_mul_mat_vec_a8`` – fused MMVQ (matrix-vector) for small batches.
+   * ``ggml_mul_mat_a8``     – fused MMQ  (matrix-matrix) for larger batches
+     (standard + K-quant types only).
+   * ``ggml_dequantize``     – GPU dequantise then standard ``x @ W.T`` for
+     IQ types with large batch where MMQ is not yet available.
+
+   This replicates the strategy used in
+   ``vllm/model_executor/layers/quantization/gguf.py``.
+
+2. **Triton fused kernel** (Q4_0 only): when Triton is installed but vLLM is
+   not, dequantises Q4_0 weights in GPU registers, never writing an fp16
+   weight tensor to HBM.
+
+3. **PyTorch-native GPU paths** (Q8_0, Q4_0, Q4_1): on-device tensor ops,
+   no CPU round-trip.
+
+4. **CPU fallback** (all other types): ``gguf.dequantize`` via numpy, then
+   the result is moved back to the compute device.
 """
 
 import torch
@@ -40,7 +60,144 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
+# Optional vLLM GGUF CUDA ops.
+#
+# When ``vllm._C`` is importable the three kernels compiled from
+# ggml_quants.cu are available and handle ALL ggml quantisation types on GPU.
+# The kernel selection logic mirrors
+# ``vllm/model_executor/layers/quantization/gguf.py::_fused_mul_mat_gguf``.
+# ---------------------------------------------------------------------------
+
+_VLLM_GGUF_OPS_AVAILABLE = False
+_vllm_ggml_dequantize = None
+_vllm_ggml_mul_mat_vec_a8 = None
+_vllm_ggml_mul_mat_a8 = None
+
+# Type-ID sets that drive kernel selection (integer values of the enum).
+# Built from the gguf library; empty frozensets if gguf is not installed.
+_VLLM_MMQ_TYPE_IDS: frozenset[int] = frozenset()      # standard + K-quants
+_VLLM_IMATRIX_TYPE_IDS: frozenset[int] = frozenset()  # IQ-family
+
+try:
+    from gguf import GGMLQuantizationType as _GQT
+
+    _standard_names = {"Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q8_1"}
+    _kquant_names = {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"}
+    _imatrix_names = {
+        "IQ1_M", "IQ1_S", "IQ2_XXS", "IQ2_XS", "IQ2_S",
+        "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL",
+    }
+
+    def _type_ids(*names: str) -> frozenset:
+        return frozenset(_GQT[n].value for n in names if hasattr(_GQT, n))
+
+    _VLLM_MMQ_TYPE_IDS = _type_ids(*(_standard_names | _kquant_names))
+    _VLLM_IMATRIX_TYPE_IDS = _type_ids(*_imatrix_names)
+
+    del _type_ids, _standard_names, _kquant_names, _imatrix_names, _GQT
+except ImportError:
+    pass
+
+try:
+    import vllm._C as _vllm_c  # CUDA extension compiled with vLLM
+
+    _vllm_ggml_dequantize = _vllm_c.ggml_dequantize
+    _vllm_ggml_mul_mat_vec_a8 = _vllm_c.ggml_mul_mat_vec_a8
+    _vllm_ggml_mul_mat_a8 = _vllm_c.ggml_mul_mat_a8
+    _VLLM_GGUF_OPS_AVAILABLE = True
+except Exception:
+    _VLLM_GGUF_OPS_AVAILABLE = False
+
+
+def _vllm_gguf_linear(
+    weight_u8: torch.Tensor,
+    x: torch.Tensor,
+    qtype_val: int,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    """vLLM-style fused GGUF dequantize+matmul using ``ggml_quants.cu`` kernels.
+
+    Replicates the kernel-selection logic from
+    ``vllm/model_executor/layers/quantization/gguf.py::_fused_mul_mat_gguf``:
+
+    * ``ggml_mul_mat_vec_a8`` (MMVQ) for small batch sizes (≤ 2 or 6).
+    * ``ggml_mul_mat_a8`` (MMQ) for larger batches — standard + K-quant types.
+    * ``ggml_dequantize`` + ``x @ W.T`` for IQ types with large batches.
+
+    Parameters
+    ----------
+    weight_u8 : torch.Tensor
+        Flat ``uint8`` tensor of raw GGUF weight blocks, on a CUDA device.
+    x : torch.Tensor
+        Input activations, shape ``(*, in_features)``, on the same device.
+    qtype_val : int
+        Integer value of the :class:`gguf.GGMLQuantizationType` enum.
+    out_features, in_features : int
+        Logical dimensions of the linear transformation.
+
+    Returns
+    -------
+    torch.Tensor
+        Output of shape ``(*, out_features)``, same dtype as *x*.
+    """
+    try:
+        from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+    except ImportError:
+        raise ImportError(
+            "Install 'gguf' to run vLLM-backed GGUF inference: pip install gguf"
+        )
+
+    block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType(qtype_val)]
+    bytes_per_row = in_features // block_size * type_size
+    weight_2d = weight_u8.reshape(out_features, bytes_per_row)
+
+    orig_shape = x.shape
+    N = x.numel() // in_features
+    x_2d = x.contiguous().reshape(N, in_features)
+
+    if N == 0:
+        return torch.empty(*orig_shape[:-1], out_features, dtype=x.dtype, device=x.device)
+
+    is_imatrix = qtype_val in _VLLM_IMATRIX_TYPE_IDS
+
+    # MMVQ batch-size thresholds mirror vLLM's _fused_mul_mat_gguf heuristic:
+    #   - IQ types tolerate larger MMVQ batch because MMQ is not yet available
+    #     for them; the "large model" boundary (> 5120 output rows) drops the
+    #     threshold to conserve shared memory.
+    #   - Standard / K-quant types use a much lower threshold because MMQ
+    #     (ggml_mul_mat_a8) is available and more efficient for any N > 2/6.
+    if is_imatrix:
+        # IQ types: MMVQ for N ≤ 8 (large model) or N ≤ 16 (small model).
+        _IMATRIX_MMVQ_MAX_LARGE = 8   # out_features > 5120
+        _IMATRIX_MMVQ_MAX_SMALL = 16  # out_features ≤ 5120
+        mmvq_safe = _IMATRIX_MMVQ_MAX_LARGE if out_features > 5120 else _IMATRIX_MMVQ_MAX_SMALL
+    else:
+        # Standard / K-quant types: MMVQ for N ≤ 2 (large) or N ≤ 6 (small).
+        _STANDARD_MMVQ_MAX_LARGE = 2
+        _STANDARD_MMVQ_MAX_SMALL = 6
+        mmvq_safe = _STANDARD_MMVQ_MAX_LARGE if out_features > 5120 else _STANDARD_MMVQ_MAX_SMALL
+
+    if N <= mmvq_safe:
+        # MMVQ: fused quantised mat-vec (all types).
+        y = _vllm_ggml_mul_mat_vec_a8(weight_2d, x_2d, qtype_val, out_features)
+    elif not is_imatrix:
+        # MMQ: fused quantised mat-mat (standard + K-quant types).
+        y = _vllm_ggml_mul_mat_a8(weight_2d, x_2d, qtype_val, out_features)
+    else:
+        # I-quant with large batch: dequantise on GPU then standard matmul.
+        weight_dq = _vllm_ggml_dequantize(
+            weight_2d, qtype_val, out_features, in_features, x.dtype
+        )
+        y = x_2d @ weight_dq.T
+
+    return y.reshape(*orig_shape[:-1], out_features)
+
+
+# ---------------------------------------------------------------------------
 # Optional Triton fused kernel for Q4_0 dequantize + matmul.
+#
+# Used when Triton is installed but vLLM is not available.  Handles Q4_0 only.
 #
 # Q4_0 block layout (18 bytes per block of 32 weights):
 #   bytes 0-1 : scale, float16 little-endian
@@ -307,21 +464,19 @@ class GGUFLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Dequantize weight on-the-fly, then apply linear transformation.
 
-        **Q4_0 on CUDA with Triton installed** — a fused Triton kernel
-        (:func:`_q4_0_dequant_matmul_kernel`) is used.  Weights are
-        dequantised in GPU registers and never written back to HBM as a
-        dense fp16 tensor.  This saves bandwidth proportional to the weight
-        size (≈ 2.25× less HBM traffic vs. the plain PyTorch path).
+        **vLLM CUDA kernels (all types, CUDA + vLLM installed)** — the three
+        kernels compiled from ``ggml_quants.cu`` handle every GGUF quantisation
+        type, including Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K, and all IQ-family
+        types.  No CPU round-trip, no intermediate fp16 weight tensor.
 
-        **Q8_0, Q4_0 (without Triton / on CPU), and Q4_1** — dequantisation
-        is performed entirely on the same device as the weight tensor using
-        PyTorch tensor operations, which avoids any CPU round-trip when the
-        model is on a CUDA device.
+        **Triton fused kernel (Q4_0, CUDA + Triton, no vLLM)** — dequantises
+        Q4_0 weights in GPU registers and accumulates directly into the output.
 
-        **All other GGUF types** (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ-family,
-        …) fall back to the ``gguf`` library's CPU path.  The quantised weight
-        buffer is briefly copied to the CPU for dequantisation before the
-        result is moved back to the compute device.
+        **PyTorch-native GPU paths (Q8_0, Q4_0, Q4_1)** — on-device tensor
+        ops; no CPU round-trip when the model is on a CUDA device.
+
+        **CPU fallback (all remaining types)** — ``gguf.dequantize`` via numpy;
+        the quantised buffer is copied to the CPU and the result is moved back.
         """
         try:
             from gguf import GGMLQuantizationType
@@ -334,8 +489,21 @@ class GGUFLinear(nn.Module):
         device = self.weight.device
 
         # ------------------------------------------------------------------
-        # GPU-native paths: dequantise directly on-device with PyTorch ops.
-        # The quantised uint8 weight stays on the GPU; no CPU round-trip.
+        # 1. vLLM CUDA path: handles ALL GGUF types on GPU using the three
+        #    kernels from ggml_quants.cu (MMVQ / MMQ / dequantize+matmul).
+        #    This covers K-quants and IQ-quants with no CPU round-trip.
+        # ------------------------------------------------------------------
+        if _VLLM_GGUF_OPS_AVAILABLE and self.weight.is_cuda:
+            out = _vllm_gguf_linear(
+                self.weight, x, qtype_val, self.out_features, self.in_features
+            ).to(dtype=target_dtype)
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+
+        # ------------------------------------------------------------------
+        # 2. PyTorch-native GPU paths.
+        #    The quantised uint8 weight stays on the GPU; no CPU round-trip.
         #
         # Block layouts follow the GGUF spec (little-endian scalars):
         #   Q8_0 – [d:f16 (2 B), qs:i8[32] (32 B)]          34 B / 32 elems

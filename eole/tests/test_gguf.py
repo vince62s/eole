@@ -514,6 +514,178 @@ class TestGGUFLinearTriton(unittest.TestCase):
         self.assertEqual(call_count["n"], 1, "Triton path was not invoked")
 
 
+class TestGGUFLinearVLLM(unittest.TestCase):
+    """Validate the vLLM GGUF CUDA kernel integration.
+
+    All tests in this class are skipped automatically when:
+    * ``vllm._C`` (vLLM CUDA extension) is not installed,
+    * no CUDA device is available, or
+    * the ``gguf`` or ``numpy`` packages are absent.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _require("gguf")
+        _require("numpy")
+        import torch
+
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA not available")
+        try:
+            import importlib
+            importlib.import_module("vllm._C")
+        except ImportError:
+            raise unittest.SkipTest("vllm._C not installed")
+
+    def _make_gguf_layer_cuda(self, n_out, n_in, qtype_enum):
+        """Build a GGUFLinear layer (given qtype) with weights on CUDA."""
+        import os
+        import tempfile
+
+        import numpy as np
+        import torch
+        from gguf import GGUFReader, GGUFWriter
+
+        from eole.modules.gguf_linear import GGUFLinear
+
+        with tempfile.TemporaryDirectory() as td:
+            gpath = os.path.join(td, "tiny.gguf")
+            writer = GGUFWriter(gpath, "llama")
+            writer.add_block_count(1)
+            writer.add_embedding_length(n_in)
+            writer.add_vocab_size(n_out)
+            writer.add_tensor(
+                "test.weight",
+                np.random.randn(n_out, n_in).astype(np.float32),
+                raw_dtype=qtype_enum,
+            )
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            reader = GGUFReader(gpath)
+            q_data = reader.tensors[0].data.copy()
+
+        layer = GGUFLinear(in_features=n_in, out_features=n_out, bias=False)
+        layer.register_buffer("weight", torch.from_numpy(q_data).cuda())
+        layer.register_buffer(
+            "gguf_qtype",
+            torch.tensor([qtype_enum.value], dtype=torch.int32),
+        )
+        return layer
+
+    def _assert_vllm_path_matches_reference(self, qtype_enum, n_out=32, n_in=128, dtype=None):
+        """vLLM kernel output must match the numpy dequant reference."""
+        import torch
+        import torch.nn.functional as F
+        from gguf import dequantize
+
+        if dtype is None:
+            dtype = torch.float16
+
+        layer = self._make_gguf_layer_cuda(n_out, n_in, qtype_enum)
+        x = torch.randn(2, 4, n_in, dtype=dtype, device="cuda")
+
+        # Reference: numpy dequant + F.linear
+        w_np = layer.weight.cpu().numpy()
+        dq_np = dequantize(w_np, qtype_enum)
+        w_ref = (
+            torch.from_numpy(dq_np)
+            .reshape(n_out, n_in)
+            .to(dtype=dtype, device="cuda")
+        )
+        expected = F.linear(x, w_ref)
+        actual = layer(x)
+
+        self.assertEqual(actual.shape, (2, 4, n_out))
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+    def test_vllm_q4_0(self):
+        """vLLM path must match numpy reference for Q4_0."""
+        from gguf import GGMLQuantizationType
+        self._assert_vllm_path_matches_reference(GGMLQuantizationType.Q4_0)
+
+    def test_vllm_q4_k(self):
+        """vLLM path must match numpy reference for Q4_K (k-quant)."""
+        from gguf import GGMLQuantizationType
+        # Q4_K requires in_features divisible by 256 (block size)
+        self._assert_vllm_path_matches_reference(
+            GGMLQuantizationType.Q4_K, n_out=32, n_in=256
+        )
+
+    def test_vllm_q8_0(self):
+        """vLLM path must match numpy reference for Q8_0."""
+        from gguf import GGMLQuantizationType
+        self._assert_vllm_path_matches_reference(GGMLQuantizationType.Q8_0)
+
+    def test_vllm_path_selected_on_cuda(self):
+        """GGUFLinear must route through the vLLM path on CUDA when available."""
+        import torch
+        from unittest.mock import patch
+
+        from eole.modules.gguf_linear import _VLLM_GGUF_OPS_AVAILABLE, _vllm_gguf_linear
+        from gguf import GGMLQuantizationType
+
+        if not _VLLM_GGUF_OPS_AVAILABLE:
+            self.skipTest("vLLM GGUF ops not available")
+
+        layer = self._make_gguf_layer_cuda(32, 128, GGMLQuantizationType.Q4_0)
+        x = torch.randn(2, 128, dtype=torch.float16, device="cuda")
+
+        call_count = {"n": 0}
+
+        def counting_wrapper(*args, **kwargs):
+            call_count["n"] += 1
+            return _vllm_gguf_linear(*args, **kwargs)
+
+        with patch(
+            "eole.modules.gguf_linear._vllm_gguf_linear",
+            side_effect=counting_wrapper,
+        ):
+            layer(x)
+
+        self.assertEqual(call_count["n"], 1, "vLLM path was not invoked")
+
+    def test_vllm_path_takes_priority_over_triton(self):
+        """When both vLLM and Triton are available, vLLM must be used for Q4_0."""
+        import torch
+        from unittest.mock import patch
+
+        from eole.modules.gguf_linear import (
+            _TRITON_AVAILABLE,
+            _VLLM_GGUF_OPS_AVAILABLE,
+            _q4_0_triton_linear,
+            _vllm_gguf_linear,
+        )
+        from gguf import GGMLQuantizationType
+
+        if not (_VLLM_GGUF_OPS_AVAILABLE and _TRITON_AVAILABLE):
+            self.skipTest("Requires both vLLM and Triton")
+
+        layer = self._make_gguf_layer_cuda(32, 128, GGMLQuantizationType.Q4_0)
+        x = torch.randn(2, 128, dtype=torch.float16, device="cuda")
+
+        triton_calls = {"n": 0}
+        vllm_calls = {"n": 0}
+
+        def count_triton(*args, **kwargs):
+            triton_calls["n"] += 1
+            return _q4_0_triton_linear(*args, **kwargs)
+
+        def count_vllm(*args, **kwargs):
+            vllm_calls["n"] += 1
+            return _vllm_gguf_linear(*args, **kwargs)
+
+        with (
+            patch("eole.modules.gguf_linear._q4_0_triton_linear", side_effect=count_triton),
+            patch("eole.modules.gguf_linear._vllm_gguf_linear", side_effect=count_vllm),
+        ):
+            layer(x)
+
+        self.assertEqual(vllm_calls["n"], 1, "vLLM path was not invoked")
+        self.assertEqual(triton_calls["n"], 0, "Triton was used even though vLLM is available")
+
+
 class TestGGUFConverter(unittest.TestCase):
     """Integration test for the full GGUF → EOLE conversion pipeline."""
 
