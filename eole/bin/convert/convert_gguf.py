@@ -439,6 +439,36 @@ class GGUFMetadata:
         return int(v) if v is not None else None
 
     @property
+    def rope_dim_sections(self) -> Optional[list]:
+        """MRoPE section sizes (`{arch}.rope.dimension_sections`).
+
+        Present in Qwen3.5-VL and similar multi-modal models that apply
+        different RoPE frequencies to each section of the head dimension.
+        Maps to ``xdrope_section`` in the EOLE ``rope_config``.
+        """
+        field = self._get_field(self._a("{arch}.rope.dimension_sections"))
+        if field is None:
+            return None
+        try:
+            return field.parts[field.data[-1]].tolist()
+        except Exception:
+            return None
+
+    @property
+    def rope_scaling_type(self) -> Optional[str]:
+        return self._str(self._a("{arch}.rope.scaling.type"), "") or None
+
+    @property
+    def rope_scaling_factor(self) -> Optional[float]:
+        v = self._scalar(self._a("{arch}.rope.scaling.factor"), None)
+        return float(v) if v is not None else None
+
+    @property
+    def rope_scaling_original_ctx_len(self) -> Optional[int]:
+        v = self._scalar(self._a("{arch}.rope.scaling.original_context_length"), None)
+        return int(v) if v is not None else None
+
+    @property
     def expert_count(self) -> int:
         return int(self._scalar(self._a("{arch}.expert_count"), 0))
 
@@ -544,6 +574,12 @@ _QK_NORM_ARCHS = frozenset(
 # GGUFLinear forward pass crashes because it tries to reshape (out=4096)
 # a dequantized buffer that has 8192*in_features elements.
 _Q_GATING_ARCHS = frozenset("qwen35".split())
+# Architectures that use Gemma-style RMS norm (scaled by 1 + weight, not just
+# weight).  Must match HF_mappings.LN_TABLE.
+_GEMMA_RMS_ARCHS = frozenset("gemma2 gemma3 qwen35 qwen35moe".split())
+# Architectures that use MRoPE (multi-dimensional rotary positional encoding)
+# and require rotary_interleave=True in the EOLE rope_config.
+_MROPE_INTERLEAVE_ARCHS = frozenset("qwen35 qwen35moe qwen2vl qwen3vl qwen3vlmoe".split())
 
 
 def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset()) -> dict:
@@ -564,13 +600,23 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
     ff_length = meta.feed_forward_length
     rope_base = meta.rope_freq_base
     rope_dim = meta.rope_dim_count
+    rope_dim_sections = meta.rope_dim_sections
+    rope_scaling_type = meta.rope_scaling_type
+    rope_scaling_factor = meta.rope_scaling_factor
+    rope_scaling_orig_ctx = meta.rope_scaling_original_ctx_len
     num_experts = meta.expert_count
     num_experts_per_tok = meta.expert_used_count
     expert_ff = meta.expert_feed_forward_length
 
     use_rms = arch in _RMS_NORM_ARCHS
     norm_eps = meta.norm_rms_eps if use_rms else meta.norm_eps
-    layer_norm = "rms" if use_rms else "standard"
+    # Gemma2/3 and Qwen3.5 use a scaled variant (weight + 1) of RMS norm.
+    if arch in _GEMMA_RMS_ARCHS:
+        layer_norm = "gemma-rms"
+    elif use_rms:
+        layer_norm = "rms"
+    else:
+        layer_norm = "standard"
     mlp_activation_fn = "gated-silu" if arch in _SWIGLU_ARCHS else "gelu"
 
     model_config: dict = {
@@ -614,6 +660,23 @@ def build_model_config(meta: GGUFMetadata, linear_blocks: frozenset = frozenset(
         model_config["rope_config"]["rotary_dim"] = rope_dim
     else:
         model_config["rope_config"]["rotary_dim"] = effective_head_dim
+
+    # MRoPE section sizes (xdrope_section in EOLE): present in multimodal models
+    # like Qwen3.5-VL that partition the head dimension into independent RoPE sections.
+    if rope_dim_sections is not None:
+        model_config["rope_config"]["xdrope_section"] = rope_dim_sections
+
+    # Architectures that use interleaved MRoPE (mrope_interleaved=True in HF config).
+    if arch in _MROPE_INTERLEAVE_ARCHS:
+        model_config["rope_config"]["rotary_interleave"] = True
+
+    # Rope scaling (e.g. yarn, linear) from GGUF rope.scaling.* metadata.
+    if rope_scaling_type is not None:
+        model_config["rope_config"]["scaling_type"] = rope_scaling_type
+        if rope_scaling_factor is not None:
+            model_config["rope_config"]["scaling_factor"] = rope_scaling_factor
+        if rope_scaling_orig_ctx is not None:
+            model_config["rope_config"]["original_max_position_embeddings"] = rope_scaling_orig_ctx
 
     if num_experts > 0:
         model_config["num_experts"] = num_experts
@@ -1562,6 +1625,19 @@ class GGUFConverter(BaseBin):
         for tid, ttype in enumerate(meta.token_types):
             if ttype == _TOKEN_TYPE_CONTROL and tid != eos_id and tid < len(tokens):
                 optional_eos.append(tokens[tid])
+
+        # Fill any special tokens still missing from GGUF token-ID metadata.
+        # This is needed when the tokenizer came from a HF tokenizer.json that
+        # stores specials only in tokenizer_config.json (not in tokenizer.json).
+        _special_id_props = {
+            "bos_token": meta.bos_token_id,
+            "eos_token": meta.eos_token_id,
+            "unk_token": meta.unk_token_id,
+            "pad_token": meta.pad_token_id,
+        }
+        for field, tok_id in _special_id_props.items():
+            if field not in vocabs["specials"] and tok_id is not None and tok_id < len(tokens):
+                vocabs["specials"][field] = tokens[tok_id]
 
         # Decoder start token
         if meta.add_bos_token and "bos_token" in vocabs["specials"]:
