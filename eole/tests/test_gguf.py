@@ -685,6 +685,64 @@ class TestGGUFLinearVLLM(unittest.TestCase):
         self.assertEqual(vllm_calls["n"], 1, "vLLM path was not invoked")
         self.assertEqual(triton_calls["n"], 0, "Triton was used even though vLLM is available")
 
+    def test_vllm_activations_cast_to_float16(self):
+        """_vllm_gguf_linear must cast x to float16 before MMVQ/MMQ kernels.
+
+        The ggml CUDA kernels use ``half*`` (float16) internally.  Passing
+        bfloat16 or float32 without casting would cause them to misinterpret
+        the bytes and produce garbage output.  This test verifies that:
+        1. The kernel is called with a float16 tensor, not the original dtype.
+        2. GGUFLinear.forward() returns a tensor in the original dtype.
+        """
+        import torch
+        from unittest.mock import patch
+
+        from eole.modules.gguf_linear import (
+            _VLLM_GGUF_OPS_AVAILABLE,
+            _vllm_ggml_mul_mat_a8,
+            _vllm_ggml_mul_mat_vec_a8,
+        )
+        from gguf import GGMLQuantizationType
+
+        if not _VLLM_GGUF_OPS_AVAILABLE:
+            self.skipTest("vLLM GGUF ops not available")
+
+        layer = self._make_gguf_layer_cuda(32, 128, GGMLQuantizationType.Q4_0)
+
+        for input_dtype in (torch.float16, torch.bfloat16, torch.float32):
+            kernel_input_dtypes = []
+
+            def spy_mmvq(W, X, qtype, row, **kw):
+                kernel_input_dtypes.append(X.dtype)
+                return _vllm_ggml_mul_mat_vec_a8(W, X, qtype, row)
+
+            def spy_mmq(W, X, qtype, row, **kw):
+                kernel_input_dtypes.append(X.dtype)
+                return _vllm_ggml_mul_mat_a8(W, X, qtype, row)
+
+            # Use batch size = 1 so MMVQ path is taken; test the cast regardless.
+            x = torch.randn(1, 128, dtype=input_dtype, device="cuda")
+
+            with (
+                patch("eole.modules.gguf_linear._vllm_ggml_mul_mat_vec_a8", side_effect=spy_mmvq),
+                patch("eole.modules.gguf_linear._vllm_ggml_mul_mat_a8", side_effect=spy_mmq),
+            ):
+                out = layer(x)
+
+            # The kernel must have received float16 activations.
+            if kernel_input_dtypes:
+                for dtype in kernel_input_dtypes:
+                    self.assertEqual(
+                        dtype, torch.float16,
+                        f"Kernel received {dtype} instead of float16 for input_dtype={input_dtype}",
+                    )
+
+            # The output must be in the original input dtype.
+            self.assertEqual(
+                out.dtype, input_dtype,
+                f"Expected output dtype {input_dtype}, got {out.dtype}",
+            )
+
 
 class TestGGUFConverter(unittest.TestCase):
     """Integration test for the full GGUF → EOLE conversion pipeline."""

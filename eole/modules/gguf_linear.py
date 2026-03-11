@@ -12,16 +12,24 @@ safetensors shard.  Both buffers are loaded automatically by
 
 GPU fast-paths (priority order)
 --------------------------------
-1. **vLLM CUDA kernels** (``vllm._C``): when vLLM is installed and the weight
-   is on a CUDA device, the three kernels ported from ``ggml_quants.cu``
-   handle *all* GGUF quantisation types — including Q4_K/M, Q5_K, Q6_K, Q3_K,
-   Q2_K and all IQ-family types — without any CPU round-trip:
+1. **vLLM CUDA kernels** (``vllm._custom_ops`` / ``vllm._C``): when vLLM is
+   installed and the weight is on a CUDA device, the three kernels ported from
+   ``ggml_quants.cu`` handle *all* GGUF quantisation types — including Q4_K/M,
+   Q5_K, Q6_K, Q3_K, Q2_K and all IQ-family types — without any CPU
+   round-trip.  The module tries ``vllm._custom_ops`` first (vLLM ≥ 0.5.x)
+   and falls back to ``vllm._C`` for older builds:
 
    * ``ggml_mul_mat_vec_a8`` – fused MMVQ (matrix-vector) for small batches.
    * ``ggml_mul_mat_a8``     – fused MMQ  (matrix-matrix) for larger batches
      (standard + K-quant types only).
    * ``ggml_dequantize``     – GPU dequantise then standard ``x @ W.T`` for
      IQ types with large batch where MMQ is not yet available.
+
+   .. note::
+       The MMVQ and MMQ kernels use ``half*`` (float16) internally.
+       Activations are **always cast to float16** before the kernel call.
+       Passing bfloat16 or float32 bits directly would cause the kernel to
+       misinterpret them and produce garbage output.
 
    This replicates the strategy used in
    ``vllm/model_executor/layers/quantization/gguf.py``.
@@ -99,7 +107,13 @@ except ImportError:
     pass
 
 try:
-    import vllm._C as _vllm_c  # CUDA extension compiled with vLLM
+    # vLLM ≥ 0.5.x reorganised the CUDA extension: the GGUF ops moved from
+    # the monolithic ``vllm._C`` module into ``vllm._custom_ops``.  Try the
+    # newer path first; fall back to ``_C`` for older vLLM installations.
+    try:
+        import vllm._custom_ops as _vllm_c
+    except ImportError:
+        import vllm._C as _vllm_c  # older vLLM versions
 
     _vllm_ggml_dequantize = _vllm_c.ggml_dequantize
     _vllm_ggml_mul_mat_vec_a8 = _vllm_c.ggml_mul_mat_vec_a8
@@ -125,6 +139,16 @@ def _vllm_gguf_linear(
     * ``ggml_mul_mat_a8`` (MMQ) for larger batches — standard + K-quant types.
     * ``ggml_dequantize`` + ``x @ W.T`` for IQ types with large batches.
 
+    .. important::
+
+        The MMVQ and MMQ CUDA kernels from ``ggml_quants.cu`` use ``half*``
+        (float16) internally.  Activations are therefore **always cast to
+        float16** before the kernel call, regardless of the model dtype
+        (bfloat16 or float32).  Passing bfloat16 or float32 bits directly
+        causes the kernel to misinterpret them as float16 and produce garbage
+        output.  The caller (``GGUFLinear.forward``) casts the result back to
+        the original dtype after this function returns.
+
     Parameters
     ----------
     weight_u8 : torch.Tensor
@@ -139,7 +163,8 @@ def _vllm_gguf_linear(
     Returns
     -------
     torch.Tensor
-        Output of shape ``(*, out_features)``, same dtype as *x*.
+        Output of shape ``(*, out_features)`` in **float16**.  The caller is
+        responsible for casting back to the desired compute dtype.
     """
     try:
         from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
@@ -150,7 +175,9 @@ def _vllm_gguf_linear(
 
     block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType(qtype_val)]
     bytes_per_row = in_features // block_size * type_size
-    weight_2d = weight_u8.reshape(out_features, bytes_per_row)
+    # The ggml CUDA kernels read the weight as a row-major uint8 matrix.
+    # Contiguous memory layout is required to avoid reading from wrong offsets.
+    weight_2d = weight_u8.reshape(out_features, bytes_per_row).contiguous()
 
     orig_shape = x.shape
     N = x.numel() // in_features
@@ -178,14 +205,23 @@ def _vllm_gguf_linear(
         _STANDARD_MMVQ_MAX_SMALL = 6
         mmvq_safe = _STANDARD_MMVQ_MAX_LARGE if out_features > 5120 else _STANDARD_MMVQ_MAX_SMALL
 
+    # The ggml MMVQ / MMQ CUDA kernels (mul_mat_q / mul_mat_vec_q families)
+    # use float16 (half) for activations internally.  Passing bfloat16 or
+    # float32 bits directly causes the kernel to misinterpret them as float16,
+    # producing garbage results.  Cast x to float16 here; the caller casts the
+    # output back to the original dtype.
+    x_fp16 = x_2d.to(torch.float16)
+
     if N <= mmvq_safe:
         # MMVQ: fused quantised mat-vec (all types).
-        y = _vllm_ggml_mul_mat_vec_a8(weight_2d, x_2d, qtype_val, out_features)
+        y = _vllm_ggml_mul_mat_vec_a8(weight_2d, x_fp16, qtype_val, out_features)
     elif not is_imatrix:
         # MMQ: fused quantised mat-mat (standard + K-quant types).
-        y = _vllm_ggml_mul_mat_a8(weight_2d, x_2d, qtype_val, out_features)
+        y = _vllm_ggml_mul_mat_a8(weight_2d, x_fp16, qtype_val, out_features)
     else:
         # I-quant with large batch: dequantise on GPU then standard matmul.
+        # ggml_dequantize accepts any output dtype, so we preserve x's dtype
+        # to avoid an extra cast on the multiply-accumulate path.
         weight_dq = _vllm_ggml_dequantize(
             weight_2d, qtype_val, out_features, in_features, x.dtype
         )
@@ -467,7 +503,10 @@ class GGUFLinear(nn.Module):
         **vLLM CUDA kernels (all types, CUDA + vLLM installed)** — the three
         kernels compiled from ``ggml_quants.cu`` handle every GGUF quantisation
         type, including Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K, and all IQ-family
-        types.  No CPU round-trip, no intermediate fp16 weight tensor.
+        types.  Activations are **cast to float16** before the kernel call
+        because the ggml MMVQ/MMQ kernels use ``half*`` internally — passing
+        bfloat16 or float32 bits directly produces garbage.  The result is cast
+        back to the model's compute dtype before returning.
 
         **Triton fused kernel (Q4_0, CUDA + Triton, no vLLM)** — dequantises
         Q4_0 weights in GPU registers and accumulates directly into the output.
