@@ -1865,5 +1865,172 @@ class TestGGUFQKNorm(unittest.TestCase):
                          f"src_word_vec_size must be {hidden}, got {emb.get('src_word_vec_size')}")
 
 
+class TestGGUFVLMSpatialMergeSize(unittest.TestCase):
+    """When a VLM (vision-language) model is converted from GGUF, the
+    ``spatial_merge_size`` in the produced config.json must match the value
+    stored in the mmproj GGUF (``clip.vision.spatial_merge_size``).
+
+    If it is missing or defaults to 1, ``Qwen3_5VisionMerger`` computes
+    ``merged_size = hidden_size * 1 = hidden_size`` instead of
+    ``hidden_size * spatial_merge_size^2``, creating ``linear_fc1`` of shape
+    ``(hidden_size, hidden_size)`` while the checkpoint weight is
+    ``(hidden_size * 4, hidden_size * 4)``, causing a silent truncation.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _require("gguf")
+        _require("numpy")
+        _require("torch")
+
+    def _make_mmproj_gguf(self, td: str, spatial_merge_size: int) -> str:
+        import numpy as np
+        from gguf import GGUFWriter
+
+        path = os.path.join(td, "mmproj.gguf")
+        hidden, heads, ff, n_dec = 32, 4, 64, 64
+        img_size, patch_size = 32, 8
+        spatial = img_size // patch_size   # 4
+        num_pos = spatial * spatial        # 16
+        merged = hidden * spatial_merge_size**2
+
+        w = GGUFWriter(path, "clip")
+        w.add_uint32("clip.vision.block_count", 1)
+        w.add_uint32("clip.vision.embedding_length", hidden)
+        w.add_uint32("clip.vision.feed_forward_length", ff)
+        w.add_uint32("clip.vision.attention.head_count", heads)
+        w.add_uint32("clip.vision.image_size", img_size)
+        w.add_uint32("clip.vision.patch_size", patch_size)
+        w.add_uint32("clip.vision.spatial_merge_size", spatial_merge_size)
+        w.add_uint32("clip.vision.projection_dim", n_dec)
+        w.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+        w.add_string("clip.projector_type", "qwen3vl_merger")
+
+        w.add_tensor("v.patch_embd.weight",
+                     np.ones((hidden, 3, patch_size, patch_size), dtype=np.float32))
+        w.add_tensor("v.patch_embd.bias", np.zeros(hidden, dtype=np.float32))
+        w.add_tensor("v.position_embed.weight",
+                     np.ones((hidden, num_pos), dtype=np.float32))
+        w.add_tensor("v.post_ln.weight", np.ones(hidden, dtype=np.float32))
+        w.add_tensor("v.post_ln.bias", np.zeros(hidden, dtype=np.float32))
+        w.add_tensor("mm.0.weight", np.ones((merged, merged), dtype=np.float32))
+        w.add_tensor("mm.0.bias", np.zeros(merged, dtype=np.float32))
+        w.add_tensor("mm.2.weight", np.ones((n_dec, merged), dtype=np.float32))
+        w.add_tensor("mm.2.bias", np.zeros(n_dec, dtype=np.float32))
+        w.add_tensor("v.blk.0.attn_qkv.weight",
+                     np.ones((3 * hidden, hidden), dtype=np.float32))
+        w.add_tensor("v.blk.0.attn_qkv.bias", np.zeros(3 * hidden, dtype=np.float32))
+        w.add_tensor("v.blk.0.attn_out.weight",
+                     np.ones((hidden, hidden), dtype=np.float32))
+        w.add_tensor("v.blk.0.attn_out.bias", np.zeros(hidden, dtype=np.float32))
+        w.add_tensor("v.blk.0.ffn_up.weight", np.ones((ff, hidden), dtype=np.float32))
+        w.add_tensor("v.blk.0.ffn_up.bias", np.zeros(ff, dtype=np.float32))
+        w.add_tensor("v.blk.0.ffn_down.weight",
+                     np.ones((hidden, ff), dtype=np.float32))
+        w.add_tensor("v.blk.0.ffn_down.bias", np.zeros(hidden, dtype=np.float32))
+        w.add_tensor("v.blk.0.ln1.weight", np.ones(hidden, dtype=np.float32))
+        w.add_tensor("v.blk.0.ln1.bias", np.zeros(hidden, dtype=np.float32))
+        w.add_tensor("v.blk.0.ln2.weight", np.ones(hidden, dtype=np.float32))
+        w.add_tensor("v.blk.0.ln2.bias", np.zeros(hidden, dtype=np.float32))
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        return path
+
+    def test_clip_metadata_reads_spatial_merge_size(self):
+        """GGUFClipMetadata.vision_spatial_merge_size must return the value
+        stored in the mmproj GGUF (not always 2 regardless of file content)."""
+        import tempfile
+        from eole.bin.convert.convert_gguf import GGUFClipMetadata
+
+        for sms in (1, 2, 4):
+            with self.subTest(spatial_merge_size=sms):
+                with tempfile.TemporaryDirectory() as td:
+                    path = self._make_mmproj_gguf(td, sms)
+                    clip = GGUFClipMetadata(path)
+                    self.assertEqual(
+                        clip.vision_spatial_merge_size,
+                        sms,
+                        f"Expected vision_spatial_merge_size={sms}, "
+                        f"got {clip.vision_spatial_merge_size}",
+                    )
+
+    @unittest.skipUnless(importlib.util.find_spec("safetensors") is not None, "requires safetensors")
+    def test_spatial_merge_size_in_config_json(self):
+        """After a full VLM conversion, config.json must have spatial_merge_size
+        matching the mmproj GGUF value, not the default 1."""
+        import numpy as np
+        import tempfile
+        from gguf import GGUFWriter
+        from argparse import Namespace
+        from eole.bin.convert.convert_gguf import GGUFConverter
+
+        spatial_merge_size = 2
+        hidden, heads, ff, n_vocab = 64, 4, 128, 32
+
+        with tempfile.TemporaryDirectory() as td:
+            # Build minimal text GGUF
+            gguf_path = os.path.join(td, "text.gguf")
+            w = GGUFWriter(gguf_path, "qwen35")
+            w.add_block_count(1)
+            w.add_context_length(128)
+            w.add_embedding_length(hidden)
+            w.add_feed_forward_length(ff)
+            w.add_head_count(heads)
+            w.add_head_count_kv(heads)
+            w.add_layer_norm_rms_eps(1e-5)
+            w.add_rope_freq_base(10000.0)
+            w.add_vocab_size(n_vocab)
+            w.add_token_list([str(i) for i in range(n_vocab)])
+            w.add_bos_token_id(1)
+            w.add_eos_token_id(2)
+            w.add_tensor("token_embd.weight",
+                         np.random.randn(n_vocab, hidden).astype(np.float32))
+            w.add_tensor("output_norm.weight", np.ones(hidden, dtype=np.float32))
+            for sfx, shape in [
+                ("attn_q", (hidden, hidden)),
+                ("attn_k", (hidden, hidden)),
+                ("attn_v", (hidden, hidden)),
+                ("attn_output", (hidden, hidden)),
+                ("ffn_gate", (ff, hidden)),
+                ("ffn_up", (ff, hidden)),
+                ("ffn_down", (hidden, ff)),
+            ]:
+                w.add_tensor(f"blk.0.{sfx}", np.ones(shape, dtype=np.float32))
+            w.add_tensor("blk.0.attn_norm.weight", np.ones(hidden, dtype=np.float32))
+            w.add_tensor("blk.0.ffn_norm.weight", np.ones(hidden, dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+            mmproj_path = self._make_mmproj_gguf(td, spatial_merge_size)
+            out_dir = os.path.join(td, "out")
+
+            args = Namespace(
+                gguf_path=gguf_path,
+                mmproj=mmproj_path,
+                output=out_dir,
+                dtype="fp16",
+                tokenizer="hf",
+                hf_tokenizer=None,
+            )
+            GGUFConverter.run(args)
+
+            with open(os.path.join(out_dir, "config.json")) as fh:
+                cfg = json.load(fh)
+
+        saved = cfg["model"].get("spatial_merge_size")
+        self.assertEqual(
+            saved,
+            spatial_merge_size,
+            f"spatial_merge_size in config.json must be {spatial_merge_size} "
+            f"(from mmproj GGUF), but got {saved!r}. "
+            "This would cause adapter linear_fc1/fc2 to be created with "
+            "wrong shape (hidden instead of hidden * spatial_merge_size^2).",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

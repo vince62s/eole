@@ -1501,6 +1501,13 @@ class GGUFConverter(BaseBin):
         if clip_meta is not None:
             model_config_dict["encoder"] = build_vision_encoder_config(clip_meta)
             model_config_dict["adapter"] = "qwen3_5vl"
+            # spatial_merge_size controls how many vision patches are grouped
+            # before projection.  Qwen3.5 VL uses spatial_merge_size=2, giving
+            # merged_size = hidden_size * 4.  ModelConfig defaults to 1 which
+            # would create linear_fc1 of shape (hidden_size, hidden_size) instead
+            # of the correct (4*hidden_size, 4*hidden_size), causing a shape
+            # mismatch when loading the adapter weights.
+            model_config_dict["spatial_merge_size"] = clip_meta.vision_spatial_merge_size
 
         quant_layers_all = [
             "gate_up_proj",
