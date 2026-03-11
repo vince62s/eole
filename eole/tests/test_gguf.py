@@ -364,6 +364,156 @@ class TestGGUFLinear(unittest.TestCase):
         self._forward_matches_cpu_fallback(GGMLQuantizationType.Q4_1)
 
 
+class TestGGUFLinearTriton(unittest.TestCase):
+    """Validate the Triton fused Q4_0 dequantize+matmul kernel.
+
+    All tests in this class are skipped automatically when:
+    * ``triton`` is not installed,
+    * no CUDA device is available, or
+    * the ``gguf`` or ``numpy`` packages are absent.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _require("triton")
+        _require("gguf")
+        _require("numpy")
+        import torch
+
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA not available")
+
+    def _make_q4_0_layer_cuda(self, n_out=32, n_in=128):
+        """Build a GGUFLinear(Q4_0) layer with weights on the CUDA device."""
+        import numpy as np
+        import torch
+        from gguf import GGMLQuantizationType, GGUFReader, GGUFWriter
+
+        from eole.modules.gguf_linear import GGUFLinear
+
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            gpath = os.path.join(td, "tiny.gguf")
+            writer = GGUFWriter(gpath, "llama")
+            writer.add_block_count(1)
+            writer.add_embedding_length(n_in)
+            writer.add_vocab_size(n_out)
+            writer.add_tensor(
+                "test.weight",
+                np.random.randn(n_out, n_in).astype(np.float32),
+                raw_dtype=GGMLQuantizationType.Q4_0,
+            )
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            reader = GGUFReader(gpath)
+            q_data = reader.tensors[0].data.copy()
+
+        layer = GGUFLinear(in_features=n_in, out_features=n_out, bias=False)
+        layer.register_buffer("weight", torch.from_numpy(q_data).cuda())
+        layer.register_buffer(
+            "gguf_qtype",
+            torch.tensor(
+                [GGMLQuantizationType.Q4_0.value], dtype=torch.int32
+            ),
+        )
+        return layer
+
+    def test_triton_q4_0_matches_pytorch_fallback(self):
+        """Triton kernel output must match the PyTorch dequant reference."""
+        import torch
+        import torch.nn.functional as F
+        from gguf import dequantize, GGMLQuantizationType
+        from eole.modules.gguf_linear import GGUFLinear, _TRITON_AVAILABLE
+
+        if not _TRITON_AVAILABLE:
+            self.skipTest("Triton kernel not compiled successfully")
+
+        n_out, n_in = 32, 128
+        layer = self._make_q4_0_layer_cuda(n_out, n_in)
+
+        # Float16 input on CUDA – the common inference scenario.
+        x = torch.randn(2, 4, n_in, dtype=torch.float16, device="cuda")
+
+        # Reference: numpy dequant + F.linear (identical to CPU fallback).
+        w_np = layer.weight.cpu().numpy()
+        dq_np = dequantize(w_np, GGMLQuantizationType.Q4_0)
+        w_ref = (
+            torch.from_numpy(dq_np)
+            .reshape(n_out, n_in)
+            .to(dtype=x.dtype, device="cuda")
+        )
+        expected = F.linear(x, w_ref)
+
+        # Actual: GGUFLinear.forward should route through the Triton kernel.
+        actual = layer(x)
+
+        self.assertEqual(actual.shape, (2, 4, n_out))
+        # Allow for float16 rounding differences between kernel and reference.
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+    def test_triton_q4_0_matches_pytorch_fallback_float32(self):
+        """Triton kernel output must match reference for float32 activations."""
+        import torch
+        import torch.nn.functional as F
+        from gguf import dequantize, GGMLQuantizationType
+        from eole.modules.gguf_linear import GGUFLinear, _TRITON_AVAILABLE
+
+        if not _TRITON_AVAILABLE:
+            self.skipTest("Triton kernel not compiled successfully")
+
+        n_out, n_in = 32, 128
+        layer = self._make_q4_0_layer_cuda(n_out, n_in)
+
+        x = torch.randn(3, n_in, dtype=torch.float32, device="cuda")
+
+        w_np = layer.weight.cpu().numpy()
+        dq_np = dequantize(w_np, GGMLQuantizationType.Q4_0)
+        w_ref = (
+            torch.from_numpy(dq_np)
+            .reshape(n_out, n_in)
+            .to(dtype=x.dtype, device="cuda")
+        )
+        expected = F.linear(x, w_ref)
+        actual = layer(x)
+
+        self.assertEqual(actual.shape, (3, n_out))
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+    def test_triton_path_selected_on_cuda(self):
+        """GGUFLinear must use the Triton path on CUDA when Triton is available."""
+        import torch
+        from eole.modules.gguf_linear import (
+            GGUFLinear,
+            _TRITON_AVAILABLE,
+            _q4_0_triton_linear,
+        )
+        from unittest.mock import patch
+
+        if not _TRITON_AVAILABLE:
+            self.skipTest("Triton kernel not compiled successfully")
+
+        layer = self._make_q4_0_layer_cuda(32, 128)
+        x = torch.randn(2, 128, dtype=torch.float16, device="cuda")
+
+        call_count = {"n": 0}
+
+        def counting_wrapper(*args, **kwargs):
+            call_count["n"] += 1
+            return _q4_0_triton_linear(*args, **kwargs)
+
+        with patch(
+            "eole.modules.gguf_linear._q4_0_triton_linear",
+            side_effect=counting_wrapper,
+        ):
+            layer(x)
+
+        self.assertEqual(call_count["n"], 1, "Triton path was not invoked")
+
+
 class TestGGUFConverter(unittest.TestCase):
     """Integration test for the full GGUF → EOLE conversion pipeline."""
 

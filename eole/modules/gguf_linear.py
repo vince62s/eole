@@ -9,6 +9,12 @@ The quantization type is persisted as a model buffer (``gguf_qtype``, int32)
 and stored alongside the quantized weight buffer (``weight``, uint8) in the
 safetensors shard.  Both buffers are loaded automatically by
 :meth:`~eole.models.model.BaseModel.load_safe_state_dict`.
+
+For Q4_0 on CUDA, a Triton kernel is used when available to perform a fused
+dequantize+matmul that keeps weights quantised throughout, reading only
+M*(K//32)*18 bytes from HBM instead of materialising the M*K fp16 weight
+matrix.  The Triton path is automatically skipped on CPU or when Triton is not
+installed.
 """
 
 import torch
@@ -32,6 +38,211 @@ try:
     }
 except ImportError:
     pass
+
+# ---------------------------------------------------------------------------
+# Optional Triton fused kernel for Q4_0 dequantize + matmul.
+#
+# Q4_0 block layout (18 bytes per block of 32 weights):
+#   bytes 0-1 : scale, float16 little-endian
+#   bytes 2-17: 16 uint8 nibble pairs
+#               - low  nibble of byte i → weight at offset i   (0..15)
+#               - high nibble of byte i → weight at offset i+16 (16..31)
+#   weight value = (nibble - 8) * scale
+#
+# The Triton kernel tiles both the output-row (M) and the batch (N) dimensions
+# and iterates over K in steps of 32 (one Q4_0 block per step).  For each
+# block it dequantises the 32 weights in registers and accumulates their
+# dot product with the corresponding activation slice, avoiding writing any
+# intermediate fp16/fp32 weight tensor to HBM.
+# ---------------------------------------------------------------------------
+
+_TRITON_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}),
+            triton.Config({"BLOCK_M": 32, "BLOCK_N": 16}),
+            triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}),
+            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}),
+            triton.Config({"BLOCK_M": 64, "BLOCK_N": 16}),
+            triton.Config({"BLOCK_M": 16, "BLOCK_N": 64}),
+            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}),
+            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}),
+        ],
+        key=["M", "K", "N"],
+    )
+    @triton.jit
+    def _q4_0_dequant_matmul_kernel(
+        W_ptr,  # uint8 flat buffer: [M * (K//32) * 18] bytes
+        X_ptr,  # float16 or float32 [N, K]
+        Y_ptr,  # float32 [N, M]
+        M,
+        K,
+        N,
+        stride_xn,
+        stride_xk,
+        stride_yn,
+        stride_ym,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Fused Q4_0 dequantize + matmul Triton kernel.
+
+        Each program instance handles a BLOCK_M × BLOCK_N tile of the output
+        matrix and iterates over all K//32 Q4_0 blocks, dequantising in
+        registers and accumulating into a fp32 accumulator.
+
+        Parameters
+        ----------
+        W_ptr : pointer to uint8
+            Flat Q4_0 weight buffer.  For output row ``m`` and K-block
+            ``b``, the block starts at byte ``(m * (K // 32) + b) * 18``.
+        X_ptr : pointer to float16 or float32
+            Activation matrix, shape [N, K].
+        Y_ptr : pointer to float32
+            Output matrix, shape [N, M].  Written as fp32; the caller casts
+            to the required dtype.
+        M, K, N : int
+            Matrix dimensions.
+        stride_xn, stride_xk : int
+            Strides (in elements) for X.
+        stride_yn, stride_ym : int
+            Strides (in elements) for Y.
+        BLOCK_M, BLOCK_N : constexpr int
+            Tile sizes; must be ≥ 16 for tensor-core usage via ``tl.dot``.
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+        ns = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)    # [BLOCK_N]
+
+        row_mask = rows < M
+        n_mask = ns < N
+
+        n_blocks_k = K // 32
+        # Number of bytes per output row in the quantised weight buffer.
+        row_stride_bytes = n_blocks_k * 18
+
+        acc = tl.zeros([BLOCK_N, BLOCK_M], dtype=tl.float32)
+
+        for k_block in range(n_blocks_k):
+            # Byte offset of this Q4_0 block for each output row: [BLOCK_M]
+            block_base = rows * row_stride_bytes + k_block * 18
+
+            # ---- Load scale (2-byte little-endian float16) ----
+            b0 = tl.load(W_ptr + block_base, mask=row_mask, other=0).to(tl.uint16)
+            b1 = tl.load(W_ptr + block_base + 1, mask=row_mask, other=0).to(tl.uint16)
+            # Reconstruct uint16 in little-endian order then bitcast to f16.
+            scale_u16 = b0 | (b1 << 8)
+            scale = scale_u16.to(tl.float16, bitcast=True).to(tl.float32)  # [BLOCK_M]
+
+            # ---- Load 16 nibble bytes: [BLOCK_M, 16] ----
+            nibble_offs = block_base[:, None] + 2 + tl.arange(0, 16)[None, :]
+            packed = tl.load(
+                W_ptr + nibble_offs, mask=row_mask[:, None], other=0
+            )  # [BLOCK_M, 16] uint8
+
+            # ---- Dequantise nibbles: both halves as float16 [BLOCK_M, 16] ----
+            # lo: weight offsets 0..15  (low  nibble of each byte)
+            # hi: weight offsets 16..31 (high nibble of each byte)
+            lo = ((packed & 0x0F).to(tl.int8) - 8).to(tl.float16)
+            hi = (((packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float16)
+
+            k_base_val = k_block * 32
+
+            # ---- Load activations: [BLOCK_N, 16] for each half ----
+            k_lo_idx = k_base_val + tl.arange(0, 16)        # [16]  (constexpr)
+            k_hi_idx = k_base_val + 16 + tl.arange(0, 16)   # [16]
+
+            x_lo = tl.load(
+                X_ptr + ns[:, None] * stride_xn + k_lo_idx[None, :] * stride_xk,
+                mask=n_mask[:, None],
+                other=0.0,
+            ).to(tl.float16)  # [BLOCK_N, 16]
+
+            x_hi = tl.load(
+                X_ptr + ns[:, None] * stride_xn + k_hi_idx[None, :] * stride_xk,
+                mask=n_mask[:, None],
+                other=0.0,
+            ).to(tl.float16)  # [BLOCK_N, 16]
+
+            # ---- Fused dot: [BLOCK_N, 16] @ [16, BLOCK_M] = [BLOCK_N, BLOCK_M] ----
+            # contrib[n, m] = Σ_j x_lo[n,j]*lo[m,j] + x_hi[n,j]*hi[m,j]
+            contrib = tl.dot(x_lo, tl.trans(lo)) + tl.dot(x_hi, tl.trans(hi))
+
+            # Apply per-row scale (broadcast over batch dim).
+            acc += contrib * scale[None, :]
+
+        # ---- Store output tile ----
+        y_offs = ns[:, None] * stride_yn + rows[None, :] * stride_ym
+        y_mask = n_mask[:, None] & row_mask[None, :]
+        tl.store(Y_ptr + y_offs, acc, mask=y_mask)
+
+    def _q4_0_triton_linear(
+        weight_u8: torch.Tensor,
+        x: torch.Tensor,
+        out_features: int,
+        in_features: int,
+    ) -> torch.Tensor:
+        """Python wrapper around :func:`_q4_0_dequant_matmul_kernel`.
+
+        Parameters
+        ----------
+        weight_u8 : torch.Tensor
+            1-D ``uint8`` tensor of length ``out_features * (in_features // 32) * 18``
+            holding the raw Q4_0 weight blocks, on a CUDA device.
+        x : torch.Tensor
+            Input activations of shape ``(*, in_features)``, on the same CUDA device.
+            Any leading batch dimensions are collapsed before calling the kernel.
+        out_features, in_features : int
+            Logical shape of the linear transformation.
+
+        Returns
+        -------
+        torch.Tensor
+            Output of shape ``(*, out_features)``, dtype ``float32``, on the
+            same CUDA device.  Cast to the desired dtype by the caller.
+        """
+        orig_shape = x.shape
+        N = x.numel() // in_features
+        x_2d = x.contiguous().reshape(N, in_features)
+
+        M = out_features
+        K = in_features
+
+        y = torch.empty((N, M), dtype=torch.float32, device=x.device)
+
+        # Grid is a lambda so the autotuner can inject the winning BLOCK_M /
+        # BLOCK_N values at runtime without recompiling.
+        grid = lambda meta: (  # noqa: E731
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+        _q4_0_dequant_matmul_kernel[grid](
+            weight_u8,
+            x_2d,
+            y,
+            M,
+            K,
+            N,
+            x_2d.stride(0),
+            x_2d.stride(1),
+            y.stride(0),
+            y.stride(1),
+        )
+
+        return y.reshape(*orig_shape[:-1], M)
+
+except Exception:
+    # Triton import failed or kernel definition raised – stay on PyTorch path.
+    _TRITON_AVAILABLE = False
 
 
 class GGUFLinear(nn.Module):
@@ -96,22 +307,21 @@ class GGUFLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Dequantize weight on-the-fly, then apply linear transformation.
 
-        For **Q8_0**, **Q4_0**, and **Q4_1** quantisation types the
-        dequantisation is performed entirely on the same device as the weight
-        tensor (GPU or CPU) using PyTorch tensor operations, which avoids any
-        CPU round-trip when the model is on a CUDA device.
+        **Q4_0 on CUDA with Triton installed** — a fused Triton kernel
+        (:func:`_q4_0_dequant_matmul_kernel`) is used.  Weights are
+        dequantised in GPU registers and never written back to HBM as a
+        dense fp16 tensor.  This saves bandwidth proportional to the weight
+        size (≈ 2.25× less HBM traffic vs. the plain PyTorch path).
 
-        All other GGUF types (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ-family, …)
-        fall back to the ``gguf`` library's CPU path.  In those cases the
-        quantised weight buffer is briefly copied to the CPU for
-        dequantisation before the result is moved back to the compute device.
+        **Q8_0, Q4_0 (without Triton / on CPU), and Q4_1** — dequantisation
+        is performed entirely on the same device as the weight tensor using
+        PyTorch tensor operations, which avoids any CPU round-trip when the
+        model is on a CUDA device.
 
-        .. note::
-            A truly fused dequantise+GEMM CUDA kernel (analogous to Marlin
-            for GPTQ) would eliminate the intermediate float16 weight
-            allocation for K-quant types as well.  Until such a kernel is
-            available the GPU path already covers the most common
-            ``llama.cpp``-style Q8_0 / Q4_0 / Q4_1 conversions.
+        **All other GGUF types** (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ-family,
+        …) fall back to the ``gguf`` library's CPU path.  The quantised weight
+        buffer is briefly copied to the CPU for dequantisation before the
+        result is moved back to the compute device.
         """
         try:
             from gguf import GGMLQuantizationType
@@ -143,6 +353,23 @@ class GGUFLinear(nn.Module):
             return F.linear(x, weight, self.bias)
 
         if qtype == GGMLQuantizationType.Q4_0:
+            # ------------------------------------------------------------------
+            # Triton fused path: dequantise in registers, never materialise the
+            # fp16 weight matrix.  Requires CUDA + Triton and K divisible by 32.
+            # ------------------------------------------------------------------
+            if (
+                _TRITON_AVAILABLE
+                and self.weight.is_cuda
+                and self.in_features % 32 == 0
+            ):
+                out = _q4_0_triton_linear(
+                    self.weight, x, self.out_features, self.in_features
+                ).to(dtype=target_dtype)
+                if self.bias is not None:
+                    out = out + self.bias
+                return out
+
+            # PyTorch fallback (CPU or Triton unavailable).
             blocks = self.weight.reshape(-1, 18)  # (n_blocks, 18)
             scales = self._decode_f16_col(blocks, 0, 2)  # (n_blocks,) float32
             qs_u8 = blocks[:, 2:]  # (n_blocks, 16) uint8
