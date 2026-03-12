@@ -148,8 +148,9 @@ _BLOCK_MAP: dict[str, Optional[str]] = {
     "ffn_gate_exps.weight": "mlp.experts_gate_up.weight",
     "ffn_up_exps.weight": "mlp.experts_up.weight",
     "ffn_down_exps.weight": "mlp.experts_down.weight",
-    # Post-attention output norm – present in both full-attention and linear-attention
-    # blocks (Qwen3.5 and similar hybrid models).
+    # Post-attention output norm – present in full-attention blocks (Qwen3.5 and
+    # similar hybrid models).  For linear-attention blocks this tensor is handled
+    # separately in _LINEAR_ATTN_BLOCK_MAP.
     "post_attention_norm.weight": "post_attention_layernorm.weight",
     "post_attention_norm.bias": "post_attention_layernorm.bias",
 }
@@ -192,13 +193,11 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_dt.bias": "linear_attn.dt_bias",
     "ssm_norm.weight": "linear_attn.norm.weight",
     "ssm_out.weight": "linear_attn.out_proj.weight",
-    # post_attention_norm is applied to the raw attention output BEFORE the
-    # residual add in Qwen3.5's hybrid blocks.  EOLE's _forward_linear_attn
-    # does not have this step (it corresponds architecturally to ffn_norm, not
-    # post_attention_norm).  Map to None so it is silently skipped instead of
-    # incorrectly overwriting post_attention_layernorm with the wrong tensor.
-    "post_attention_norm.weight": None,
-    "post_attention_norm.bias": None,
+    # post_attention_norm in linear-attention blocks maps to post_attention_layernorm,
+    # just as in full-attention blocks.  EOLE's _forward_linear_attn uses
+    # post_attention_layernorm as the post-linear-attention output norm.
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "post_attention_norm.bias": "post_attention_layernorm.bias",
 }
 
 # ---------------------------------------------------------------------------
@@ -1292,19 +1291,19 @@ def build_safetensors(
             t = torch.log(-t)
 
         # GemmaRMSNorm layernorm1p correction: for architectures in _GEMMA_RMS_ARCHS
-        # (gemma2, gemma3, qwen35, qwen35moe), llama.cpp adds +1 to ALL norm weights
-        # (including ssm_norm.weight / linear_attn.norm.weight) during HF→GGUF
-        # conversion using a blanket `if name.endswith("norm.weight")` check.
-        # For regular attention norms (GemmaRMSNorm): EOLE uses (1+weight)*x/rms(x)
-        # while ggml uses weight*x/rms(x), so +1 is needed for ggml — we must undo
-        # it to restore the "deviation-from-1" convention expected by GemmaRMSNorm.
-        # For linear_attn.norm.weight (RMSNormGated): EOLE uses weight*x/rms(x),
-        # same as ggml, but llama.cpp still adds +1 (blanket match).  We must also
-        # subtract 1 here so that RMSNormGated loads the original HF scale factor.
+        # (gemma2, gemma3, qwen35, qwen35moe), llama.cpp adds +1 to all norm weights
+        # during HF→GGUF conversion so ggml's standard RMSNorm produces the same
+        # result as HF's layernorm1p (which stores weight as deviation from 1 and
+        # computes (1+weight)*x/rms(x)).  EOLE's GemmaRMSNorm also uses (1+weight),
+        # so the +1 would be applied twice.  Subtract 1 here to restore the
+        # "deviation-from-1" convention expected by GemmaRMSNorm.
+        # Exception: linear_attn.norm.weight is a plain RMSNormGated (not GemmaRMSNorm)
+        # and was explicitly excluded from the +1 by llama.cpp's Qwen3NextModel.
         if (
             meta.arch in _GEMMA_RMS_ARCHS
             and qtype_t is None  # float tensors only; norm weights are never quantized
             and eole_name.endswith("norm.weight")
+            and not eole_name.endswith("linear_attn.norm.weight")
         ):
             t = t - 1.0
 
