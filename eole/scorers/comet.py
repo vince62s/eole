@@ -1,4 +1,5 @@
 import logging
+import os
 
 from .scorer import Scorer
 from eole.scorers import register_scorer
@@ -61,9 +62,14 @@ class _CometBaseScorer(Scorer):
             for src, mt in zip(texts_srcs, preds):
                 data.append({"src": src, "mt": mt})
 
-        logger.info("Downloading/loading COMET model: %s", self.model_name)
-        model_path = download_model(self.model_name)
-        comet_model = load_from_checkpoint(model_path)
+        logger.info("Loading COMET model: %s", self.model_name)
+        if os.path.exists(self.model_name):
+            # Local checkpoint file or directory — load directly without downloading
+            comet_model = load_from_checkpoint(self.model_name)
+        else:
+            # HuggingFace repo ID — download (cached) then load
+            model_path = download_model(self.model_name)
+            comet_model = load_from_checkpoint(model_path)
 
         gpus = 1 if torch.cuda.is_available() else 0
         batch_size = getattr(self.config, "comet_batch_size", 64)
