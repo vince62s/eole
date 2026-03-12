@@ -1252,25 +1252,19 @@ def build_safetensors(
                         t = torch.cat([qk_part, v_part], dim=0)
 
                 elif _blk_suffix == "ssm_out.weight":
-                    # out_proj: (hidden, num_v_heads * head_v_dim) – column reorder
+                    # out_proj: ALWAYS dequantize before column reordering.
+                    # _inverse_v_head_reorder_cols on uint8 Q5_K bytes appears safe
+                    # (4096 % 32 == 0 so no ValueError) but silently corrupts block
+                    # metadata because Q5_K blocks span 176 bytes and are not aligned
+                    # to the 128-byte "column group" boundaries we reindex.
+                    if qtype_t is not None:
+                        import numpy as _np2
+                        from gguf.quants import dequantize as _gguf_dq2
+                        dq2 = _gguf_dq2(tensor.data, tensor.tensor_type)
+                        t = torch.from_numpy(_np2.array(dq2, copy=True)).to(target_dtype)
+                        qtype_t = None
                     if t.dim() == 2:
-                        try:
-                            t = _inverse_v_head_reorder_cols(
-                                t, _num_k_heads, _num_v_per_k
-                            )
-                        except ValueError:
-                            # Fallback: dequantize, reorder, keep as float.
-                            if qtype_t is not None:
-                                import numpy as _np2
-                                from gguf.quants import dequantize as _gguf_dq2
-                                dq2 = _gguf_dq2(tensor.data, tensor.tensor_type)
-                                t = torch.from_numpy(_np2.array(dq2, copy=True)).to(
-                                    target_dtype
-                                )
-                                qtype_t = None
-                            t = _inverse_v_head_reorder_cols(
-                                t, _num_k_heads, _num_v_per_k
-                            )
+                        t = _inverse_v_head_reorder_cols(t, _num_k_heads, _num_v_per_k)
 
                 elif _blk_suffix == "ssm_conv1d.weight":
                     # conv1d: (conv_dim, kernel_size) – only V channels need reorder.

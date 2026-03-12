@@ -5,12 +5,6 @@ dequantizes them on-the-fly during the forward pass, following the same
 pattern as the autoround/Marlin backend: quantized weights stay on disk and in
 CPU/GPU memory in compact form; dequantization happens per forward call.
 
-For K-quant types (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) the weight is dequantized
-**once** on the first forward call and the result is stored as a float buffer
-(``weight`` is replaced in-place).  Subsequent calls use the materialized float
-weight directly, making K-quant inference without vLLM as fast as BF16
-inference after the initial dequantization.
-
 The quantization type is persisted as a model buffer (``gguf_qtype``, int32)
 and stored alongside the quantized weight buffer (``weight``, uint8) in the
 safetensors shard.  Both buffers are loaded automatically by
@@ -42,9 +36,8 @@ GPU fast-paths (priority order)
 3. **PyTorch-native GPU paths** (Q8_0, Q4_0, Q4_1): on-device tensor ops,
    no CPU round-trip.
 
-4. **CPU fallback with lazy materialization** (all other types, including all
-   K-quant types): ``gguf.dequantize`` via numpy on the first call; the
-   result is stored as a float buffer so subsequent calls use path 0 (fast).
+4. **CPU fallback** (all other types): ``gguf.dequantize`` via numpy, then
+   the result is moved back to the compute device.
 """
 
 import torch
@@ -424,10 +417,6 @@ class GGUFLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Dequantize weight on-the-fly, then apply linear transformation.
 
-        **Materialized float weight (already dequantized)** — when a K-quant
-        weight has been dequantized and cached on a previous call (see CPU
-        fallback below), the float buffer is used directly with no overhead.
-
         **vLLM fused op (all types, CUDA + vLLM installed)** — delegates to
         ``torch.ops.vllm._fused_mul_mat_gguf``, which is the same op used by
         vLLM's own GGUF linear layers.  It handles every GGUF quantisation
@@ -441,10 +430,7 @@ class GGUFLinear(nn.Module):
         ops; no CPU round-trip when the model is on a CUDA device.
 
         **CPU fallback (all remaining types)** — ``gguf.dequantize`` via numpy;
-        the quantised buffer is copied to the CPU, dequantized, moved back to
-        the compute device, and then **stored as a float buffer** so that all
-        subsequent calls use the fast materialized-weight path above (no more
-        CPU round-trips for K-quant types when vLLM is not available).
+        the quantised buffer is copied to the CPU and the result is moved back.
         """
         try:
             from gguf import GGMLQuantizationType
@@ -455,18 +441,6 @@ class GGUFLinear(nn.Module):
         qtype = GGMLQuantizationType(qtype_val)
         target_dtype = x.dtype
         device = self.weight.device
-
-        # ------------------------------------------------------------------
-        # 0. Fast path: weight has already been materialized to a float tensor
-        #    by the CPU fallback on a previous call.  Use it directly.
-        #    This avoids repeated CPU round-trips for K-quant types when vLLM
-        #    is not installed.
-        # ------------------------------------------------------------------
-        if self.weight.is_floating_point():
-            weight = self.weight
-            if weight.dtype != target_dtype or weight.device != device:
-                weight = weight.to(dtype=target_dtype, device=device)
-            return F.linear(x, weight, self.bias)
 
         # ------------------------------------------------------------------
         # 1. vLLM CUDA path: handles ALL GGUF types on GPU using the three
@@ -541,13 +515,8 @@ class GGUFLinear(nn.Module):
 
         # ------------------------------------------------------------------
         # CPU fallback for K-quant and other complex GGUF types.
-        #
-        # Dequantize the uint8 weight to float via numpy (one-time cost), then
-        # replace the compact uint8 buffer with the float weight so that all
-        # subsequent forward calls take the fast path (0. above) instead of
-        # repeating the expensive CPU round-trip on every token.  This makes
-        # K-quant inference without vLLM as fast as BF16 inference after the
-        # first call, at the cost of higher peak memory during the first call.
+        # The weight is copied to CPU for numpy-based dequantisation, then
+        # moved back to the compute device.
         # ------------------------------------------------------------------
         from gguf import dequantize
 
@@ -558,9 +527,6 @@ class GGUFLinear(nn.Module):
             .reshape(self.out_features, self.in_features)
             .to(dtype=target_dtype, device=device)
         )
-        # Materialize: swap the compact uint8 buffer for the float weight so
-        # subsequent calls avoid the CPU round-trip.
-        self.register_buffer("weight", weight)
         return F.linear(x, weight, self.bias)
 
     def extra_repr(self) -> str:
