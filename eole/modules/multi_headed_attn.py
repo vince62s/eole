@@ -508,7 +508,12 @@ class SelfMHA(MultiHeadedAttention):
                     rotary_interleaved=self.rotary_interleave,
                     window_size=self.window_size,
                 )
-                self.causal = False
+                # Only switch off causal masking when transitioning to
+                # single-token decode (S == 1).  During chunked prefill each
+                # chunk is a multi-token forward (S > 1), so causal must stay
+                # True to preserve correct within-chunk ordering.
+                if query.size(1) == 1:
+                    self.causal = False
                 context = blhd_to_bld(context)
                 if self.q_gating and hasattr(self, "_attn_gate"):
                     context = context * self._attn_gate
