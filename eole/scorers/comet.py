@@ -1,10 +1,44 @@
+import contextlib
 import logging
+import io
 import os
+import warnings
 
 from .scorer import Scorer
 from eole.scorers import register_scorer
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _suppress_third_party_noise():
+    """Suppress noisy output from pytorch_lightning / torchmetrics during COMET scoring.
+
+    Suppresses:
+    - Python warnings from third-party packages (deprecation, state-dict mismatches, etc.)
+    - pytorch_lightning and lightning_fabric INFO/WARNING log messages
+    - Direct stdout prints (Lightning upgrade notices, Tips, "Encoder model frozen.", etc.)
+    """
+    # Raise log level on noisy third-party loggers to ERROR for the duration
+    noisy_loggers = [
+        "pytorch_lightning",
+        "lightning_fabric",
+        "lightning",
+        "lightning.pytorch",
+    ]
+    old_levels = {}
+    for name in noisy_loggers:
+        lg = logging.getLogger(name)
+        old_levels[name] = lg.level
+        lg.setLevel(logging.ERROR)
+
+    with warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+        warnings.simplefilter("ignore")
+        try:
+            yield
+        finally:
+            for name, level in old_levels.items():
+                logging.getLogger(name).setLevel(level)
 
 
 class _CometBaseScorer(Scorer):
@@ -63,25 +97,27 @@ class _CometBaseScorer(Scorer):
                 data.append({"src": src, "mt": mt})
 
         logger.info("Loading COMET model: %s", self.model_name)
-        if os.path.exists(self.model_name):
-            # Local checkpoint file or directory — load directly without downloading
-            comet_model = load_from_checkpoint(self.model_name)
-        else:
-            # HuggingFace repo ID — download (cached) then load
-            model_path = download_model(self.model_name)
-            comet_model = load_from_checkpoint(model_path)
+        with _suppress_third_party_noise():
+            if os.path.exists(self.model_name):
+                # Local checkpoint file or directory — load directly without downloading
+                comet_model = load_from_checkpoint(self.model_name)
+            else:
+                # HuggingFace repo ID — download (cached) then load
+                model_path = download_model(self.model_name)
+                comet_model = load_from_checkpoint(model_path)
 
         gpus = 1 if torch.cuda.is_available() else 0
         batch_size = getattr(self.config, "comet_batch_size", 64)
 
         try:
-            result = comet_model.predict(
-                data,
-                batch_size=batch_size,
-                gpus=gpus,
-                num_workers=0,
-                progress_bar=False,
-            )
+            with _suppress_third_party_noise():
+                result = comet_model.predict(
+                    data,
+                    batch_size=batch_size,
+                    gpus=gpus,
+                    num_workers=0,
+                    progress_bar=False,
+                )
             score = result.system_score
         finally:
             # Unload COMET model to free GPU memory before returning
