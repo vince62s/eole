@@ -113,6 +113,7 @@ setup(
         "pydantic",
     ],
     extras_require={
+        "comet": ["unbabel-comet>=2.2.0"],
         "wer": ["jiwer>=3.0", "whisper-normalizer>=0.1"],
     },
     entry_points={"console_scripts": ["eole=eole.bin.main:main"]},
