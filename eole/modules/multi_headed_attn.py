@@ -170,12 +170,6 @@ class MultiHeadedAttention(torch.nn.Module):
         self.dropout_p = dropout
 
     def _fuse_KVQ(self) -> None:
-        from eole.modules.gguf_linear import GGUFLinear
-
-        if isinstance(self.linear_keys, GGUFLinear):
-            # GGUFLinear stores uint8 quantized buffers that cannot be fused
-            # into a single float nn.Linear. Skip fusing silently.
-            return
         if hasattr(self.linear_keys, "weight"):
             self.linear_kvq = skip_init(
                 nn.Linear,

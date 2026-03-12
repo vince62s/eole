@@ -1252,18 +1252,26 @@ def build_safetensors(
                         t = torch.cat([qk_part, v_part], dim=0)
 
                 elif _blk_suffix == "ssm_out.weight":
-                    # out_proj: ALWAYS dequantize before column reordering.
-                    # _inverse_v_head_reorder_cols on uint8 Q5_K bytes appears safe
-                    # (4096 % 32 == 0 so no ValueError) but silently corrupts block
-                    # metadata because Q5_K blocks span 176 bytes and are not aligned
-                    # to the 128-byte "column group" boundaries we reindex.
-                    if qtype_t is not None:
+                    if qtype_t is not None and t.dim() == 2:
                         import numpy as _np2
-                        from gguf.quants import dequantize as _gguf_dq2
-                        dq2 = _gguf_dq2(tensor.data, tensor.tensor_type)
-                        t = torch.from_numpy(_np2.array(dq2, copy=True)).to(target_dtype)
-                        qtype_t = None
-                    if t.dim() == 2:
+                        from gguf.quants import dequantize as _gguf_dq2, quantize as _gguf_q2
+                        from gguf import GGMLQuantizationType
+
+                        # Dequantize original Q5_K → float32
+                        dq = _gguf_dq2(tensor.data, tensor.tensor_type)
+                        t_f32 = torch.from_numpy(_np2.array(dq, copy=True)).float()
+                        t_f32 = t_f32.reshape(t.shape[0], -1)  # (out, in)
+
+                        # Undo column reorder on float
+                        t_f32 = _inverse_v_head_reorder_cols(t_f32, _num_k_heads, _num_v_per_k)
+
+                        # Re-quantize to Q8_0 (quantize_blocks is implemented, higher quality)
+                        reqs = _gguf_q2(t_f32.numpy(), GGMLQuantizationType.Q8_0)
+                        t = torch.from_numpy(_np2.array(reqs, copy=True))
+
+                        # Update qtype_t to Q8_0 so GGUFLinear gets the right gguf_qtype scalar
+                        qtype_t = torch.tensor([GGMLQuantizationType.Q8_0.value], dtype=torch.int32)
+                    elif t.dim() == 2:
                         t = _inverse_v_head_reorder_cols(t, _num_k_heads, _num_v_per_k)
 
                 elif _blk_suffix == "ssm_conv1d.weight":
