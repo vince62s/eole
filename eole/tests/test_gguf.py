@@ -202,15 +202,27 @@ class TestGGUFNameMapping(unittest.TestCase):
         r = self._map("blk.1.attn_qkv.weight", linear_blocks=frozenset({0}))
         self.assertEqual(r, "decoder.transformer_layers.1.self_attn.qkv_proj.weight")
 
-    def test_ssm_tensors_unrecognised_without_linear_blocks(self):
-        """Without linear_blocks context, SSM tensor names are unrecognised (warn)."""
-        self.assertEqual(self._map("blk.0.ssm_a"), "")
-        self.assertEqual(self._map("blk.0.ssm_alpha.weight"), "")
-        self.assertEqual(self._map("blk.0.ssm_out.weight"), "")
+    def test_ssm_tensors_recognised_without_linear_blocks(self):
+        """SSM tensor names are now in _BLOCK_MAP and always recognised."""
+        self.assertEqual(
+            self._map("blk.0.ssm_a"),
+            "decoder.transformer_layers.0.linear_attn.A_log",
+        )
+        self.assertEqual(
+            self._map("blk.0.ssm_alpha.weight"),
+            "decoder.transformer_layers.0.linear_attn.in_proj_a.weight",
+        )
+        self.assertEqual(
+            self._map("blk.0.ssm_out.weight"),
+            "decoder.transformer_layers.0.linear_attn.out_proj.weight",
+        )
 
-    def test_attn_gate_unrecognised_in_full_attention_block(self):
-        """attn_gate.weight in a non-linear block is unrecognised (no silent skip)."""
-        self.assertEqual(self._map("blk.3.attn_gate.weight"), "")
+    def test_attn_gate_maps_to_in_proj_z_for_any_block(self):
+        """attn_gate.weight is in _BLOCK_MAP and recognised for any block index."""
+        self.assertEqual(
+            self._map("blk.3.attn_gate.weight"),
+            "decoder.transformer_layers.3.linear_attn.in_proj_z.weight",
+        )
 
 
 class TestGGUFLinear(unittest.TestCase):
@@ -237,8 +249,8 @@ class TestGGUFLinear(unittest.TestCase):
         # Untouched modules stay as nn.Linear
         self.assertIsInstance(model.other, nn.Linear)
 
-    def test_forward_quantized(self):
-        """Load a Q4_K weight buffer (written via GGUFWriter) and run forward pass."""
+    def test_forward_raises_import_error_without_vllm(self):
+        """GGUFLinear raises ImportError if vLLM is not installed."""
         _require("numpy")
         import tempfile
         import os
@@ -278,8 +290,12 @@ class TestGGUFLinear(unittest.TestCase):
         )
 
         x = torch.randn(2, 4, n_in)
-        out = layer(x)
-        self.assertEqual(out.shape, (2, 4, n_out))
+
+        # Without vLLM, forward must raise ImportError.
+        from unittest.mock import patch
+        with patch("eole.modules.gguf_linear._vllm_fused_mul_mat_gguf", None):
+            with self.assertRaises(ImportError):
+                layer(x)
 
     def test_extra_repr_shows_qtype(self):
         import torch
@@ -328,196 +344,6 @@ class TestGGUFLinear(unittest.TestCase):
             torch.tensor([qtype_enum.value], dtype=torch.int32),
         )
         return layer
-
-    def _forward_matches_cpu_fallback(self, qtype_enum, n_out=8, n_in=256):
-        """GPU-native path must produce the same result as the CPU fallback."""
-        import torch
-        import torch.nn.functional as F
-        from gguf import dequantize
-
-        layer = self._make_gguf_layer(n_out, n_in, qtype_enum)
-
-        x = torch.randn(2, 4, n_in)
-
-        # Reference: CPU numpy path (the original fallback logic)
-        w_np = layer.weight.cpu().numpy()
-        dq_np = dequantize(w_np, qtype_enum)
-        w_ref = torch.from_numpy(dq_np).reshape(n_out, n_in).to(x.dtype)
-        expected = F.linear(x, w_ref)
-
-        # Actual: GGUFLinear.forward (should hit GPU path for Q8_0/Q4_0/Q4_1)
-        actual = layer(x)
-
-        self.assertEqual(actual.shape, (2, 4, n_out))
-        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4, equal_nan=True)
-
-    def test_forward_q8_0_matches_numpy(self):
-        """Q8_0 GPU-native dequantisation must match the numpy reference."""
-        _require("numpy")
-        from gguf import GGMLQuantizationType
-        self._forward_matches_cpu_fallback(GGMLQuantizationType.Q8_0)
-
-    def test_forward_q4_0_matches_numpy(self):
-        """Q4_0 GPU-native dequantisation must match the numpy reference."""
-        _require("numpy")
-        from gguf import GGMLQuantizationType
-        self._forward_matches_cpu_fallback(GGMLQuantizationType.Q4_0)
-
-    def test_forward_q4_1_matches_numpy(self):
-        """Q4_1 GPU-native dequantisation must match the numpy reference."""
-        _require("numpy")
-        from gguf import GGMLQuantizationType
-        self._forward_matches_cpu_fallback(GGMLQuantizationType.Q4_1)
-
-
-class TestGGUFLinearTriton(unittest.TestCase):
-    """Validate the Triton fused Q4_0 dequantize+matmul kernel.
-
-    All tests in this class are skipped automatically when:
-    * ``triton`` is not installed,
-    * no CUDA device is available, or
-    * the ``gguf`` or ``numpy`` packages are absent.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        _require("triton")
-        _require("gguf")
-        _require("numpy")
-        import torch
-
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
-
-    def _make_q4_0_layer_cuda(self, n_out=32, n_in=128):
-        """Build a GGUFLinear(Q4_0) layer with weights on the CUDA device."""
-        import numpy as np
-        import torch
-        from gguf import GGMLQuantizationType, GGUFReader, GGUFWriter
-
-        from eole.modules.gguf_linear import GGUFLinear
-
-        import os
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as td:
-            gpath = os.path.join(td, "tiny.gguf")
-            writer = GGUFWriter(gpath, "llama")
-            writer.add_block_count(1)
-            writer.add_embedding_length(n_in)
-            writer.add_vocab_size(n_out)
-            writer.add_tensor(
-                "test.weight",
-                np.random.randn(n_out, n_in).astype(np.float32),
-                raw_dtype=GGMLQuantizationType.Q4_0,
-            )
-            writer.write_header_to_file()
-            writer.write_kv_data_to_file()
-            writer.write_tensors_to_file()
-            writer.close()
-            reader = GGUFReader(gpath)
-            q_data = reader.tensors[0].data.copy()
-
-        layer = GGUFLinear(in_features=n_in, out_features=n_out, bias=False)
-        layer.register_buffer("weight", torch.from_numpy(q_data).cuda())
-        layer.register_buffer(
-            "gguf_qtype",
-            torch.tensor(
-                [GGMLQuantizationType.Q4_0.value], dtype=torch.int32
-            ),
-        )
-        return layer
-
-    def test_triton_q4_0_matches_pytorch_fallback(self):
-        """Triton kernel output must match the PyTorch dequant reference."""
-        import torch
-        import torch.nn.functional as F
-        from gguf import dequantize, GGMLQuantizationType
-        from eole.modules.gguf_linear import GGUFLinear, _TRITON_AVAILABLE
-
-        if not _TRITON_AVAILABLE:
-            self.skipTest("Triton kernel not compiled successfully")
-
-        n_out, n_in = 32, 128
-        layer = self._make_q4_0_layer_cuda(n_out, n_in)
-
-        # Float16 input on CUDA – the common inference scenario.
-        x = torch.randn(2, 4, n_in, dtype=torch.float16, device="cuda")
-
-        # Reference: numpy dequant + F.linear (identical to CPU fallback).
-        w_np = layer.weight.cpu().numpy()
-        dq_np = dequantize(w_np, GGMLQuantizationType.Q4_0)
-        w_ref = (
-            torch.from_numpy(dq_np)
-            .reshape(n_out, n_in)
-            .to(dtype=x.dtype, device="cuda")
-        )
-        expected = F.linear(x, w_ref)
-
-        # Actual: GGUFLinear.forward should route through the Triton kernel.
-        actual = layer(x)
-
-        self.assertEqual(actual.shape, (2, 4, n_out))
-        # Allow for float16 rounding differences between kernel and reference.
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-    def test_triton_q4_0_matches_pytorch_fallback_float32(self):
-        """Triton kernel output must match reference for float32 activations."""
-        import torch
-        import torch.nn.functional as F
-        from gguf import dequantize, GGMLQuantizationType
-        from eole.modules.gguf_linear import GGUFLinear, _TRITON_AVAILABLE
-
-        if not _TRITON_AVAILABLE:
-            self.skipTest("Triton kernel not compiled successfully")
-
-        n_out, n_in = 32, 128
-        layer = self._make_q4_0_layer_cuda(n_out, n_in)
-
-        x = torch.randn(3, n_in, dtype=torch.float32, device="cuda")
-
-        w_np = layer.weight.cpu().numpy()
-        dq_np = dequantize(w_np, GGMLQuantizationType.Q4_0)
-        w_ref = (
-            torch.from_numpy(dq_np)
-            .reshape(n_out, n_in)
-            .to(dtype=x.dtype, device="cuda")
-        )
-        expected = F.linear(x, w_ref)
-        actual = layer(x)
-
-        self.assertEqual(actual.shape, (3, n_out))
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-    def test_triton_path_selected_on_cuda(self):
-        """GGUFLinear must use the Triton path on CUDA when Triton is available."""
-        import torch
-        from eole.modules.gguf_linear import (
-            GGUFLinear,
-            _TRITON_AVAILABLE,
-            _q4_0_triton_linear,
-        )
-        from unittest.mock import patch
-
-        if not _TRITON_AVAILABLE:
-            self.skipTest("Triton kernel not compiled successfully")
-
-        layer = self._make_q4_0_layer_cuda(32, 128)
-        x = torch.randn(2, 128, dtype=torch.float16, device="cuda")
-
-        call_count = {"n": 0}
-
-        def counting_wrapper(*args, **kwargs):
-            call_count["n"] += 1
-            return _q4_0_triton_linear(*args, **kwargs)
-
-        with patch(
-            "eole.modules.gguf_linear._q4_0_triton_linear",
-            side_effect=counting_wrapper,
-        ):
-            layer(x)
-
-        self.assertEqual(call_count["n"], 1, "Triton path was not invoked")
 
 
 class TestGGUFLinearVLLM(unittest.TestCase):
@@ -625,89 +451,48 @@ class TestGGUFLinearVLLM(unittest.TestCase):
         self._assert_vllm_path_matches_reference(GGMLQuantizationType.Q8_0)
 
     def test_vllm_path_selected_on_cuda(self):
-        """GGUFLinear must route through the vLLM path on CUDA when available."""
+        """GGUFLinear must route through the vLLM fused op on CUDA when available."""
         import torch
         from unittest.mock import patch
 
-        from eole.modules.gguf_linear import _VLLM_GGUF_OPS_AVAILABLE, _vllm_gguf_linear
+        from eole.modules.gguf_linear import _vllm_fused_mul_mat_gguf
         from gguf import GGMLQuantizationType
 
-        if not _VLLM_GGUF_OPS_AVAILABLE:
+        if _vllm_fused_mul_mat_gguf is None:
             self.skipTest("vLLM GGUF ops not available")
 
         layer = self._make_gguf_layer_cuda(32, 128, GGMLQuantizationType.Q4_0)
         x = torch.randn(2, 128, dtype=torch.float16, device="cuda")
 
         call_count = {"n": 0}
+        real_fn = _vllm_fused_mul_mat_gguf
 
         def counting_wrapper(*args, **kwargs):
             call_count["n"] += 1
-            return _vllm_gguf_linear(*args, **kwargs)
+            return real_fn(*args, **kwargs)
 
         with patch(
-            "eole.modules.gguf_linear._vllm_gguf_linear",
+            "eole.modules.gguf_linear._vllm_fused_mul_mat_gguf",
             side_effect=counting_wrapper,
         ):
             layer(x)
 
-        self.assertEqual(call_count["n"], 1, "vLLM path was not invoked")
-
-    def test_vllm_path_takes_priority_over_triton(self):
-        """When both vLLM and Triton are available, vLLM must be used for Q4_0."""
-        import torch
-        from unittest.mock import patch
-
-        from eole.modules.gguf_linear import (
-            _TRITON_AVAILABLE,
-            _VLLM_GGUF_OPS_AVAILABLE,
-            _q4_0_triton_linear,
-            _vllm_gguf_linear,
-        )
-        from gguf import GGMLQuantizationType
-
-        if not (_VLLM_GGUF_OPS_AVAILABLE and _TRITON_AVAILABLE):
-            self.skipTest("Requires both vLLM and Triton")
-
-        layer = self._make_gguf_layer_cuda(32, 128, GGMLQuantizationType.Q4_0)
-        x = torch.randn(2, 128, dtype=torch.float16, device="cuda")
-
-        triton_calls = {"n": 0}
-        vllm_calls = {"n": 0}
-
-        def count_triton(*args, **kwargs):
-            triton_calls["n"] += 1
-            return _q4_0_triton_linear(*args, **kwargs)
-
-        def count_vllm(*args, **kwargs):
-            vllm_calls["n"] += 1
-            return _vllm_gguf_linear(*args, **kwargs)
-
-        with (
-            patch("eole.modules.gguf_linear._q4_0_triton_linear", side_effect=count_triton),
-            patch("eole.modules.gguf_linear._vllm_gguf_linear", side_effect=count_vllm),
-        ):
-            layer(x)
-
-        self.assertEqual(vllm_calls["n"], 1, "vLLM path was not invoked")
-        self.assertEqual(triton_calls["n"], 0, "Triton was used even though vLLM is available")
+        self.assertEqual(call_count["n"], 1, "vLLM fused op was not invoked")
 
     def test_vllm_delegates_to_fused_op(self):
-        """_vllm_gguf_linear must call _vllm_fused_mul_mat_gguf without dtype cast.
+        """GGUFLinear must call _vllm_fused_mul_mat_gguf without dtype cast.
 
-        vLLM's fused op owns all dispatch and dtype logic internally.  Our
-        wrapper must pass (x_2d, weight_2d, qtype_val) directly — no manual
-        float16 cast — and the output dtype must match the input dtype.
+        vLLM's fused op owns all dispatch and dtype logic internally.  The
+        forward pass must pass (x_2d, weight_2d, qtype_val) directly — no
+        manual float16 cast — and the output dtype must match the input dtype.
         """
         import torch
         from unittest.mock import patch
 
-        from eole.modules.gguf_linear import (
-            _VLLM_GGUF_OPS_AVAILABLE,
-            _vllm_fused_mul_mat_gguf,
-        )
+        from eole.modules.gguf_linear import _vllm_fused_mul_mat_gguf
         from gguf import GGMLQuantizationType
 
-        if not _VLLM_GGUF_OPS_AVAILABLE:
+        if _vllm_fused_mul_mat_gguf is None:
             self.skipTest("vLLM GGUF ops not available")
 
         layer = self._make_gguf_layer_cuda(32, 128, GGMLQuantizationType.Q4_0)

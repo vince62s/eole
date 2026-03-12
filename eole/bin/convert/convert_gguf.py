@@ -148,34 +148,14 @@ _BLOCK_MAP: dict[str, Optional[str]] = {
     "ffn_gate_exps.weight": "mlp.experts_gate_up.weight",
     "ffn_up_exps.weight": "mlp.experts_up.weight",
     "ffn_down_exps.weight": "mlp.experts_down.weight",
-    # Post-attention output norm – present in full-attention blocks (Qwen3.5 and
-    # similar hybrid models).  For linear-attention blocks this tensor is handled
-    # separately in _LINEAR_ATTN_BLOCK_MAP.
+    # Post-attention output norm – present in full-attention and linear-attention
+    # blocks (Qwen3.5 and similar hybrid models).
     "post_attention_norm.weight": "post_attention_layernorm.weight",
     "post_attention_norm.bias": "post_attention_layernorm.bias",
-}
-
-# ---------------------------------------------------------------------------
-# Per-block suffix → EOLE decoder-layer suffix for *linear-attention* blocks.
-#
-# In hybrid models (Qwen3.5, …) some blocks are linear/SSM layers
-# (GatedDeltaNet) rather than standard self-attention layers.  Tensor names
-# that are specific to those blocks – or whose mapping differs from the
-# full-attention case – are listed here.
-#
-# ``_gguf_to_eole_name`` checks this map *first* for blocks that are detected
-# as linear-attention blocks; anything not found here falls through to
-# ``_BLOCK_MAP`` so that shared tensors (input norm, FFN, …) are still handled.
-# ---------------------------------------------------------------------------
-_LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
-    # In linear-attention blocks the merged QKV projection feeds GatedDeltaNet,
-    # not self_attn – override the _BLOCK_MAP entry.
-    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
-    "attn_qkv.bias": "linear_attn.in_proj_qkv.bias",
-    # Gate / z projection (in_proj_z)
+    # Gate / z projection for GatedDeltaNet linear-attention blocks (in_proj_z)
     "attn_gate.weight": "linear_attn.in_proj_z.weight",
     "attn_gate.bias": "linear_attn.in_proj_z.bias",
-    # GatedDeltaNet SSM weights
+    # GatedDeltaNet SSM weights (linear-attention / hybrid models, e.g. Qwen3.5)
     # NOTE: llama.cpp's Qwen3NextModel.modify_tensors converts A_log → -exp(A_log)
     # before writing ssm_a to GGUF.  build_safetensors inverts this with log(-t).
     "ssm_a": "linear_attn.A_log",          # log-scale A decay factor (needs inversion)
@@ -193,11 +173,6 @@ _LINEAR_ATTN_BLOCK_MAP: dict[str, Optional[str]] = {
     "ssm_dt.bias": "linear_attn.dt_bias",
     "ssm_norm.weight": "linear_attn.norm.weight",
     "ssm_out.weight": "linear_attn.out_proj.weight",
-    # post_attention_norm in linear-attention blocks maps to post_attention_layernorm,
-    # just as in full-attention blocks.  EOLE's _forward_linear_attn uses
-    # post_attention_layernorm as the post-linear-attention output norm.
-    "post_attention_norm.weight": "post_attention_layernorm.weight",
-    "post_attention_norm.bias": "post_attention_layernorm.bias",
 }
 
 # ---------------------------------------------------------------------------
@@ -298,9 +273,9 @@ def _gguf_to_eole_name(gguf_name: str, linear_blocks: frozenset = frozenset()) -
     Args:
         gguf_name: The name of the tensor in the GGUF file.
         linear_blocks: Set of block indices that are linear-attention (SSM/GatedDeltaNet)
-            blocks, as detected by :func:`_detect_linear_attention_blocks`.  When a
-            block index appears here the ``_LINEAR_ATTN_BLOCK_MAP`` is consulted first
-            before falling through to ``_BLOCK_MAP``.
+            blocks, as detected by :func:`_detect_linear_attention_blocks`.  Only
+            used to disambiguate ``attn_qkv.*`` which maps to ``linear_attn.in_proj_qkv``
+            in linear-attention blocks and ``self_attn.qkv_proj`` otherwise.
 
     Returns:
         ``None`` for tensors that should be skipped (e.g., RoPE cache).
@@ -315,14 +290,12 @@ def _gguf_to_eole_name(gguf_name: str, linear_blocks: frozenset = frozenset()) -
         block_idx = int(m.group(1))
         suffix = m.group(2)
 
-        if block_idx in linear_blocks:
-            # Linear-attention block: check the SSM/GatedDeltaNet map first.
-            if suffix in _LINEAR_ATTN_BLOCK_MAP:
-                eole_suffix = _LINEAR_ATTN_BLOCK_MAP[suffix]
-                if eole_suffix is None:
-                    return None
-                return f"decoder.transformer_layers.{block_idx}.{eole_suffix}"
-            # Fall through to _BLOCK_MAP for shared tensors (norms, FFN, …).
+        # attn_qkv.* maps differently depending on block type: in linear-attention
+        # blocks the merged QKV projection feeds GatedDeltaNet (in_proj_qkv), while
+        # in full-attention blocks it feeds self_attn (qkv_proj).
+        if block_idx in linear_blocks and suffix in ("attn_qkv.weight", "attn_qkv.bias"):
+            param = suffix.split(".", 1)[1]  # "weight" or "bias"
+            return f"decoder.transformer_layers.{block_idx}.linear_attn.in_proj_qkv.{param}"
 
         if suffix not in _BLOCK_MAP:
             return ""  # unrecognised

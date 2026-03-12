@@ -1,48 +1,30 @@
 """GGUF quantized linear layer.
 
 Stores weights in their native GGUF quantized format (uint8 packed blocks) and
-dequantizes them on-the-fly during the forward pass, following the same
-pattern as the autoround/Marlin backend: quantized weights stay on disk and in
-CPU/GPU memory in compact form; dequantization happens per forward call.
+dequantizes them on-the-fly during the forward pass via the vLLM fused op.
 
 The quantization type is persisted as a model buffer (``gguf_qtype``, int32)
 and stored alongside the quantized weight buffer (``weight``, uint8) in the
 safetensors shard.  Both buffers are loaded automatically by
 :meth:`~eole.models.model.BaseModel.load_safe_state_dict`.
 
-GPU fast-paths (priority order)
---------------------------------
-1. **vLLM fused op** (``torch.ops.vllm._fused_mul_mat_gguf``): when vLLM is
-   installed and the weight is on a CUDA device, the single fused op
-   registered by ``vllm/model_executor/layers/quantization/gguf.py`` handles
-   *all* GGUF quantisation types — including Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K
-   and all IQ-family types — without any CPU round-trip.
+vLLM fused op
+-------------
+Inference uses ``torch.ops.vllm._fused_mul_mat_gguf`` registered by
+``vllm/model_executor/layers/quantization/gguf.py``.  It handles all GGUF
+quantisation types — including Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K, Q8_0 and all
+IQ-family types — without any CPU round-trip:
 
-   The fused op contains the exact same dispatch logic as vLLM uses for its
-   own GGUF linear layers:
+* ``ggml_mul_mat_vec_a8`` (MMVQ) for small batch sizes.
+* ``ggml_mul_mat_a8`` (MMQ) for larger batches on standard + K-quant types.
+* ``ggml_dequantize`` + ``x @ W.T`` for IQ types with large batches.
 
-   * ``ggml_mul_mat_vec_a8`` (MMVQ) for small batch sizes.
-   * ``ggml_mul_mat_a8`` (MMQ) for larger batches on standard + K-quant types.
-   * ``ggml_dequantize`` + ``x @ W.T`` for IQ types with large batches.
-   * Direct ``x @ W.T`` for unquantized (F16/BF16/F32) weight types.
-
-   The op handles dtype dispatch internally and preserves the activation dtype
-   in the output — no manual float16 cast is required or applied.
-
-2. **Triton fused kernel** (Q4_0 only): when Triton is installed but vLLM is
-   not, dequantises Q4_0 weights in GPU registers, never writing an fp16
-   weight tensor to HBM.
-
-3. **PyTorch-native GPU paths** (Q8_0, Q4_0, Q4_1): on-device tensor ops,
-   no CPU round-trip.
-
-4. **CPU fallback** (all other types): ``gguf.dequantize`` via numpy, then
-   the result is moved back to the compute device.
+vLLM must be installed; an :class:`ImportError` is raised at forward time if
+it is not available.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # Float-typed GGUF types that should be loaded as regular tensors (not as
@@ -63,10 +45,7 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
-# Optional vLLM GGUF CUDA ops.
-#
-# ---------------------------------------------------------------------------
-# Optional vLLM GGUF support via ``torch.ops.vllm._fused_mul_mat_gguf``.
+# vLLM GGUF support via ``torch.ops.vllm._fused_mul_mat_gguf``.
 #
 # vLLM registers a single fused op that encapsulates the full MMVQ/MMQ/
 # dequantize dispatch logic used by vLLM's own GGUF linear layers:
@@ -77,286 +56,20 @@ except ImportError:
 # activation dtype in the output.
 # ---------------------------------------------------------------------------
 
-_VLLM_GGUF_OPS_AVAILABLE = False
 _vllm_fused_mul_mat_gguf = None
 
 try:
     from vllm.model_executor.layers.quantization.gguf import (
         fused_mul_mat_gguf as _vllm_fused_mul_mat_gguf,
     )
-    _VLLM_GGUF_OPS_AVAILABLE = True
 except Exception:
     pass
 
 
-def _vllm_gguf_linear(
-    weight_u8: torch.Tensor,
-    x: torch.Tensor,
-    qtype_val: int,
-    out_features: int,
-    in_features: int,
-) -> torch.Tensor:
-    """vLLM-backed GGUF linear using ``torch.ops.vllm._fused_mul_mat_gguf``.
-
-    Delegates entirely to vLLM's single fused op, which owns the full dispatch
-    logic mirroring ``vllm/model_executor/layers/quantization/gguf.py``:
-
-    * ``ggml_mul_mat_vec_a8`` (MMVQ) for small batch sizes.
-    * ``ggml_mul_mat_a8`` (MMQ) for larger batches on standard/K-quant types.
-    * ``ggml_dequantize`` + ``x @ W.T`` for IQ types with large batches.
-    * Direct ``x @ W.T`` for unquantized (F16/BF16/F32) weight types.
-
-    The fused op handles dtype dispatch internally and preserves the input
-    activation dtype in the output.
-
-    Parameters
-    ----------
-    weight_u8 : torch.Tensor
-        Flat ``uint8`` tensor of raw GGUF weight blocks, on a CUDA device.
-    x : torch.Tensor
-        Input activations, shape ``(*, in_features)``, on the same device.
-    qtype_val : int
-        Integer value of the :class:`gguf.GGMLQuantizationType` enum.
-    out_features, in_features : int
-        Logical dimensions of the linear transformation.
-
-    Returns
-    -------
-    torch.Tensor
-        Output of shape ``(*, out_features)``, same dtype as *x*.
-    """
-    try:
-        from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-    except ImportError:
-        raise ImportError(
-            "Install 'gguf' to run vLLM-backed GGUF inference: pip install gguf"
-        )
-
-    block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType(qtype_val)]
-    bytes_per_row = in_features // block_size * type_size
-    weight_2d = weight_u8.reshape(out_features, bytes_per_row).contiguous()
-
-    orig_shape = x.shape
-    N = x.numel() // in_features
-    x_2d = x.contiguous().reshape(N, in_features)
-
-    if N == 0:
-        return torch.empty(*orig_shape[:-1], out_features, dtype=x.dtype, device=x.device)
-
-    y = _vllm_fused_mul_mat_gguf(x_2d, weight_2d, qtype_val)
-    return y.reshape(*orig_shape[:-1], out_features)
-
-
-# ---------------------------------------------------------------------------
-# Optional Triton fused kernel for Q4_0 dequantize + matmul.
-#
-# Used when Triton is installed but vLLM is not available.  Handles Q4_0 only.
-#
-# Q4_0 block layout (18 bytes per block of 32 weights):
-#   bytes 0-1 : scale, float16 little-endian
-#   bytes 2-17: 16 uint8 nibble pairs
-#               - low  nibble of byte i → weight at offset i   (0..15)
-#               - high nibble of byte i → weight at offset i+16 (16..31)
-#   weight value = (nibble - 8) * scale
-#
-# The Triton kernel tiles both the output-row (M) and the batch (N) dimensions
-# and iterates over K in steps of 32 (one Q4_0 block per step).  For each
-# block it dequantises the 32 weights in registers and accumulates their
-# dot product with the corresponding activation slice, avoiding writing any
-# intermediate fp16/fp32 weight tensor to HBM.
-# ---------------------------------------------------------------------------
-
-_TRITON_AVAILABLE = False
-try:
-    import triton
-    import triton.language as tl
-
-    _TRITON_AVAILABLE = True
-
-    @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 16}),
-            triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 16}),
-            triton.Config({"BLOCK_M": 16, "BLOCK_N": 64}),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}),
-        ],
-        key=["M", "K", "N"],
-    )
-    @triton.jit
-    def _q4_0_dequant_matmul_kernel(
-        W_ptr,  # uint8 flat buffer: [M * (K//32) * 18] bytes
-        X_ptr,  # float16 or float32 [N, K]
-        Y_ptr,  # float32 [N, M]
-        M,
-        K,
-        N,
-        stride_xn,
-        stride_xk,
-        stride_yn,
-        stride_ym,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Fused Q4_0 dequantize + matmul Triton kernel.
-
-        Each program instance handles a BLOCK_M × BLOCK_N tile of the output
-        matrix and iterates over all K//32 Q4_0 blocks, dequantising in
-        registers and accumulating into a fp32 accumulator.
-
-        Parameters
-        ----------
-        W_ptr : pointer to uint8
-            Flat Q4_0 weight buffer.  For output row ``m`` and K-block
-            ``b``, the block starts at byte ``(m * (K // 32) + b) * 18``.
-        X_ptr : pointer to float16 or float32
-            Activation matrix, shape [N, K].
-        Y_ptr : pointer to float32
-            Output matrix, shape [N, M].  Written as fp32; the caller casts
-            to the required dtype.
-        M, K, N : int
-            Matrix dimensions.
-        stride_xn, stride_xk : int
-            Strides (in elements) for X.
-        stride_yn, stride_ym : int
-            Strides (in elements) for Y.
-        BLOCK_M, BLOCK_N : constexpr int
-            Tile sizes; must be ≥ 16 for tensor-core usage via ``tl.dot``.
-        """
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-
-        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
-        ns = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)    # [BLOCK_N]
-
-        row_mask = rows < M
-        n_mask = ns < N
-
-        n_blocks_k = K // 32
-        # Number of bytes per output row in the quantised weight buffer.
-        row_stride_bytes = n_blocks_k * 18
-
-        acc = tl.zeros([BLOCK_N, BLOCK_M], dtype=tl.float32)
-
-        for k_block in range(n_blocks_k):
-            # Byte offset of this Q4_0 block for each output row: [BLOCK_M]
-            block_base = rows * row_stride_bytes + k_block * 18
-
-            # ---- Load scale (2-byte little-endian float16) ----
-            b0 = tl.load(W_ptr + block_base, mask=row_mask, other=0).to(tl.uint16)
-            b1 = tl.load(W_ptr + block_base + 1, mask=row_mask, other=0).to(tl.uint16)
-            # Reconstruct uint16 in little-endian order then bitcast to f16.
-            scale_u16 = b0 | (b1 << 8)
-            scale = scale_u16.to(tl.float16, bitcast=True).to(tl.float32)  # [BLOCK_M]
-
-            # ---- Load 16 nibble bytes: [BLOCK_M, 16] ----
-            nibble_offs = block_base[:, None] + 2 + tl.arange(0, 16)[None, :]
-            packed = tl.load(
-                W_ptr + nibble_offs, mask=row_mask[:, None], other=0
-            )  # [BLOCK_M, 16] uint8
-
-            # ---- Dequantise nibbles: both halves as float16 [BLOCK_M, 16] ----
-            # lo: weight offsets 0..15  (low  nibble of each byte)
-            # hi: weight offsets 16..31 (high nibble of each byte)
-            lo = ((packed & 0x0F).to(tl.int8) - 8).to(tl.float16)
-            hi = (((packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float16)
-
-            k_base_val = k_block * 32
-
-            # ---- Load activations: [BLOCK_N, 16] for each half ----
-            k_lo_idx = k_base_val + tl.arange(0, 16)        # [16]  (constexpr)
-            k_hi_idx = k_base_val + 16 + tl.arange(0, 16)   # [16]
-
-            x_lo = tl.load(
-                X_ptr + ns[:, None] * stride_xn + k_lo_idx[None, :] * stride_xk,
-                mask=n_mask[:, None],
-                other=0.0,
-            ).to(tl.float16)  # [BLOCK_N, 16]
-
-            x_hi = tl.load(
-                X_ptr + ns[:, None] * stride_xn + k_hi_idx[None, :] * stride_xk,
-                mask=n_mask[:, None],
-                other=0.0,
-            ).to(tl.float16)  # [BLOCK_N, 16]
-
-            # ---- Fused dot: [BLOCK_N, 16] @ [16, BLOCK_M] = [BLOCK_N, BLOCK_M] ----
-            # contrib[n, m] = Σ_j x_lo[n,j]*lo[m,j] + x_hi[n,j]*hi[m,j]
-            contrib = tl.dot(x_lo, tl.trans(lo)) + tl.dot(x_hi, tl.trans(hi))
-
-            # Apply per-row scale (broadcast over batch dim).
-            acc += contrib * scale[None, :]
-
-        # ---- Store output tile ----
-        y_offs = ns[:, None] * stride_yn + rows[None, :] * stride_ym
-        y_mask = n_mask[:, None] & row_mask[None, :]
-        tl.store(Y_ptr + y_offs, acc, mask=y_mask)
-
-    def _q4_0_triton_linear(
-        weight_u8: torch.Tensor,
-        x: torch.Tensor,
-        out_features: int,
-        in_features: int,
-    ) -> torch.Tensor:
-        """Python wrapper around :func:`_q4_0_dequant_matmul_kernel`.
-
-        Parameters
-        ----------
-        weight_u8 : torch.Tensor
-            1-D ``uint8`` tensor of length ``out_features * (in_features // 32) * 18``
-            holding the raw Q4_0 weight blocks, on a CUDA device.
-        x : torch.Tensor
-            Input activations of shape ``(*, in_features)``, on the same CUDA device.
-            Any leading batch dimensions are collapsed before calling the kernel.
-        out_features, in_features : int
-            Logical shape of the linear transformation.
-
-        Returns
-        -------
-        torch.Tensor
-            Output of shape ``(*, out_features)``, dtype ``float32``, on the
-            same CUDA device.  Cast to the desired dtype by the caller.
-        """
-        orig_shape = x.shape
-        N = x.numel() // in_features
-        x_2d = x.contiguous().reshape(N, in_features)
-
-        M = out_features
-        K = in_features
-
-        y = torch.empty((N, M), dtype=torch.float32, device=x.device)
-
-        # Grid is a lambda so the autotuner can inject the winning BLOCK_M /
-        # BLOCK_N values at runtime without recompiling.
-        grid = lambda meta: (  # noqa: E731
-            triton.cdiv(M, meta["BLOCK_M"]),
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
-
-        _q4_0_dequant_matmul_kernel[grid](
-            weight_u8,
-            x_2d,
-            y,
-            M,
-            K,
-            N,
-            x_2d.stride(0),
-            x_2d.stride(1),
-            y.stride(0),
-            y.stride(1),
-        )
-
-        return y.reshape(*orig_shape[:-1], M)
-
-except Exception:
-    # Triton import failed or kernel definition raised – stay on PyTorch path.
-    _TRITON_AVAILABLE = False
-
-
 class GGUFLinear(nn.Module):
     """Linear layer whose weights are stored in GGUF quantized format.
+
+    Inference is performed via the vLLM fused GGUF op, which must be installed.
 
     Parameters
     ----------
@@ -395,139 +108,54 @@ class GGUFLinear(nn.Module):
         else:
             self.bias = None
 
-    @staticmethod
-    def _decode_f16_col(blocks: torch.Tensor, start: int, end: int) -> torch.Tensor:
-        """Reinterpret a uint8 byte slice as float16 scalars (little-endian).
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Dequantize weight on-the-fly via the vLLM fused op and apply linear.
+
+        Requires vLLM to be installed. Raises :class:`ImportError` if it is not.
 
         Parameters
         ----------
-        blocks:
-            2-D uint8 tensor of shape ``(n_blocks, type_size)``.
-        start, end:
-            Byte slice ``[start:end]`` within each block (must span exactly
-            ``(end - start) / 2`` float16 values, so ``end - start`` must be even).
+        x : torch.Tensor
+            Input activations of shape ``(*, in_features)``.
 
         Returns
         -------
         torch.Tensor
-            1-D float32 tensor of shape ``(n_blocks * (end - start) // 2,)``.
+            Output of shape ``(*, out_features)``, same dtype as *x*.
         """
-        return blocks[:, start:end].contiguous().view(torch.float16).reshape(-1).to(torch.float32)
+        if _vllm_fused_mul_mat_gguf is None:
+            raise ImportError(
+                "vLLM is required for GGUF quantized inference. "
+                "Install it with: pip install vllm"
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Dequantize weight on-the-fly, then apply linear transformation.
-
-        **vLLM fused op (all types, CUDA + vLLM installed)** — delegates to
-        ``torch.ops.vllm._fused_mul_mat_gguf``, which is the same op used by
-        vLLM's own GGUF linear layers.  It handles every GGUF quantisation
-        type (Q4_K/M, Q5_K, Q6_K, Q3_K, Q2_K, IQ-family, …) and owns all
-        MMVQ/MMQ/dequantize dispatch and dtype logic internally.
-
-        **Triton fused kernel (Q4_0, CUDA + Triton, no vLLM)** — dequantises
-        Q4_0 weights in GPU registers and accumulates directly into the output.
-
-        **PyTorch-native GPU paths (Q8_0, Q4_0, Q4_1)** — on-device tensor
-        ops; no CPU round-trip when the model is on a CUDA device.
-
-        **CPU fallback (all remaining types)** — ``gguf.dequantize`` via numpy;
-        the quantised buffer is copied to the CPU and the result is moved back.
-        """
         try:
-            from gguf import GGMLQuantizationType
+            from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
         except ImportError:
-            raise ImportError("Install 'gguf' to run inference with GGUF quantized models: pip install gguf")
+            raise ImportError(
+                "Install 'gguf' to run GGUF quantized inference: pip install gguf"
+            )
 
         qtype_val = int(self.gguf_qtype.item())
-        qtype = GGMLQuantizationType(qtype_val)
-        target_dtype = x.dtype
-        device = self.weight.device
+        block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType(qtype_val)]
+        bytes_per_row = self.in_features // block_size * type_size
+        weight_2d = self.weight.reshape(self.out_features, bytes_per_row).contiguous()
 
-        # ------------------------------------------------------------------
-        # 1. vLLM CUDA path: handles ALL GGUF types on GPU using the three
-        #    kernels from ggml_quants.cu (MMVQ / MMQ / dequantize+matmul).
-        #    This covers K-quants and IQ-quants with no CPU round-trip.
-        # ------------------------------------------------------------------
-        if _VLLM_GGUF_OPS_AVAILABLE and self.weight.is_cuda:
-            out = _vllm_gguf_linear(
-                self.weight, x, qtype_val, self.out_features, self.in_features
-            ).to(dtype=target_dtype)
-            if self.bias is not None:
-                out = out + self.bias
-            return out
+        orig_shape = x.shape
+        N = x.numel() // self.in_features
+        x_2d = x.contiguous().reshape(N, self.in_features)
 
-        # ------------------------------------------------------------------
-        # 2. PyTorch-native GPU paths.
-        #    The quantised uint8 weight stays on the GPU; no CPU round-trip.
-        #
-        # Block layouts follow the GGUF spec (little-endian scalars):
-        #   Q8_0 – [d:f16 (2 B), qs:i8[32] (32 B)]          34 B / 32 elems
-        #   Q4_0 – [d:f16 (2 B), qs:u8[16] (16 B)]           18 B / 32 elems
-        #   Q4_1 – [d:f16 (2 B), m:f16 (2 B), qs:u8[16]]     20 B / 32 elems
-        # ------------------------------------------------------------------
+        if N == 0:
+            return torch.empty(
+                *orig_shape[:-1], self.out_features, dtype=x.dtype, device=x.device
+            )
 
-        if qtype == GGMLQuantizationType.Q8_0:
-            blocks = self.weight.reshape(-1, 34)  # (n_blocks, 34)
-            # First 2 bytes of each block = scale (f16, little-endian)
-            scales = self._decode_f16_col(blocks, 0, 2)  # (n_blocks,) float32
-            # Remaining 32 bytes = quantised values (int8)
-            qs = blocks[:, 2:].contiguous().view(torch.int8).to(torch.float32)  # (n_blocks, 32)
-            weight = (qs * scales.unsqueeze(1)).reshape(self.out_features, self.in_features).to(dtype=target_dtype)
-            return F.linear(x, weight, self.bias)
+        y = _vllm_fused_mul_mat_gguf(x_2d, weight_2d, qtype_val)
+        out = y.reshape(*orig_shape[:-1], self.out_features)
 
-        if qtype == GGMLQuantizationType.Q4_0:
-            # ------------------------------------------------------------------
-            # Triton fused path: dequantise in registers, never materialise the
-            # fp16 weight matrix.  Requires CUDA + Triton and K divisible by 32.
-            # ------------------------------------------------------------------
-            if (
-                _TRITON_AVAILABLE
-                and self.weight.is_cuda
-                and self.in_features % 32 == 0
-            ):
-                out = _q4_0_triton_linear(
-                    self.weight, x, self.out_features, self.in_features
-                ).to(dtype=target_dtype)
-                if self.bias is not None:
-                    out = out + self.bias
-                return out
-
-            # PyTorch fallback (CPU or Triton unavailable).
-            blocks = self.weight.reshape(-1, 18)  # (n_blocks, 18)
-            scales = self._decode_f16_col(blocks, 0, 2)  # (n_blocks,) float32
-            qs_u8 = blocks[:, 2:]  # (n_blocks, 16) uint8
-            # Nibble order: low nibbles of bytes[0..15], then high nibbles
-            lo = qs_u8 & 0x0F         # low  nibbles, values 0–15
-            hi = (qs_u8 >> 4) & 0x0F  # high nibbles, values 0–15
-            qs = torch.cat([lo, hi], dim=1).to(torch.float32) - 8.0  # (n_blocks, 32), center at 0
-            weight = (qs * scales.unsqueeze(1)).reshape(self.out_features, self.in_features).to(dtype=target_dtype)
-            return F.linear(x, weight, self.bias)
-
-        if qtype == GGMLQuantizationType.Q4_1:
-            blocks = self.weight.reshape(-1, 20)  # (n_blocks, 20)
-            scales = self._decode_f16_col(blocks, 0, 2)  # (n_blocks,) float32
-            mins   = self._decode_f16_col(blocks, 2, 4)  # (n_blocks,) float32
-            qs_u8  = blocks[:, 4:]  # (n_blocks, 16) uint8
-            lo = qs_u8 & 0x0F
-            hi = (qs_u8 >> 4) & 0x0F
-            qs = torch.cat([lo, hi], dim=1).to(torch.float32)  # (n_blocks, 32), values 0–15 (no centering)
-            weight = (qs * scales.unsqueeze(1) + mins.unsqueeze(1)).reshape(self.out_features, self.in_features).to(dtype=target_dtype)
-            return F.linear(x, weight, self.bias)
-
-        # ------------------------------------------------------------------
-        # CPU fallback for K-quant and other complex GGUF types.
-        # The weight is copied to CPU for numpy-based dequantisation, then
-        # moved back to the compute device.
-        # ------------------------------------------------------------------
-        from gguf import dequantize
-
-        w_np = self.weight.cpu().numpy()
-        dq_np = dequantize(w_np, qtype)
-        weight = (
-            torch.from_numpy(dq_np)
-            .reshape(self.out_features, self.in_features)
-            .to(dtype=target_dtype, device=device)
-        )
-        return F.linear(x, weight, self.bias)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
 
     def extra_repr(self) -> str:
         qtype_name = "unknown"
