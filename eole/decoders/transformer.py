@@ -537,6 +537,9 @@ class TransformerDecoder(DecoderBase):
         # Apply image-token mask: image tokens may attend to other image tokens
         # at any cached position (including tokens from previous chunks).
         if image_locations is not None:
+            # current_step may be a 0-d tensor; convert to plain int so it can
+            # be used as a Python slice index (tensor slicing requires int/slice,
+            # not a 0-d tensor).
             step = int(current_step)
             is_q_img = image_locations[:, step : step + chunk_size]  # (B, chunk_size)
             is_k_img = image_locations[:, :cache_len]                # (B, cache_len)
