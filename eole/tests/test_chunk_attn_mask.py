@@ -183,27 +183,80 @@ class TestUpdateCausalMaskAsymmetric(unittest.TestCase):
         causal = _chunked_prefill_allowed_keys(q_pos, cache_len, sliding_window)
         return _update_causal_mask_allowed_keys(causal, q_is_img, k_image_locs, cache_len)
 
-    def test_image_query_gains_all_image_keys_in_full_cache(self):
-        """An image query token can attend to ALL image key tokens regardless of
-        whether they are in the current chunk or a previous chunk."""
+    def test_image_query_gains_image_keys_from_filled_positions(self):
+        """An image query token can attend to image key tokens in already-filled
+        positions (previous chunks and the current chunk), but NOT to positions
+        in future chunks that have not yet been written to the KV cache."""
         cache_len = 32
         chunk_size = 8
-        current_step = 8  # second chunk
+        current_step = 8  # second chunk; filled positions are 0..15
 
-        # Sprinkle image tokens throughout the full cache
-        k_image_locs = [i % 3 == 0 for i in range(cache_len)]  # positions 0, 3, 6, …
+        # Sprinkle image tokens throughout the full cache, including future positions
+        all_image_locs = [i % 3 == 0 for i in range(cache_len)]  # 0, 3, 6, …
+
+        # After the fix, k_image_locations is ANDed with filled_mask (k < current_step+S)
+        filled_end = current_step + chunk_size  # = 16
+        k_image_locs_filled = [all_image_locs[k] and k < filled_end for k in range(cache_len)]
 
         for offset in range(chunk_size):
             q_pos = current_step + offset
             # query is an image token
-            allowed = self._allowed_keys(q_pos, q_is_img=True, k_image_locs=k_image_locs, cache_len=cache_len)
-            # All image key positions should be accessible (cross-chunk)
-            for k in range(cache_len):
-                if k_image_locs[k]:
+            allowed = self._allowed_keys(q_pos, q_is_img=True, k_image_locs=k_image_locs_filled, cache_len=cache_len)
+            # Image keys in FILLED positions (0..15) should be accessible
+            for k in range(filled_end):
+                if k_image_locs_filled[k]:
                     self.assertIn(
                         k,
                         allowed,
-                        msg=f"q={q_pos} (image): image key {k} should be accessible",
+                        msg=f"q={q_pos} (image): filled image key {k} should be accessible",
+                    )
+            # Image keys in FUTURE positions (16..31) must NOT be accessible
+            for k in range(filled_end, cache_len):
+                if all_image_locs[k]:
+                    self.assertNotIn(
+                        k,
+                        allowed,
+                        msg=f"q={q_pos} (image): future image key {k} must NOT be accessible",
+                    )
+
+    def test_image_bonus_does_not_open_future_positions(self):
+        """The image-to-image bonus must not allow attending to key positions
+        that are beyond the last position filled by the current chunk.
+
+        Regression test for the bug where k_image_locations=image_locations[:, :cache_len]
+        was passed to _update_causal_mask, which OR-ed in image connections for
+        key positions in future chunks (positions >= current_step + chunk_size)
+        that have not yet been written to the KV cache.
+        """
+        cache_len = 32
+        chunk_size = 8
+
+        # Image tokens at every position to maximise exposure of the bug
+        all_image = [True] * cache_len
+
+        for chunk_idx in range(cache_len // chunk_size):
+            current_step = chunk_idx * chunk_size
+            filled_end = current_step + chunk_size
+
+            # Simulate the fixed k_image_locs: filled positions only
+            k_image_locs_fixed = [k < filled_end for k in range(cache_len)]
+
+            for offset in range(chunk_size):
+                q_pos = current_step + offset
+                allowed_fixed = self._allowed_keys(
+                    q_pos, q_is_img=True, k_image_locs=k_image_locs_fixed, cache_len=cache_len
+                )
+                # With k_image_locs covering only filled positions, future
+                # positions must never appear in the allowed set
+                for k in range(filled_end, cache_len):
+                    self.assertNotIn(
+                        k,
+                        allowed_fixed,
+                        msg=(
+                            f"chunk={chunk_idx}, q={q_pos}: "
+                            f"future key {k} should be blocked "
+                            f"(filled_end={filled_end})"
+                        ),
                     )
 
     def test_text_query_not_given_image_bonus(self):
