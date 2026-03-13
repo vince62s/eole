@@ -989,14 +989,22 @@ class TestUpperCaseTransform(unittest.TestCase):
     def test_apply_random_sampling(self):
         """With intermediate ratio, some examples are converted and some are not."""
         t = self._make_transform(ratio=0.5)
-        random.seed(42)
-        results = set()
-        ex_template = {"src": "Hello world.", "tgt": None}
-        for _ in range(100):
-            r = t.apply(copy.deepcopy(ex_template))
-            results.add(r["src"])
-        # Both uppercased and original forms should appear
-        self.assertGreater(len(results), 1)
+        rng = random.Random(42)
+        # Monkey-patch the module-level random.random used inside UpperCaseTransform.apply
+        import eole.transforms.uppercase as _umod
+
+        original_random = _umod.random.random
+        _umod.random.random = rng.random
+        try:
+            results = set()
+            ex_template = {"src": "Hello world.", "tgt": None}
+            for _ in range(100):
+                r = t.apply(copy.deepcopy(ex_template))
+                results.add(r["src"])
+            # Both uppercased and original forms should appear
+            self.assertGreater(len(results), 1)
+        finally:
+            _umod.random.random = original_random
 
 
 class TestFilterTooShortTransform(unittest.TestCase):
