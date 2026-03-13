@@ -257,7 +257,7 @@ class DynamicDatasetIter(torch.utils.data.IterableDataset):
             bucket_size = 16384
             bucket_size_init = -1
             bucket_size_increment = 0
-            skip_empty_level = "warning"
+            skip_empty_level = getattr(config, "skip_empty_level", "warning")
         try:
             image_patch_size = config.model.encoder.patch_size * config.model.spatial_merge_size
         except AttributeError:
