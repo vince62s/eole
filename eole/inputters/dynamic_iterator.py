@@ -30,6 +30,8 @@ def _resolve_numericalizer_model_type(model_config):
     """
     from eole.constants import ModelType
 
+    if model_config is None:
+        return None
     encoder = getattr(model_config, "encoder", None)
     encoder_type = getattr(encoder, "encoder_type", None)
     if encoder_type == "vision":
