@@ -477,8 +477,8 @@ class TransformerDecoder(DecoderBase):
             chunk_size (int): number of query tokens in this chunk.
             current_step (int or Tensor): absolute position of the first query
                 token.  A 0-d scalar tensor (``self.cache_seqlens[0]``) or a
-                plain Python ``int`` are both accepted; tensor arithmetic
-                handles both transparently.
+                plain Python ``int`` are both accepted; all arithmetic remains
+                on-device to avoid unnecessary host synchronisation.
             tgt_pad_mask (Tensor): target padding mask ``(B, 1, chunk_size)``,
                 True = padding token.
             image_locations (Tensor, optional): ``(B, S_full)`` bool tensor
@@ -537,11 +537,10 @@ class TransformerDecoder(DecoderBase):
         # Apply image-token mask: image tokens may attend to other image tokens
         # at any cached position (including tokens from previous chunks).
         if image_locations is not None:
-            # current_step may be a 0-d tensor; convert to plain int so it can
-            # be used as a Python slice index (tensor slicing requires int/slice,
-            # not a 0-d tensor).
-            step = int(current_step)
-            is_q_img = image_locations[:, step : step + chunk_size]  # (B, chunk_size)
+            # Use advanced (gather-style) indexing so that current_step can
+            # remain a 0-d CUDA tensor without forcing a device-to-host sync.
+            idx = current_step + torch.arange(chunk_size, device=device)
+            is_q_img = image_locations[:, idx]  # (B, chunk_size)
             is_k_img = image_locations[:, :cache_len]                # (B, cache_len)
             img_block = is_q_img.unsqueeze(2) & is_k_img.unsqueeze(1)  # (B, chunk_size, cache_len)
             mask = mask | img_block
