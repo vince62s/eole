@@ -158,7 +158,6 @@ class MultiHeadedAttention(torch.nn.Module):
             self.alibi = AlibiPositionalBias(self.heads)
 
         self.maybe_ckpt = checkpoint if "mha" in getattr(running_config, "use_ckpting", []) else lambda f, x: f(x)
-        self.causal = True
         if getattr(running_config, "self_attn_backend", "") == "flash":
             from eole.ops import _FLASH_ATTN_AVAILABLE, flash_attn_kvcache
 
@@ -493,13 +492,11 @@ class SelfMHA(MultiHeadedAttention):
                 )
             else:
                 # Fast path with flash_attn_with_kvcache
-                # Use causal masking for multi-token (prefill/chunked)
-                # forward passes; disable it for single-token decode where
-                # there is only one query token and it trivially attends to
-                # all KV positions regardless.  Compute a local variable so
-                # that self.causal is never mutated during the forward pass
-                # (mutation would break CUDA-graph replay and torch.compile).
-                causal = self.causal and query.size(1) > 1
+                # Use causal masking only for multi-token (prefill/chunked)
+                # forward passes; for single-token decode the sole query
+                # trivially attends to all KV positions so causal=False is
+                # equivalent and avoids unnecessary masking overhead.
+                causal = query.size(1) > 1
                 context = self.flash_attn_with_kvcache(
                     query,
                     self.kcache[:, :, :, :],
