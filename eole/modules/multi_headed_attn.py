@@ -491,12 +491,6 @@ class SelfMHA(MultiHeadedAttention):
                     cache_slice=cache_slice,
                 )
             else:
-                # Fast path with flash_attn_with_kvcache
-                # Use causal masking only for multi-token (prefill/chunked)
-                # forward passes; for single-token decode the sole query
-                # trivially attends to all KV positions so causal=False is
-                # equivalent and avoids unnecessary masking overhead.
-                causal = query.size(1) > 1
                 context = self.flash_attn_with_kvcache(
                     query,
                     self.kcache[:, :, :, :],
@@ -508,7 +502,7 @@ class SelfMHA(MultiHeadedAttention):
                     cache_seqlens=cache_seqlens,
                     cache_leftpad=self.cache_leftpad,
                     softmax_scale=self.scale,
-                    causal=causal,
+                    causal=query.size(1) > 1,
                     rotary_interleaved=self.rotary_interleave,
                     window_size=self.window_size,
                 )
