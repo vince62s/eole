@@ -493,6 +493,13 @@ class SelfMHA(MultiHeadedAttention):
                 )
             else:
                 # Fast path with flash_attn_with_kvcache
+                # Use causal masking for multi-token (prefill/chunked)
+                # forward passes; disable it for single-token decode where
+                # there is only one query token and it trivially attends to
+                # all KV positions regardless.  Compute a local variable so
+                # that self.causal is never mutated during the forward pass
+                # (mutation would break CUDA-graph replay and torch.compile).
+                causal = self.causal and query.size(1) > 1
                 context = self.flash_attn_with_kvcache(
                     query,
                     self.kcache[:, :, :, :],
@@ -504,16 +511,10 @@ class SelfMHA(MultiHeadedAttention):
                     cache_seqlens=cache_seqlens,
                     cache_leftpad=self.cache_leftpad,
                     softmax_scale=self.scale,
-                    causal=self.causal,
+                    causal=causal,
                     rotary_interleaved=self.rotary_interleave,
                     window_size=self.window_size,
                 )
-                # Only switch off causal masking when transitioning to
-                # single-token decode (S == 1).  During chunked prefill each
-                # chunk is a multi-token forward (S > 1), so causal must stay
-                # True to preserve correct within-chunk ordering.
-                if query.size(1) == 1:
-                    self.causal = False
                 context = blhd_to_bld(context)
                 if self.q_gating and hasattr(self, "_attn_gate"):
                     context = context * self._attn_gate
