@@ -17,6 +17,38 @@ This matches the decoding path:
 
 import unittest
 
+try:
+    import types
+
+    import torch
+
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+
+def _chunk_attn_mask_cpu(chunk_size, cache_len_tgt, current_step, batch=1, sliding_window=0):
+    """Call the real ``_chunk_attn_mask`` logic on CPU via a minimal mock.
+
+    Binds the actual ``TransformerDecoder._chunk_attn_mask`` implementation to a
+    lightweight ``types.SimpleNamespace`` object so the test exercises the real
+    code path without constructing a full ``TransformerDecoder`` (which would
+    require model weights, configs, etc.).
+
+    Only callable when ``HAS_TORCH`` is True.
+    """
+    from eole.decoders.transformer import TransformerDecoder  # noqa: E402
+
+    mock = types.SimpleNamespace(
+        cache_len_tgt=cache_len_tgt,
+        sliding_window=sliding_window,
+        LM_type="decoder",
+        # All positions valid — no left-padding in these unit tests
+        left_pad_attn_mask=torch.ones(batch, cache_len_tgt, dtype=torch.bool),
+    )
+    tgt_pad_mask = torch.zeros(batch, 1, chunk_size, dtype=torch.bool)
+    return TransformerDecoder._chunk_attn_mask(mock, chunk_size, current_step, tgt_pad_mask)
+
 
 def _chunked_prefill_allowed_keys(q_pos, cache_len, sliding_window=0):
     """Pure-Python reference for _chunk_attn_mask — the FIXED absolute-position formula.
@@ -32,8 +64,10 @@ def _chunked_prefill_allowed_keys(q_pos, cache_len, sliding_window=0):
 
         keys = {k | k <= q_pos and k >= q_pos - sliding_window + 1}
 
-    Note: ``sliding_window + 1`` (not ``sliding_window``) is deliberate — it
-    gives a window of exactly ``sliding_window`` tokens (q_pos included).
+    Note: the lower bound is ``q_pos - sliding_window + 1`` (the ``+1``
+    shifts the lower bound *up* by one), giving a window of exactly
+    ``sliding_window`` tokens including ``q_pos`` itself.  The ``+1`` applies
+    to the lower-bound expression, not to ``sliding_window``.
     """
     keys = {k for k in range(cache_len) if k <= q_pos}
     if sliding_window > 0:
@@ -55,6 +89,7 @@ def _decoding_allowed_keys(current_step, cache_len, sliding_window):
 
 
 
+@unittest.skipUnless(HAS_TORCH, "torch not available")
 class TestFirstChunkMaskKeyDimension(unittest.TestCase):
     """Validate that _chunk_attn_mask with current_step=0 (first chunk) produces
     a causal mask whose key dimension equals cache_len_tgt, not chunk_size.
@@ -63,26 +98,22 @@ class TestFirstChunkMaskKeyDimension(unittest.TestCase):
     chunked prefill used _causal_attn_mask (key dim = chunk_size) instead of
     _chunk_attn_mask (key dim = cache_len_tgt), causing a shape mismatch with
     the pre-allocated KV cache.
+
+    These tests call the real _chunk_attn_mask on CPU (via a minimal mock) so
+    they will catch regressions in the actual implementation.
     """
-
-    def _expected_key_dim(self, chunk_size, cache_len_tgt, current_step):
-        """Simulate the key dimension produced by _chunk_attn_mask.
-
-        _chunk_attn_mask always uses cache_len_tgt as the key dimension,
-        regardless of current_step or chunk_size.
-        """
-        return cache_len_tgt
 
     def test_first_chunk_key_dim_equals_cache_len_tgt(self):
         """Key dimension for chunk 0 (current_step=0) is cache_len_tgt."""
         cache_len_tgt = 64
         chunk_size = 16
 
-        key_dim = self._expected_key_dim(chunk_size, cache_len_tgt, current_step=0)
-        self.assertEqual(key_dim, cache_len_tgt)
+        mask = _chunk_attn_mask_cpu(chunk_size, cache_len_tgt, current_step=0)
+        # Shape: (B, 1, chunk_size, cache_len_tgt)
+        self.assertEqual(mask.shape[-1], cache_len_tgt)
         # Crucially, NOT chunk_size (which is what _causal_attn_mask would use
         # when dynamic_shapes=True and MAX_T == seq_len == chunk_size)
-        self.assertNotEqual(key_dim, chunk_size)
+        self.assertNotEqual(mask.shape[-1], chunk_size)
 
     def test_all_chunks_key_dim_equals_cache_len_tgt(self):
         """Key dimension is cache_len_tgt for every chunk, not just non-first."""
@@ -92,11 +123,14 @@ class TestFirstChunkMaskKeyDimension(unittest.TestCase):
 
         for chunk_idx in range(num_chunks):
             current_step = chunk_idx * chunk_size
-            key_dim = self._expected_key_dim(chunk_size, cache_len_tgt, current_step)
+            mask = _chunk_attn_mask_cpu(chunk_size, cache_len_tgt, current_step)
             self.assertEqual(
-                key_dim,
+                mask.shape[-1],
                 cache_len_tgt,
-                msg=f"chunk {chunk_idx} (current_step={current_step}): key_dim={key_dim} != cache_len_tgt={cache_len_tgt}",
+                msg=(
+                    f"chunk {chunk_idx} (current_step={current_step}): "
+                    f"key_dim={mask.shape[-1]} != cache_len_tgt={cache_len_tgt}"
+                ),
             )
 
     def test_first_chunk_causal_mask_values(self):
@@ -111,17 +145,21 @@ class TestFirstChunkMaskKeyDimension(unittest.TestCase):
         chunk_size = 8
         current_step = 0
 
+        mask = _chunk_attn_mask_cpu(chunk_size, cache_len_tgt, current_step)
+        # mask shape: (1, 1, chunk_size, cache_len_tgt); squeeze batch and head dims
+        mask_2d = mask[0, 0]  # (chunk_size, cache_len_tgt)
+
         for q_offset in range(chunk_size):
             q_abs = current_step + q_offset
-            allowed = _chunked_prefill_allowed_keys(q_abs, cache_len_tgt)
-            # Should see exactly positions [0..q_abs]
-            self.assertEqual(allowed, set(range(q_abs + 1)))
-            # Positions beyond q_abs must be blocked
-            for k in range(q_abs + 1, cache_len_tgt):
-                self.assertNotIn(
-                    k,
-                    allowed,
-                    msg=f"q={q_abs}: key {k} should be blocked but is allowed",
+            # Positions 0..q_abs must be True; positions q_abs+1..cache_len_tgt-1 must be False
+            self.assertTrue(
+                mask_2d[q_offset, : q_abs + 1].all().item(),
+                msg=f"q={q_abs}: causal positions 0..{q_abs} should all be True",
+            )
+            if q_abs + 1 < cache_len_tgt:
+                self.assertFalse(
+                    mask_2d[q_offset, q_abs + 1 :].any().item(),
+                    msg=f"q={q_abs}: future positions {q_abs+1}..{cache_len_tgt-1} should all be False",
                 )
 
     def test_first_chunk_same_as_non_first_for_same_positions(self):
@@ -136,18 +174,17 @@ class TestFirstChunkMaskKeyDimension(unittest.TestCase):
         sliding_window = 6
 
         # Process positions 0..chunk_size-1 as "chunk 0" (current_step=0)
+        mask_chunk0 = _chunk_attn_mask_cpu(chunk_size, cache_len_tgt, 0, sliding_window=sliding_window)
+
+        # Process the same positions one-by-one as single-token "non-first" chunks
         for q_offset in range(chunk_size):
             q_abs = q_offset
-            keys_chunk0 = _chunked_prefill_allowed_keys(q_abs, cache_len_tgt, sliding_window)
-
-            # Simulate the same position being the only token in a chunk at
-            # current_step=q_abs (as if it were a "non-first" single-token chunk)
-            keys_nonfirst = _chunked_prefill_allowed_keys(q_abs, cache_len_tgt, sliding_window)
-
-            self.assertEqual(
-                keys_chunk0,
-                keys_nonfirst,
-                msg=f"q={q_abs}: chunk0={sorted(keys_chunk0)} != non-first={sorted(keys_nonfirst)}",
+            mask_single = _chunk_attn_mask_cpu(1, cache_len_tgt, q_abs, sliding_window=sliding_window)
+            # Single-token mask: (1, 1, 1, cache_len_tgt)
+            # Chunk-0 row for q_offset: mask_chunk0[0, 0, q_offset, :]
+            self.assertTrue(
+                (mask_chunk0[0, 0, q_offset] == mask_single[0, 0, 0]).all().item(),
+                msg=f"q={q_abs}: chunk0 row vs single-token mask differ",
             )
 
 
