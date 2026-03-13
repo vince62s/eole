@@ -661,13 +661,7 @@ class TransformerDecoder(DecoderBase):
                 image_locations = kwargs.pop("image_locations", None)
                 prefix_len = kwargs.pop("prefix_len", None)
 
-                # When cache_seqlens is None (training) current_step is
-                # already the Python int 0, so the outer guard short-circuits
-                # and no .item() conversion is needed.  When cache is present
-                # current_step is self.cache_seqlens[0], a 0-d tensor; the
-                # comparison to 0 and subsequent arithmetic in _chunk_attn_mask
-                # both work transparently with a tensor value.
-                if self.cache_seqlens is not None and current_step > 0:
+                if current_step > 0:
                     # Non-first chunk during chunked prefill: _causal_attn_mask
                     # always starts rows from position 0, which is incorrect
                     # once earlier chunks have already been written to the cache.
