@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # Standard Library Imports
-import argparse
 import configparser
 import ctypes
 import json
@@ -12,8 +11,6 @@ import shutil
 import struct
 from dataclasses import dataclass, field, fields
 from typing import Optional
-
-import yaml
 
 # Third-Party Library Imports
 import huggingface_hub
@@ -1198,24 +1195,16 @@ class LlamaHFConverter(BaseBin):
     @classmethod
     def add_args(cls, parser):
         parser.add_argument(
-            "--config",
-            "-config",
-            "-c",
-            default=None,
-            help="Path to a YAML config file. All arguments can be provided in the YAML file; "
-            "command-line arguments take precedence over the file.",
-        )
-        parser.add_argument(
             "--model_dir",
             type=str,
-            default=None,
+            required=True,
             help="""Path to the input (to convert) model directory""",
         )
 
         parser.add_argument(
             "--output",
             type=str,
-            default=None,
+            required=True,
             help="""Path to the output (converted) model directory""",
         )
         parser.add_argument(
@@ -1246,45 +1235,7 @@ class LlamaHFConverter(BaseBin):
         )
 
     @classmethod
-    def _merge_config_and_args(cls, args):
-        """Load YAML config (if provided) and merge with CLI args.
-
-        CLI arguments that differ from their defaults take precedence over
-        values in the YAML file.  The merged result is written back into the
-        *args* namespace so the rest of ``run()`` can use it unchanged.
-        """
-        if args.config is None:
-            return
-
-        with open(args.config) as f:
-            config_dict = yaml.safe_load(os.path.expandvars(f.read()))
-        if not config_dict:
-            return
-
-        # Build a fresh parser to discover each argument's default value.
-        _parser = argparse.ArgumentParser()
-        cls.add_args(_parser)
-        defaults = vars(_parser.parse_args([]))
-
-        # Determine which CLI args were explicitly set (i.e. differ from default).
-        cli_overrides = {
-            key: value for key, value in vars(args).items() if value != defaults.get(key)
-        }
-
-        # Start from the YAML values, then let explicit CLI overrides win.
-        for key, value in config_dict.items():
-            if key not in cli_overrides:
-                setattr(args, key, value)
-
-    @classmethod
     def run(cls, args):
-        cls._merge_config_and_args(args)
-
-        if args.model_dir is None:
-            raise ValueError("--model_dir is required (provide it on the command line or via --config)")
-        if args.output is None:
-            raise ValueError("--output is required (provide it on the command line or via --config)")
-
         hf = HuggingfaceFiles.fetch(args)
 
         # Build eole compatible configs from HF config
