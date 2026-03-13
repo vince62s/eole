@@ -508,8 +508,11 @@ class TransformerDecoder(DecoderBase):
         mask = k_pos <= q_pos  # (chunk_size, cache_len)
 
         if self.sliding_window > 0:
-            # Sliding window: key position must be within the window
-            mask = mask & (k_pos >= (q_pos - self.sliding_window))
+            # Sliding window: key position must be within the window.
+            # Use "+ 1" to match the single-step decoding path which computes
+            # start = current_step - sliding_window + 1, giving a window of
+            # exactly sliding_window tokens (not sliding_window + 1).
+            mask = mask & (k_pos >= (q_pos - self.sliding_window + 1))
 
         # Apply prefix-LM mask: prefix tokens attend to each other
         # bidirectionally regardless of the causal / sliding-window constraint.
