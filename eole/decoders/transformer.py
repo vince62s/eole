@@ -475,7 +475,10 @@ class TransformerDecoder(DecoderBase):
 
         Args:
             chunk_size (int): number of query tokens in this chunk.
-            current_step (int): absolute position of the first query token.
+            current_step (int or Tensor): absolute position of the first query
+                token.  A 0-d scalar tensor (``self.cache_seqlens[0]``) or a
+                plain Python ``int`` are both accepted; tensor arithmetic
+                handles both transparently.
             tgt_pad_mask (Tensor): target padding mask ``(B, 1, chunk_size)``,
                 True = padding token.
 
@@ -658,16 +661,18 @@ class TransformerDecoder(DecoderBase):
                 image_locations = kwargs.pop("image_locations", None)
                 prefix_len = kwargs.pop("prefix_len", None)
 
-                # Convert to Python int once to avoid two GPU→CPU syncs.
-                # When training (cache_seqlens is None) current_step is already
-                # the Python int 0, so no .item() call is needed.
-                current_step_int = int(current_step.item()) if self.cache_seqlens is not None else 0
-                if current_step_int > 0:
+                # When cache_seqlens is None (training) current_step is
+                # already the Python int 0, so the outer guard short-circuits
+                # and no .item() conversion is needed.  When cache is present
+                # current_step is self.cache_seqlens[0], a 0-d tensor; the
+                # comparison to 0 and subsequent arithmetic in _chunk_attn_mask
+                # both work transparently with a tensor value.
+                if self.cache_seqlens is not None and current_step > 0:
                     # Non-first chunk during chunked prefill: _causal_attn_mask
                     # always starts rows from position 0, which is incorrect
                     # once earlier chunks have already been written to the cache.
                     # Use an absolute-position mask instead.
-                    attn_mask = self._chunk_attn_mask(S, current_step_int, tgt_pad_mask)
+                    attn_mask = self._chunk_attn_mask(S, current_step, tgt_pad_mask)
                 else:
                     attn_mask = self._causal_attn_mask(tgt_pad_mask, prefix_len=prefix_len)
                     if image_locations is not None:
