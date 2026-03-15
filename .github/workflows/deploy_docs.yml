@@ -1,7 +1,15 @@
 name: Deploy Docs
 
-# Trigger manually via Github Actions UI for now, on release later
-on: ["workflow_dispatch", "workflow_call"]
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'README.md'
+      - 'CONTRIBUTING.md'
 
 jobs:
   build_and_deploy_docs:
