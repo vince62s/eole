@@ -456,3 +456,172 @@ def fused_experts_int4_impl(
     )
 
     return final_output
+
+
+# ---------------------------------------------------------------------------
+# Marlin MoE path using vLLM's moe_wna16_marlin_gemm kernel
+# ---------------------------------------------------------------------------
+
+
+def fused_experts_marlin_impl(
+    hidden_states: torch.Tensor,
+    w1_qweight: torch.Tensor,
+    w1_scales: torch.Tensor,
+    w1_qzeros: torch.Tensor,
+    w1_g_idx: torch.Tensor,
+    w1_perm: torch.Tensor,
+    w2_qweight: torch.Tensor,
+    w2_scales: torch.Tensor,
+    w2_qzeros: torch.Tensor,
+    w2_g_idx: torch.Tensor,
+    w2_perm: torch.Tensor,
+    workspace: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    scalar_type_id: int,
+    num_experts: int,
+    activation: str = "silu",
+) -> torch.Tensor:
+    """MoE forward pass using vLLM's ``moe_wna16_marlin_gemm`` fused kernel.
+
+    Requires ``torch.ops._moe_C.moe_wna16_marlin_gemm`` (installed with vLLM).
+
+    Parameters
+    ----------
+    hidden_states : (M, K)               – input tokens (fp16 / bf16)
+    w1_qweight    : (E, K//16, 4*I)      – Marlin-tiled gate+up weight (int32)
+    w1_scales     : (E, K//gs, 2*I)      – permuted gate+up scales
+    w1_qzeros     : (E, 0)               – empty for symmetric quant
+    w1_g_idx      : (E, 0)               – empty (no act-ordering)
+    w1_perm       : (E, 0)               – empty
+    w2_qweight    : (E, I//16, 2*K)      – Marlin-tiled down weight (int32)
+    w2_scales     : (E, I//gs, K)        – permuted down scales
+    w2_qzeros     : (E, 0)               – empty
+    w2_g_idx      : (E, 0)               – empty
+    w2_perm       : (E, 0)               – empty
+    workspace     : (sms * 4,) int32     – Marlin workspace
+    topk_weights  : (M, topk)  float32   – routing weights (sum to 1 per token)
+    topk_ids      : (M, topk)  int32/int64 – selected expert indices
+    scalar_type_id : int                 – Marlin scalar type (e.g. uint4b8.id)
+    num_experts   : int                  – total number of experts
+    activation    : "silu" | "gelu" | "relu"
+
+    Returns
+    -------
+    (M, K) output tensor
+    """
+    from eole.modules.moe_quant_utils import _moe_align_block_size
+
+    M, K = hidden_states.shape
+    topk = topk_ids.shape[1]
+    device = hidden_states.device
+
+    # Derive intermediate size I from W2 shape: w2_qweight (E, I//16, 2*K)
+    # I//16 = w2_qweight.size(1)  →  I = w2_qweight.size(1) * 16
+    I = w2_qweight.size(1) * 16  # noqa: E741
+
+    # Ensure routing weights are float32 as required by the Marlin kernel
+    topk_weights_f32 = topk_weights.float()
+
+    # ── Pick moe_block_size based on heuristic from vLLM ──────────────────
+    # Smaller block sizes work better when tokens per expert is low.
+    moe_block_size = 8
+    for bs in [8, 16, 32, 48, 64]:
+        if M * topk / max(num_experts, 1) / bs < 0.9:
+            break
+        moe_block_size = bs
+
+    # ── Build sorted routing structures ───────────────────────────────────
+    sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size(
+        topk_ids.to(torch.int64).view(M, topk),
+        moe_block_size,
+        num_experts,
+    )
+
+    # ── W1: gate+up projection → (M*topk, 2*I) ────────────────────────────
+    # Output shape: (size_m * top_k, size_n) = (M * topk, 2*I)
+    intermediate_w1 = torch.ops._moe_C.moe_wna16_marlin_gemm(
+        hidden_states,
+        None,  # allocate new output
+        w1_qweight,
+        None,  # no bias
+        w1_scales,
+        None,  # no activation scales (fp16 input)
+        None,  # no global scale
+        w1_qzeros if w1_qzeros.numel() > 0 else None,
+        w1_g_idx if w1_g_idx.numel() > 0 else None,
+        w1_perm if w1_perm.numel() > 0 else None,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights_f32,
+        moe_block_size,  # moe_block_size
+        topk,  # top_k
+        False,  # mul_topk_weights – apply weights during W2 instead
+        scalar_type_id,
+        M,  # size_m
+        2 * I,  # size_n  (gate + up combined)
+        K,  # size_k
+        True,  # is_k_full
+        False,  # use_atomic_add
+        True,  # use_fp32_reduce
+        False,  # is_zp_float
+    )
+    # intermediate_w1 shape: (M * topk, 2 * I) – gate and up interleaved
+
+    # ── Gated activation: split gate / up and apply activation ────────────
+    # gate = intermediate_w1[:, :I],  up = intermediate_w1[:, I:]
+    gate = intermediate_w1[:, :I]
+    up = intermediate_w1[:, I:]
+
+    import torch.nn.functional as F  # local import to avoid circular issues
+
+    act_str = activation.lower()
+    if act_str == "silu":
+        intermediate_w2 = F.silu(gate) * up
+    elif act_str == "gelu":
+        intermediate_w2 = F.gelu(gate, approximate="tanh") * up
+    else:  # relu
+        intermediate_w2 = F.relu(gate) * up
+
+    # intermediate_w2 shape: (M * topk, I)
+
+    # ── W2: down projection with routing-weight accumulation ──────────────
+    # Output shape: (size_m * top_k, size_n) = (M * topk * 1, K) = (M*topk, K)
+    output_w2 = torch.ops._moe_C.moe_wna16_marlin_gemm(
+        intermediate_w2,
+        None,  # allocate new output
+        w2_qweight,
+        None,  # no bias
+        w2_scales,
+        None,
+        None,
+        w2_qzeros if w2_qzeros.numel() > 0 else None,
+        w2_g_idx if w2_g_idx.numel() > 0 else None,
+        w2_perm if w2_perm.numel() > 0 else None,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights_f32,
+        moe_block_size,  # moe_block_size
+        1,  # top_k = 1 (each intermediate slot is an independent token)
+        True,  # mul_topk_weights – multiply routing weight into W2 output
+        scalar_type_id,
+        M * topk,  # size_m (M * topk intermediate tokens)
+        K,  # size_n
+        I,  # size_k
+        True,  # is_k_full
+        False,  # use_atomic_add
+        True,  # use_fp32_reduce
+        False,  # is_zp_float
+    )
+    # output_w2 shape: (M * topk, K) in flat token-expert pair order
+
+    # ── Reduce over topk: weighted sum → (M, K) ───────────────────────────
+    # output_w2[m * topk + k] already carries routing_weight[m, k] * W2_result
+    # Reshape to (M, topk, K) and sum over the topk dimension.
+    final_output = output_w2.view(M, topk, K).sum(dim=1)
+
+    return final_output

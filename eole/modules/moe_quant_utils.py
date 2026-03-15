@@ -7,6 +7,7 @@ Supported backends
 ------------------
 * AutoGPTQ / AutoRound  – QuantLinear   (K-packed int4, kpacked=True)
 * AutoAWQ               – WQLinear_GEMM (N-packed int4, kpacked=False)
+* gptqmodel Marlin      – MarlinQuantLinear  (Marlin tiled layout)
 
 Tensor layout after stacking (E = num_experts, gs = group_size)
 ----------------------------------------------------------------
@@ -26,12 +27,138 @@ AWQ (kpacked=False):
   w2_scales   (E, I//gs, H)       fp16/bf16
   w2_qzeros   (E, I//gs, H//8)    int32
 
+Marlin (after gptqmodel post_init, for use with moe_wna16_marlin_gemm):
+  w1_qweight  (E, K//16, 4*I)     int32   – gate+up concatenated along N dim
+  w1_scales   (E, K//gs, 2*I)     fp16    – gate+up scales concatenated
+  w2_qweight  (E, I//16, 2*K)     int32
+  w2_scales   (E, I//gs, K)       fp16
+  (qzeros, g_idx, perm are empty tensors for symmetric quantization)
+
 where K = in_features (= H for W1, = I for W2)
-      I = per-stream intermediate size (W1 out_features = 2*I)
+      I = per-stream intermediate size (W1 out_features = 2*I for gated)
 """
 
 from __future__ import annotations
 import torch
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Named constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fallback SM count used when torch.cuda.get_device_properties() is unavailable.
+# 108 is the A100-SXM4-80GB value; a larger number only wastes a few KB of
+# workspace memory so erring on the high side is safe for any modern GPU.
+_DEFAULT_SM_COUNT_FALLBACK = 108
+
+# Marlin scalar type IDs as used by vLLM / gptqmodel_marlin_kernels.
+# These map to the ScalarType enum values inside the C++ extension.
+MARLIN_UINT4B8_TYPE_ID = 4   # uint4b8: 4-bit unsigned with bias 8 (symmetric int4)
+MARLIN_UINT8B128_TYPE_ID = 5  # uint8b128: 8-bit unsigned with bias 128 (symmetric int8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vLLM Marlin MoE availability
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _vllm_moe_marlin_available() -> bool:
+    """Return True when vLLM's _moe_C extension provides moe_wna16_marlin_gemm."""
+    try:
+        return hasattr(torch.ops, "_moe_C") and callable(
+            getattr(torch.ops._moe_C, "moe_wna16_marlin_gemm", None)
+        )
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Marlin workspace / block-size helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _marlin_make_workspace(device: torch.device, max_blocks_per_sm: int = 4) -> torch.Tensor:
+    """Allocate the integer workspace required by the Marlin GEMM kernel.
+
+    The workspace size matches gptqmodel's ``marlin_make_workspace_new`` but
+    uses a slightly larger default (4 blocks per SM instead of 1) for the
+    batched MoE kernel which may spawn more concurrent thread-blocks.
+    """
+    try:
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+    except Exception:
+        # Conservative fallback when device properties cannot be queried.
+        # 108 SMs is the A100-SXM4-80GB count; a larger value only wastes a
+        # few KB of workspace memory so erring on the high side is safe.
+        sms = _DEFAULT_SM_COUNT_FALLBACK
+    return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int32, device=device)
+
+
+def _moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-Python implementation of vLLM's moe_align_block_size.
+
+    Pads each expert's token set to a multiple of *block_size* and returns
+    three tensors that drive the Marlin MoE GEMM kernel:
+
+    sorted_token_ids : (max_padded,) int32
+        Flat token-expert pair indices (position in topk_ids.flatten()) for
+        real slots; value ``M * topk`` for padding slots.
+    expert_ids : (num_blocks,) int32
+        Expert index for every GEMM block (one block = *block_size* slots).
+    num_tokens_post_padded : (1,) int32
+        Total number of slots including padding (= len(sorted_token_ids)).
+
+    See vLLM ``moe_align_block_size`` for the full semantics.
+    """
+    M, topk = topk_ids.shape
+    flat_ids = topk_ids.reshape(-1).long()  # (M * topk,) – expert IDs
+    num_tokens = flat_ids.numel()  # M * topk (also used as padding sentinel)
+    device = flat_ids.device
+
+    # Tokens per expert (real)
+    counts = torch.bincount(flat_ids, minlength=num_experts)  # (E,)
+
+    # Padded counts rounded up to block_size
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size  # (E,)
+
+    total_padded = int(padded_counts.sum().item())
+    num_blocks = total_padded // block_size
+
+    # Cumulative start positions in the sorted (padded) array per expert
+    padded_starts = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
+    padded_starts[1:] = padded_counts.cumsum(0)
+
+    # Cumulative start positions of real tokens per expert (in sort_order)
+    real_starts = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
+    real_starts[1:] = counts.cumsum(0)
+
+    # Sort flat token-expert pair indices by expert ID (stable → deterministic)
+    sort_order = torch.argsort(flat_ids, stable=True)  # (M * topk,)
+
+    # Build sorted_token_ids: real flat indices followed by padding per expert
+    sorted_token_ids = torch.full((total_padded,), num_tokens, dtype=torch.int32, device=device)
+    for e in range(num_experts):
+        c = int(counts[e].item())
+        if c > 0:
+            out_start = int(padded_starts[e].item())
+            in_start = int(real_starts[e].item())
+            sorted_token_ids[out_start : out_start + c] = sort_order[in_start : in_start + c].to(
+                torch.int32
+            )
+
+    # Build expert_ids: one entry per GEMM block
+    expert_ids = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
+    for e in range(num_experts):
+        block_start = int(padded_starts[e].item()) // block_size
+        num_e_blocks = int(padded_counts[e].item()) // block_size
+        if num_e_blocks > 0:
+            expert_ids[block_start : block_start + num_e_blocks] = e
+
+    num_tokens_post_padded = torch.tensor([total_padded], dtype=torch.int32, device=device)
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -42,19 +169,24 @@ import torch
 def detect_expert_quant_type(experts) -> str:
     """
     Inspect the first expert gate_up_proj and return one of:
-      'gptq'  – AutoGPTQ / AutoRound  (K-packed int4)
-      'awq'   – AutoAWQ               (N-packed int4)
-      'fp16'  – plain nn.Linear / anything else (including Marlin)
+      'gptq'   – AutoGPTQ / AutoRound  (K-packed int4)
+      'awq'    – AutoAWQ               (N-packed int4)
+      'marlin' – gptqmodel MarlinQuantLinear when vLLM moe_wna16_marlin_gemm
+                 is available (uses fused Marlin MoE kernel)
+      'fp16'   – plain nn.Linear / anything else (including Marlin without vLLM)
 
     Note on gptqmodel Marlin layers
     --------------------------------
     gptqmodel's Marlin backend repacks the standard GPTQ qweight (shape
     ``(in_features//8, out_features)``) into its own tiled layout during
     ``post_init()``.  After repacking the shape no longer matches either
-    the GPTQ (K-packed) or AWQ (N-packed) conventions.  We detect this case
-    via two guards and fall through to 'fp16' so that vectorized_moe is used
-    instead, which calls each expert's own ``forward()`` (i.e. the fast
-    Marlin CUDA kernel) rather than our custom Triton kernel.
+    the GPTQ (K-packed) or AWQ (N-packed) conventions.
+
+    When vLLM's ``torch.ops._moe_C.moe_wna16_marlin_gemm`` is available we
+    return 'marlin' so that ``stack_marlin_moe_weights`` + the fused Marlin
+    MoE kernel path in moe.py are used.  Otherwise we fall through to 'fp16'
+    so that ``vectorized_moe`` calls each expert's own ``forward()`` (which
+    already uses the fast per-layer Marlin CUDA kernel).
     """
     if not experts:
         return "fp16"
@@ -65,8 +197,13 @@ def detect_expert_quant_type(experts) -> str:
 
     # gptqmodel Marlin layers live under the "gptqmodel" namespace.
     # Their qweight has been repacked into Marlin tiles and is incompatible
-    # with our int4 Triton kernel.  Let each expert's own forward() handle it.
+    # with our int4 Triton kernel.
+    # When vLLM's moe_wna16_marlin_gemm is available we use the fused Marlin
+    # MoE kernel (faster than calling each expert's own forward() separately).
+    # Otherwise fall back to per-expert vectorized_moe.
     if "gptqmodel" in module_path:
+        if _vllm_moe_marlin_available():
+            return "marlin"
         return "fp16"
 
     # AutoGPTQ / AutoRound: QuantLinear with qweight.
@@ -289,3 +426,113 @@ def _free_expert_weights_single(expert):
         if hasattr(proj, "weight") and proj.weight is not None:
             proj.weight = None
     torch.cuda.empty_cache()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Marlin MoE weight stacking
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def stack_marlin_moe_weights(experts, device: torch.device):
+    """Stack per-expert gptqmodel MarlinQuantLinear weights for moe_wna16_marlin_gemm.
+
+    After ``post_init()`` each ``MarlinQuantLinear`` stores weights in the
+    Marlin tile format (``gptq_marlin_repack`` applied).  For int4 symmetric
+    quantization the layout per expert is::
+
+        gate_up_proj.qweight  (K//16, 2*I)  int32   – Marlin-tiled K→I weight
+        up_proj.qweight       (K//16, 2*I)  int32   – Marlin-tiled K→I weight
+        down_proj.qweight     (I//16, 2*K)  int32   – Marlin-tiled I→K weight
+
+    The gate and up projections are concatenated along their last (N) dimension
+    before stacking, producing the combined W1 weight expected by
+    ``moe_wna16_marlin_gemm`` with ``size_n = 2*I``.  This concatenation is
+    valid because Marlin tiling is column-independent: repacking (K, I)
+    separately and concatenating along N gives the same result as repacking
+    the combined (K, 2I) weight matrix in one shot.
+
+    Returns
+    -------
+    w1_qweight  (E, K//16, 4*I)   int32   – combined gate+up Marlin weight
+    w1_scales   (E, K//gs, 2*I)   fp16    – combined gate+up scales
+    w1_qzeros   (E, 0)            int32   – empty (symmetric quantization)
+    w1_g_idx    (E, 0)            int32   – empty (no activation reordering)
+    w1_perm     (E, 0)            int32   – empty
+    w2_qweight  (E, I//16, 2*K)   int32
+    w2_scales   (E, I//gs, K)     fp16
+    w2_qzeros   (E, 0)            int32   – empty
+    w2_g_idx    (E, 0)            int32   – empty
+    w2_perm     (E, 0)            int32   – empty
+    workspace   (sms * 4,)        int32   – shared Marlin workspace
+    num_bits    int               – quantization bit-width (4 or 8)
+    scalar_type_id  int           – Marlin scalar type ID (e.g. uint4b8.id)
+    group_size  int               – quantization group size
+    """
+    w1_qw, w1_sc = [], []
+    w2_qw, w2_sc = [], []
+    num_bits = None
+    scalar_type_id = None
+    group_size = None
+
+    for e in experts:
+        gate_layer = e.gate_up_proj
+        up_layer = getattr(e, "up_proj", None)
+        down_layer = e.down_proj
+
+        if num_bits is None:
+            num_bits = getattr(gate_layer, "bits", 4)
+            group_size = getattr(gate_layer, "group_size", 128)
+            # Retrieve the Marlin scalar type ID (e.g. uint4b8.id)
+            weight_type = getattr(gate_layer, "weight_type", None)
+            if weight_type is not None:
+                scalar_type_id = int(weight_type.id)
+            else:
+                # Fallback: derive ID from bits assuming symmetric quantization.
+                scalar_type_id = MARLIN_UINT4B8_TYPE_ID if num_bits == 4 else MARLIN_UINT8B128_TYPE_ID
+
+        # ── W1: concatenate gate and up along the N (last) dimension ─────────
+        if up_layer is not None:
+            # Separate gate and up projections – concatenate Marlin qweights
+            # along the last dim (valid since Marlin tiling is column-independent)
+            qw1 = torch.cat([gate_layer.qweight, up_layer.qweight], dim=-1)
+            sc1 = torch.cat([gate_layer.scales, up_layer.scales], dim=-1)
+        else:
+            # gate_up_proj already contains the fused gate+up weight
+            qw1 = gate_layer.qweight
+            sc1 = gate_layer.scales
+
+        w1_qw.append(qw1.unsqueeze(0))
+        w1_sc.append(sc1.unsqueeze(0))
+
+        # ── W2: down projection ───────────────────────────────────────────────
+        w2_qw.append(down_layer.qweight.unsqueeze(0))
+        w2_sc.append(down_layer.scales.unsqueeze(0))
+
+        _free_expert_weights_single(e)
+
+    # Empty tensors for symmetric (no zero-points, no g_idx / perm)
+    empty = torch.empty(0, dtype=torch.int32, device=device)
+
+    w1_qweight = torch.cat(w1_qw, dim=0).to(device)
+    w1_scales = torch.cat(w1_sc, dim=0).to(device)
+    w2_qweight = torch.cat(w2_qw, dim=0).to(device)
+    w2_scales = torch.cat(w2_sc, dim=0).to(device)
+
+    workspace = _marlin_make_workspace(device)
+
+    return (
+        w1_qweight,
+        w1_scales,
+        empty,  # w1_qzeros
+        empty,  # w1_g_idx
+        empty,  # w1_perm
+        w2_qweight,
+        w2_scales,
+        empty,  # w2_qzeros
+        empty,  # w2_g_idx
+        empty,  # w2_perm
+        workspace,
+        num_bits,
+        scalar_type_id,
+        group_size,
+    )
