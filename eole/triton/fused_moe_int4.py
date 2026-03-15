@@ -458,7 +458,18 @@ _BLOCK_M_CANDIDATES = [16, 32, 64]
 
 
 def _select_block_m(M: int, topk: int, num_experts: int) -> int:
-    """Choose BLOCK_M so that average valid rows per block ≥ 0.9."""
+    """Choose BLOCK_M based on average tokens per expert.
+
+    Iterates from smallest to largest block size.  Returns the first candidate
+    where the average token count per expert is less than one full block (ratio
+    < 0.9).  For large batches where every candidate is well-filled the
+    largest block size is returned.
+
+    This mirrors the heuristic used by vLLM's fused_marlin_moe.py: use small
+    tiles for decode (few tokens per expert) to minimise padding waste, and
+    use large tiles for prefill (many tokens per expert) to maximise tensor-
+    core utilisation.
+    """
     avg_tokens_per_expert = M * topk / max(num_experts, 1)
     for bm in _BLOCK_M_CANDIDATES:
         if avg_tokens_per_expert / bm < 0.9:
@@ -647,6 +658,9 @@ def fused_experts_int4_impl(
     # Scatter-add into (M, H)
     final_output = torch.zeros((M, H), device=device, dtype=dtype)
     valid_mask = sorted_token_ids < M  # (total_padded,)
+    # clamp(max=M-1): scatter_add_ requires all indices to be in [0, M-1];
+    # padding rows have sorted_token_ids == M (out of range), so we clamp
+    # them to a valid index.  Their contribution is zeroed by valid_mask below.
     valid_token_ids = sorted_token_ids.clamp(max=M - 1).long()  # (total_padded,)
     idx = valid_token_ids[:, None].expand(-1, H)  # (total_padded, H)
     src = weighted_output * valid_mask[:, None]  # zero out padding rows
