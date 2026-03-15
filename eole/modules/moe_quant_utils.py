@@ -353,12 +353,17 @@ def stack_marlin_moe_weights(experts, device: torch.device):
         qw2, sc2, qz2, gi2, gs2, ws2 = _marlin_tensors(down)
 
         if quant_type is None:
-            quant_type    = getattr(gate_up, "weight_type", None)
-            in_features   = gate_up.in_features
-            # W1 output = 2*I (gate + up), so I = out_features // 2
-            intermediate_features = gate_up.out_features // 2
-            out_features  = down.out_features
-            is_k_full     = getattr(gate_up, "is_k_full", True)
+            quant_type        = getattr(gate_up, "weight_type", None)
+            in_features       = gate_up.in_features
+            # w1_out_features is the actual output of W1 (gate+up combined for
+            # gated MoE, or a single projection for non-gated MoE).
+            # intermediate_features is the actual K fed into W2 (= down.in_features),
+            # which equals gate_up.out_features // 2 for gated MoE and
+            # gate_up.out_features for non-gated MoE.
+            w1_out_features   = gate_up.out_features         # actual W1 output: 2*I (gated) or I (non-gated)
+            intermediate_features = down.in_features         # K for W2 = I always
+            out_features      = down.out_features
+            is_k_full         = getattr(gate_up, "is_k_full", True)
 
         w1_qw.append(qw1.to(device) if qw1 is not None else qw1)
         w1_sc.append(sc1.to(device) if sc1 is not None else sc1)
@@ -381,6 +386,7 @@ def stack_marlin_moe_weights(experts, device: torch.device):
         workspaces,
         quant_type,
         in_features,
+        w1_out_features,
         intermediate_features,
         out_features,
         is_k_full,

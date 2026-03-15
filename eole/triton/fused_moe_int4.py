@@ -582,7 +582,11 @@ except (ImportError, ModuleNotFoundError):
 
 
 def _act_fn(x: torch.Tensor, activation: str) -> torch.Tensor:
-    """Apply gated activation to a (batch, 2*I) tensor, returning (batch, I)."""
+    """Apply gated activation to a (batch, 2*I) tensor, returning (batch, I).
+
+    Used for gated MoE (SwiGLU / GeGLU / ReLU-gated): chunks x in half along
+    the last dimension and multiplies the activated gate by the up projection.
+    """
     gate, up = x.chunk(2, dim=-1)
     if activation == "silu":
         return torch.nn.functional.silu(gate) * up
@@ -590,6 +594,19 @@ def _act_fn(x: torch.Tensor, activation: str) -> torch.Tensor:
         return torch.nn.functional.gelu(gate) * up
     else:  # relu
         return torch.nn.functional.relu(gate) * up
+
+
+def _act_fn_ungated(x: torch.Tensor, activation: str) -> torch.Tensor:
+    """Apply element-wise activation without halving the dimension.
+
+    Used for non-gated MoE where W1 outputs I features directly.
+    """
+    if activation == "silu":
+        return torch.nn.functional.silu(x)
+    elif activation == "gelu":
+        return torch.nn.functional.gelu(x)
+    else:  # relu
+        return torch.nn.functional.relu(x)
 
 
 def fused_marlin_moe_impl(
@@ -609,6 +626,7 @@ def fused_marlin_moe_impl(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     in_features: int,
+    gate_up_out_features: int,
     intermediate_features: int,
     out_features: int,
     is_k_full: bool,
@@ -616,28 +634,30 @@ def fused_marlin_moe_impl(
 ) -> torch.Tensor:
     """MoE forward with Marlin-repacked int4 weights.
 
-    Uses ``gptq_marlin_gemm`` (from gptqmodel_marlin_kernels) per expert,
-    with tokens pre-sorted by expert to maximise batch size per call.
-    Falls back to plain fp16 matmul if the Marlin kernels are unavailable.
+    Uses ``moe_wna16_marlin_gemm`` (vllm._custom_ops) when vLLM is installed,
+    falling back to ``gptq_marlin_gemm`` (gptqmodel_marlin_kernels) per expert.
 
     Parameters
     ----------
-    hidden_states       : (M, H) fp16/bf16
-    w1_qweight          : list[E] of Marlin-repacked qweight tensors for W1
-    w1_scales           : list[E] of Marlin-permuted scale tensors for W1
-    w1_qzeros           : list[E] of (empty) zero-point tensors for W1
-    w1_g_idx            : list[E] of g_idx tensors (empty if no act_order)
-    w1_g_idx_sort       : list[E] of sort_indices tensors
+    hidden_states         : (M, H) fp16/bf16
+    w1_qweight            : list[E] of Marlin-repacked qweight tensors for W1
+    w1_scales             : list[E] of Marlin-permuted scale tensors for W1
+    w1_qzeros             : list[E] of (empty) zero-point tensors for W1
+    w1_g_idx              : list[E] of g_idx tensors (empty if no act_order)
+    w1_g_idx_sort         : list[E] of sort_indices tensors
     w2_qweight / scales / qzeros / g_idx / g_idx_sort : same for W2
-    workspaces          : list[E] of pre-allocated workspace tensors (or None)
-    quant_type          : ScalarType (e.g. scalar_types.uint4b8)
-    topk_weights        : (M, K) routing weights
-    topk_ids            : (M, K) expert assignments
-    in_features         : H (hidden size)
-    intermediate_features : I (per-expert intermediate, W1 out = 2*I)
-    out_features        : H (same as in_features for standard MoE)
-    is_k_full           : Marlin is_k_full flag
-    activation          : "silu" | "gelu" | "relu"
+    workspaces            : list[E] of pre-allocated workspace tensors (or None)
+    quant_type            : ScalarType (e.g. scalar_types.uint4b8)
+    topk_weights          : (M, K) routing weights
+    topk_ids              : (M, K) expert assignments
+    in_features           : H (hidden size, input to W1)
+    gate_up_out_features  : actual output size of W1
+                            = 2*I for gated MoE (gate+up combined)
+                            = I   for non-gated MoE
+    intermediate_features : I = down.in_features (W2 input size, after activation)
+    out_features          : H (hidden size, output of W2)
+    is_k_full             : Marlin is_k_full flag
+    activation            : "silu" | "gelu" | "relu"
     """
     if not _MARLIN_AVAILABLE:
         raise RuntimeError(
@@ -709,9 +729,14 @@ def fused_marlin_moe_impl(
 
         vllm_qt = _VllmScalarType.from_id(quant_type.id)
 
+        # Auto-detect gated MoE (gate+up combined) vs non-gated.
+        # Gated:     gate_up_out_features = 2 * intermediate_features
+        # Non-gated: gate_up_out_features = intermediate_features
+        is_gated = (gate_up_out_features == 2 * intermediate_features)
+
         # ── W1: gate+up projection ──────────────────────────────────────────
         gate_up_output = torch.empty(
-            (M * topk, 2 * intermediate_features), device=device, dtype=dtype
+            (M * topk, gate_up_out_features), device=device, dtype=dtype
         )
         gate_up_output = _vllm_ops.moe_wna16_marlin_gemm(
             hidden_states, gate_up_output,
@@ -723,16 +748,19 @@ def fused_marlin_moe_impl(
             mul_topk_weights=False,
             b_q_type=vllm_qt,
             size_m=M,
-            size_n=2 * intermediate_features,
+            size_n=gate_up_out_features,
             size_k=in_features,
             is_k_full=is_k_full,
             use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
-        )  # (M * topk, 2*I)
+        )  # (M * topk, gate_up_out_features)
 
-        # Gated activation → (M * topk, I)
-        act_out = _act_fn(gate_up_output, activation)
+        # Activation: gated (SwiGLU/GeGLU) halves the dimension; non-gated does not.
+        if is_gated:
+            act_out = _act_fn(gate_up_output, activation)        # (M*topk, I)
+        else:
+            act_out = _act_fn_ungated(gate_up_output, activation)  # (M*topk, I)
 
         # ── W2: down projection ─────────────────────────────────────────────
         down_output = torch.empty((M * topk, out_features), device=device, dtype=dtype)
@@ -757,6 +785,10 @@ def fused_marlin_moe_impl(
         return out.view(M, topk, out_features).sum(dim=1)
 
     # ── Fallback: per-expert loop using gptq_marlin_gemm ───────────────────
+    # Auto-detect gated MoE (gate+up combined, gate_up_out_features = 2*I)
+    # vs non-gated MoE (single projection, gate_up_out_features = I).
+    is_gated = (gate_up_out_features == 2 * intermediate_features)
+
     flat_ids   = topk_ids.flatten().long()
     sort_order = torch.argsort(flat_ids, stable=True)
     expert_counts = torch.bincount(flat_ids.int(), minlength=E)
@@ -792,12 +824,15 @@ def fused_marlin_moe_impl(
             w1_g_idx[e], w1_g_idx_sort[e],
             ws1,
             quant_type.id,
-            count, 2 * intermediate_features, in_features,
+            count, gate_up_out_features, in_features,
             is_k_full, False, True, False,
-        )  # (count, 2*I)
+        )  # (count, gate_up_out_features)
 
-        # Gated activation → (count, I)
-        act_out = _act_fn(gate_up, activation)
+        # Activation: gated (SwiGLU/GeGLU) halves the dimension; non-gated does not.
+        if is_gated:
+            act_out = _act_fn(gate_up, activation)
+        else:
+            act_out = _act_fn_ungated(gate_up, activation)
 
         # ── W2: down projection ─────────────────────────────────────────────
         ws2 = workspaces[e] if workspaces[e] is not None else _make_workspace(device)

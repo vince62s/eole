@@ -164,6 +164,7 @@ class MoE(nn.Module):
         self._marlin_workspaces = None
         self._marlin_quant_type = None
         self._marlin_in_features = None
+        self._marlin_w1_out_features = None
         self._marlin_intermediate_features = None
         self._marlin_out_features = None
         self._marlin_is_k_full = True
@@ -240,6 +241,7 @@ class MoE(nn.Module):
                 self._marlin_workspaces,
                 self._marlin_quant_type,
                 self._marlin_in_features,
+                self._marlin_w1_out_features,
                 self._marlin_intermediate_features,
                 self._marlin_out_features,
                 self._marlin_is_k_full,
@@ -337,6 +339,7 @@ class MoE(nn.Module):
                 topk_weights=expert_weights,
                 topk_ids=expert_indices,
                 in_features=self._marlin_in_features,
+                gate_up_out_features=self._marlin_w1_out_features,
                 intermediate_features=self._marlin_intermediate_features,
                 out_features=self._marlin_out_features,
                 is_k_full=self._marlin_is_k_full,

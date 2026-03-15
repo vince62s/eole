@@ -182,7 +182,7 @@ class TestStackMarlinMoeWeights(unittest.TestCase):
             w1_qw, w1_sc, w1_qz, w1_gi, w1_gs,
             w2_qw, w2_sc, w2_qz, w2_gi, w2_gs,
             workspaces, quant_type,
-            in_features, intermediate_features, out_features,
+            in_features, w1_out_features, intermediate_features, out_features,
             is_k_full,
         ) = result
         for lst in (w1_qw, w1_sc, w1_qz, w1_gi, w1_gs,
@@ -196,11 +196,12 @@ class TestStackMarlinMoeWeights(unittest.TestCase):
         (
             *_,
             quant_type,
-            in_features, intermediate_features, out_features,
+            in_features, w1_out_features, intermediate_features, out_features,
             is_k_full,
         ) = result
         self.assertEqual(in_features, H)
-        self.assertEqual(intermediate_features, I)   # W1 out = 2*I, so I = out//2
+        self.assertEqual(w1_out_features, 2 * I)      # gate+up combined
+        self.assertEqual(intermediate_features, I)    # = down.in_features
         self.assertEqual(out_features, H)
         self.assertTrue(is_k_full)
         self.assertIsNotNone(quant_type)
