@@ -8,7 +8,7 @@ from torch.distributed import all_reduce
 
 try:
     from eole.triton.fused_moe import fused_experts_impl
-    from eole.triton.fused_moe_int4 import fused_experts_int4_impl
+    from eole.triton.fused_moe_int4 import fused_experts_int4_impl, fused_marlin_moe_impl
 
     _triton_moe = True
 except ImportError:
@@ -18,6 +18,7 @@ from eole.modules.moe_quant_utils import (
     detect_expert_quant_type,
     stack_gptq_moe_weights,
     stack_awq_moe_weights,
+    stack_marlin_moe_weights,
 )
 
 
@@ -149,6 +150,24 @@ class MoE(nn.Module):
         self._group_size = None
         self._kpacked = None  # True = GPTQ, False = AWQ
 
+        # Marlin fast-path cache (gptqmodel Marlin backend)
+        self._marlin_w1_qweight = None
+        self._marlin_w1_scales = None
+        self._marlin_w1_qzeros = None
+        self._marlin_w1_g_idx = None
+        self._marlin_w1_g_idx_sort = None
+        self._marlin_w2_qweight = None
+        self._marlin_w2_scales = None
+        self._marlin_w2_qzeros = None
+        self._marlin_w2_g_idx = None
+        self._marlin_w2_g_idx_sort = None
+        self._marlin_workspaces = None
+        self._marlin_quant_type = None
+        self._marlin_in_features = None
+        self._marlin_intermediate_features = None
+        self._marlin_out_features = None
+        self._marlin_is_k_full = True
+
         self._quant_weights_initialized = False
 
     def _maybe_fuse_gates(self):
@@ -205,6 +224,26 @@ class MoE(nn.Module):
         if quant_type == "fp16":
             if type(self.experts[0].gate_up_proj) is torch.nn.Linear:
                 self._maybe_fused_moe_weights(device, dtype)
+
+        elif quant_type == "marlin":
+            (
+                self._marlin_w1_qweight,
+                self._marlin_w1_scales,
+                self._marlin_w1_qzeros,
+                self._marlin_w1_g_idx,
+                self._marlin_w1_g_idx_sort,
+                self._marlin_w2_qweight,
+                self._marlin_w2_scales,
+                self._marlin_w2_qzeros,
+                self._marlin_w2_g_idx,
+                self._marlin_w2_g_idx_sort,
+                self._marlin_workspaces,
+                self._marlin_quant_type,
+                self._marlin_in_features,
+                self._marlin_intermediate_features,
+                self._marlin_out_features,
+                self._marlin_is_k_full,
+            ) = stack_marlin_moe_weights(self.experts, device)
 
         elif quant_type == "gptq":
             (
@@ -276,8 +315,35 @@ class MoE(nn.Module):
                 topk_ids=expert_indices,
                 activation=self.activation_function,
             ).view(B, T, C)
+        elif not self.training and self._marlin_w1_qweight is not None:
+            # Path 2: Marlin int4 (gptqmodel Marlin backend)
+            # Uses gptq_marlin_gemm per expert with sorted tokens, matching
+            # the vLLM fused_marlin_moe approach as closely as possible with
+            # the kernels available in gptqmodel_marlin_kernels.
+            y = fused_marlin_moe_impl(
+                hidden_states=x_flat,
+                w1_qweight=self._marlin_w1_qweight,
+                w1_scales=self._marlin_w1_scales,
+                w1_qzeros=self._marlin_w1_qzeros,
+                w1_g_idx=self._marlin_w1_g_idx,
+                w1_g_idx_sort=self._marlin_w1_g_idx_sort,
+                w2_qweight=self._marlin_w2_qweight,
+                w2_scales=self._marlin_w2_scales,
+                w2_qzeros=self._marlin_w2_qzeros,
+                w2_g_idx=self._marlin_w2_g_idx,
+                w2_g_idx_sort=self._marlin_w2_g_idx_sort,
+                workspaces=self._marlin_workspaces,
+                quant_type=self._marlin_quant_type,
+                topk_weights=expert_weights,
+                topk_ids=expert_indices,
+                in_features=self._marlin_in_features,
+                intermediate_features=self._marlin_intermediate_features,
+                out_features=self._marlin_out_features,
+                is_k_full=self._marlin_is_k_full,
+                activation=self.activation_function or "silu",
+            ).view(B, T, C)
         elif not self.training and self._w1_qweight is not None:
-            # Path 2: int4 Triton (GPTQ / AutoRound / AWQ)
+            # Path 3: int4 Triton (GPTQ / AutoRound / AWQ)
             y = fused_experts_int4_impl(
                 hidden_states=x_flat,
                 w1_qweight=self._w1_qweight,
