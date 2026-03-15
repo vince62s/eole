@@ -1,3 +1,8 @@
+---
+sidebar_label: "How to use torch.compile?"
+sidebar_position: 1
+---
+
 # How to use torch.compile for fast inference?
 
 EOLE supports [torch.compile](https://pytorch.org/docs/stable/torch.compile.html) for significantly accelerated inference, reaching speeds comparable to vLLM on GPU.
