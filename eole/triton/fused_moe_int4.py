@@ -484,7 +484,10 @@ def fused_experts_marlin_impl(
 ) -> torch.Tensor:
     """MoE forward pass using vLLM's ``moe_wna16_marlin_gemm`` fused kernel.
 
-    Requires ``torch.ops._moe_C.moe_wna16_marlin_gemm`` (installed with vLLM).
+    Requires ``vllm._custom_ops.moe_wna16_marlin_gemm`` (installed with vLLM).
+    The vLLM wrapper is used instead of ``torch.ops._moe_C`` directly because
+    the wrapper accepts a ``ScalarType`` object for ``b_q_type`` and handles the
+    ``.id`` extraction, making it the stable public API for this kernel.
 
     Parameters
     ----------
@@ -511,6 +514,12 @@ def fused_experts_marlin_impl(
     (M, K) output tensor
     """
     from eole.modules.moe_quant_utils import _moe_align_block_size
+    import vllm._custom_ops as _vllm_ops
+    from vllm.scalar_type import ScalarType
+
+    # Convert the integer scalar type ID to the ScalarType object required by
+    # the vLLM wrapper (which then extracts .id before calling the C++ kernel).
+    b_q_type = ScalarType.from_id(scalar_type_id)
 
     M, K = hidden_states.shape
     topk = topk_ids.shape[1]
@@ -540,7 +549,7 @@ def fused_experts_marlin_impl(
 
     # ── W1: gate+up projection → (M*topk, 2*I) ────────────────────────────
     # Output shape: (size_m * top_k, size_n) = (M * topk, 2*I)
-    intermediate_w1 = torch.ops._moe_C.moe_wna16_marlin_gemm(
+    intermediate_w1 = _vllm_ops.moe_wna16_marlin_gemm(
         hidden_states,
         None,  # allocate new output
         w1_qweight,
@@ -556,17 +565,17 @@ def fused_experts_marlin_impl(
         expert_ids,
         num_tokens_post_padded,
         topk_weights_f32,
-        moe_block_size,  # moe_block_size
-        topk,  # top_k
-        False,  # mul_topk_weights – apply weights during W2 instead
-        scalar_type_id,
-        M,  # size_m
-        2 * I,  # size_n  (gate + up combined)
-        K,  # size_k
-        True,  # is_k_full
-        False,  # use_atomic_add
-        True,  # use_fp32_reduce
-        False,  # is_zp_float
+        moe_block_size=moe_block_size,
+        top_k=topk,
+        mul_topk_weights=False,  # apply weights during W2 instead
+        b_q_type=b_q_type,
+        size_m=M,
+        size_n=2 * I,  # gate + up combined
+        size_k=K,
+        is_k_full=True,
+        use_atomic_add=False,
+        use_fp32_reduce=True,
+        is_zp_float=False,
     )
     # intermediate_w1 shape: (M * topk, 2 * I) – gate and up interleaved
 
@@ -589,14 +598,14 @@ def fused_experts_marlin_impl(
 
     # ── W2: down projection with routing-weight accumulation ──────────────
     # Output shape: (size_m * top_k, size_n) = (M * topk * 1, K) = (M*topk, K)
-    output_w2 = torch.ops._moe_C.moe_wna16_marlin_gemm(
+    output_w2 = _vllm_ops.moe_wna16_marlin_gemm(
         intermediate_w2,
         None,  # allocate new output
         w2_qweight,
         None,  # no bias
         w2_scales,
-        None,
-        None,
+        None,  # no activation scales
+        None,  # no global scale
         w2_qzeros if w2_qzeros.numel() > 0 else None,
         w2_g_idx if w2_g_idx.numel() > 0 else None,
         w2_perm if w2_perm.numel() > 0 else None,
@@ -605,17 +614,17 @@ def fused_experts_marlin_impl(
         expert_ids,
         num_tokens_post_padded,
         topk_weights_f32,
-        moe_block_size,  # moe_block_size
-        1,  # top_k = 1 (each intermediate slot is an independent token)
-        True,  # mul_topk_weights – multiply routing weight into W2 output
-        scalar_type_id,
-        M * topk,  # size_m (M * topk intermediate tokens)
-        K,  # size_n
-        I,  # size_k
-        True,  # is_k_full
-        False,  # use_atomic_add
-        True,  # use_fp32_reduce
-        False,  # is_zp_float
+        moe_block_size=moe_block_size,
+        top_k=1,  # each intermediate slot is an independent token
+        mul_topk_weights=True,  # multiply routing weight into W2 output
+        b_q_type=b_q_type,
+        size_m=M * topk,  # M * topk intermediate tokens
+        size_n=K,
+        size_k=I,
+        is_k_full=True,
+        use_atomic_add=False,
+        use_fp32_reduce=True,
+        is_zp_float=False,
     )
     # output_w2 shape: (M * topk, K) in flat token-expert pair order
 

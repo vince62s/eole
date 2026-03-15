@@ -52,6 +52,9 @@ _DEFAULT_SM_COUNT_FALLBACK = 108
 
 # Marlin scalar type IDs as used by vLLM / gptqmodel_marlin_kernels.
 # These map to the ScalarType enum values inside the C++ extension.
+# Must stay in sync with vLLM's scalar_types registry; verify with
+# ``vllm.scalar_type.scalar_types.uint4b8.id`` (== 4) and
+# ``vllm.scalar_type.scalar_types.uint8b128.id`` (== 5).
 MARLIN_UINT4B8_TYPE_ID = 4   # uint4b8: 4-bit unsigned with bias 8 (symmetric int4)
 MARLIN_UINT8B128_TYPE_ID = 5  # uint8b128: 8-bit unsigned with bias 128 (symmetric int8)
 
@@ -62,12 +65,20 @@ MARLIN_UINT8B128_TYPE_ID = 5  # uint8b128: 8-bit unsigned with bias 128 (symmetr
 
 
 def _vllm_moe_marlin_available() -> bool:
-    """Return True when vLLM's _moe_C extension provides moe_wna16_marlin_gemm."""
+    """Return True when vLLM's moe_wna16_marlin_gemm wrapper is importable.
+
+    We probe ``vllm._custom_ops`` rather than ``torch.ops._moe_C`` directly
+    because PyTorch op-namespace attributes (``OpOverloadPacket`` /
+    ``_OpNamespace``) are lazily registered objects that do **not** pass
+    Python's ``callable()`` test before the op has been invoked at least once.
+    Importing ``vllm._custom_ops`` both loads the shared-library extension
+    *and* exposes a proper Python function for ``moe_wna16_marlin_gemm``.
+    """
     try:
-        return hasattr(torch.ops, "_moe_C") and callable(
-            getattr(torch.ops._moe_C, "moe_wna16_marlin_gemm", None)
-        )
-    except Exception:
+        import vllm._custom_ops as _vllm_ops  # noqa: F401
+
+        return hasattr(_vllm_ops, "moe_wna16_marlin_gemm")
+    except (ImportError, ModuleNotFoundError):
         return False
 
 
@@ -182,10 +193,10 @@ def detect_expert_quant_type(experts) -> str:
     ``post_init()``.  After repacking the shape no longer matches either
     the GPTQ (K-packed) or AWQ (N-packed) conventions.
 
-    When vLLM's ``torch.ops._moe_C.moe_wna16_marlin_gemm`` is available we
-    return 'marlin' so that ``stack_marlin_moe_weights`` + the fused Marlin
-    MoE kernel path in moe.py are used.  Otherwise we fall through to 'fp16'
-    so that ``vectorized_moe`` calls each expert's own ``forward()`` (which
+    When ``vllm._custom_ops.moe_wna16_marlin_gemm`` is importable we return
+    'marlin' so that ``stack_marlin_moe_weights`` + the fused Marlin MoE
+    kernel path in moe.py are used.  Otherwise we fall through to 'fp16' so
+    that ``vectorized_moe`` calls each expert's own ``forward()`` (which
     already uses the fast per-layer Marlin CUDA kernel).
     """
     if not experts:
