@@ -95,11 +95,25 @@ def apply_rotary_pos_emb_xdrope(
 
 
 def apply_rotary_emb(query: Tensor, key: Tensor, cos_sin: Tensor, interleave: bool) -> Tuple[Tensor, Tensor]:
+    """Apply rotary position embeddings to *query* and *key*.
+
+    Supports two layouts for *cos_sin*:
+
+    * ``(S, Rd)``   – all sequences in the batch share the same S positions.
+      This is the standard case used by prefill and uniform-batch decoding.
+    * ``(B, S, Rd)`` – each sequence has its own S positions.  Used during
+      continuous-batching decode steps where different sequences are at
+      different decode positions.  The fast C++ kernel path is bypassed in
+      this case because it cannot handle per-sequence offsets.
+    """
 
     B, S, H, D = query.shape
     _, _, Hk, _ = key.shape  # GQA: key may have fewer heads than query
 
-    if _CPP_OPS_AVAILABLE and not torch.compiler.is_compiling():
+    # Detect per-sequence (continuous-batching) layout: cos_sin is (B, S, Rd).
+    per_sequence = cos_sin.dim() == 3
+
+    if _CPP_OPS_AVAILABLE and not torch.compiler.is_compiling() and not per_sequence:
         num_tok = B * S
         query_ = query.view(num_tok, -1, D)
         key_ = key.view(num_tok, -1, D)
@@ -109,7 +123,8 @@ def apply_rotary_emb(query: Tensor, key: Tensor, cos_sin: Tensor, interleave: bo
         return query_.view(B, S, -1, D), key_.view(B, S, -1, D)
 
     else:
-        Rd = cos_sin.size(1)
+        # cos_sin is either (S, Rd) [standard] or (B, S, Rd) [per-sequence].
+        Rd = cos_sin.size(-1)
         q_rot, q_pass = query[..., :Rd], query[..., Rd:]
         k_rot, k_pass = key[..., :Rd], key[..., Rd:]
 
@@ -124,9 +139,15 @@ def apply_rotary_emb(query: Tensor, key: Tensor, cos_sin: Tensor, interleave: bo
             q1, q2 = q_rot[..., :half], q_rot[..., half:]
             k1, k2 = k_rot[..., :half], k_rot[..., half:]
 
-        # Broadcast cos/sin to match
-        cos = cos_sin[None, :, None, : Rd // 2]
-        sin = cos_sin[None, :, None, Rd // 2 :]
+        # Build cos/sin tensors that broadcast over (B, S, H, Rd/2).
+        if per_sequence:
+            # cos_sin: (B, S, Rd) → cos/sin: (B, S, 1, Rd/2)  per-sequence
+            cos = cos_sin[:, :, None, : Rd // 2]
+            sin = cos_sin[:, :, None, Rd // 2 :]
+        else:
+            # cos_sin: (S, Rd) → cos/sin: (1, S, 1, Rd/2)  broadcast over B
+            cos = cos_sin[None, :, None, : Rd // 2]
+            sin = cos_sin[None, :, None, Rd // 2 :]
 
         # Apply rotation (same formula for both modes)
         qr = q1 * cos - q2 * sin

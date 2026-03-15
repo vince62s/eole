@@ -534,7 +534,23 @@ class TransformerDecoder(DecoderBase):
         pos_ids_1d = current_step + torch.arange(S, device=emb.device)
         position_embeddings = self.rope.cos_sin
 
-        if self.rope_local is not None:
+        # Continuous-batching: when decoding a single token (S=1) on the flash
+        # path with sequences at *different* positions we need per-sequence
+        # position embeddings so that each query/key gets the correct RoPE angle.
+        _heterogeneous_positions = (
+            self.flash
+            and S == 1
+            and self.cache_seqlens is not None
+            and self.cache_seqlens.numel() > 1
+            and not (self.cache_seqlens == current_step).all()
+        )
+
+        if _heterogeneous_positions and position_embeddings is not None:
+            # Build per-sequence pos embeddings: index rope table with each
+            # sequence's cache_seqlens value → shape (B, 1, Rd).
+            _per_seq_pe = position_embeddings[self.cache_seqlens.long()].unsqueeze(1)
+            pos_emb_list = [_per_seq_pe] * len(self.transformer_layers)
+        elif self.rope_local is not None:
             position_embeddings_local = self.rope_local.cos_sin
             pos_emb_list = [
                 (
@@ -704,6 +720,137 @@ class TransformerDecoder(DecoderBase):
             b, _ = self.left_pad_attn_mask.shape
             extend = torch.ones(b, addzeros, device=self.left_pad_attn_mask.device, dtype=torch.bool)
             self.left_pad_attn_mask = torch.cat([self.left_pad_attn_mask, extend], dim=1)
+
+    def _insert_batch_entries(self, new_kcaches, new_vcaches, new_cache_seqlens, new_cache_leftpads=None):
+        """Insert pre-filled sequences into the live KV cache (continuous batching).
+
+        This method is called between decode steps when new inference requests
+        have been prefilled and need to join the currently-active generation
+        batch.  It expands all per-layer KV cache tensors along the batch
+        dimension and updates ``cache_seqlens`` / ``left_pad_attn_mask`` so
+        that the next decode step includes the new sequences.
+
+        Only the **flash-attention** path is supported (``self.flash == True``).
+        For non-flash models a ``RuntimeError`` is raised because the
+        non-flash cache-update kernel uses a shared position index
+        (``cache_slice``) that cannot represent per-sequence offsets.
+
+        Args:
+            new_kcaches (list[Tensor]): One tensor per transformer layer,
+                each of shape ``(n_new, prefill_len, heads_kv, dim_per_head)``.
+                Contains the pre-computed key cache for the new sequences.
+            new_vcaches (list[Tensor]): Same structure as *new_kcaches* for
+                value cache.
+            new_cache_seqlens (Tensor): 1-D ``int32`` tensor of shape
+                ``(n_new,)`` giving the number of valid tokens already in the
+                cache for each new sequence (= their prompt length after
+                prefill).
+            new_cache_leftpads (Tensor, optional): 1-D ``int32`` tensor of
+                shape ``(n_new,)`` giving the left-padding offset for each new
+                sequence.  Defaults to zero (no left-padding).
+
+        Raises:
+            RuntimeError: If called when ``self.flash`` is ``False``.
+        """
+        if not self.flash:
+            raise RuntimeError(
+                "_insert_batch_entries requires the flash-attention backend "
+                "(self_attn_backend='flash').  Continuous batching is not "
+                "supported with the sdpa/standard attention backend."
+            )
+
+        device = self.cache_seqlens.device
+        n_new = new_cache_seqlens.shape[0]
+
+        # Ensure both new tensors are on the same device as the existing cache.
+        new_cache_seqlens = new_cache_seqlens.to(device)
+        if new_cache_leftpads is None:
+            new_cache_leftpads = torch.zeros(n_new, dtype=torch.int32, device=device)
+        else:
+            new_cache_leftpads = new_cache_leftpads.to(device)
+
+        # Determine required cache length after insertion.
+        new_max_len = int(new_cache_seqlens.max().item())
+        combined_len = max(self.cache_len_tgt, new_max_len)
+
+        # ------------------------------------------------------------------
+        # Update cache_seqlens
+        # ------------------------------------------------------------------
+        self.cache_seqlens = torch.cat([self.cache_seqlens, new_cache_seqlens])
+
+        # ------------------------------------------------------------------
+        # Update left_pad_attn_mask (only used on non-flash path, but keep in
+        # sync so _disable_cache / _init_cache calls see correct state).
+        # ------------------------------------------------------------------
+        new_left_pad_mask = (
+            torch.arange(combined_len, device=device).unsqueeze(0) >= new_cache_leftpads.unsqueeze(1)
+        )  # (n_new, combined_len)
+
+        if combined_len > self.cache_len_tgt:
+            # Extend the existing left_pad_attn_mask and position_indices.
+            extra = combined_len - self.cache_len_tgt
+            ext = torch.ones(
+                self.left_pad_attn_mask.shape[0],
+                extra,
+                device=device,
+                dtype=self.left_pad_attn_mask.dtype,
+            )
+            self.left_pad_attn_mask = torch.cat([self.left_pad_attn_mask, ext], dim=1)
+            self.position_indices = torch.arange(combined_len, device=device).unsqueeze(0)
+            self.cache_len_tgt = combined_len
+
+        self.left_pad_attn_mask = torch.cat([self.left_pad_attn_mask, new_left_pad_mask], dim=0)
+
+        # ------------------------------------------------------------------
+        # Per-layer KV cache expansion
+        # ------------------------------------------------------------------
+        for i, layer in enumerate(self.transformer_layers):
+            if layer.layer_type == "linear_attention":
+                # Linear-attention conv/recurrent state: append zero-initialised
+                # entries for the new sequences.
+                B_old = layer.linear_attn.conv_state.shape[0]
+                cs = torch.zeros(
+                    n_new, *layer.linear_attn.conv_state.shape[1:],
+                    device=device, dtype=layer.linear_attn.conv_state.dtype,
+                )
+                rs = torch.zeros(
+                    n_new, *layer.linear_attn.recurrent_state.shape[1:],
+                    device=device, dtype=layer.linear_attn.recurrent_state.dtype,
+                )
+                layer.linear_attn.conv_state = torch.cat([layer.linear_attn.conv_state, cs], dim=0)
+                layer.linear_attn.recurrent_state = torch.cat([layer.linear_attn.recurrent_state, rs], dim=0)
+                continue
+
+            existing_k = layer.self_attn.kcache  # (B, cache_len_tgt_old, H, D)
+            existing_v = layer.self_attn.vcache
+            B_old, old_len, H, D = existing_k.shape
+
+            new_k_src = new_kcaches[i]  # (n_new, prefill_len, H, D)
+            new_v_src = new_vcaches[i]
+            prefill_len = new_k_src.shape[1]
+
+            # Slots for new sequences, padded to combined_len.
+            new_k_slot = torch.zeros(n_new, combined_len, H, D, device=device, dtype=existing_k.dtype)
+            new_v_slot = torch.zeros(n_new, combined_len, H, D, device=device, dtype=existing_v.dtype)
+            fill = min(prefill_len, combined_len)
+            new_k_slot[:, :fill] = new_k_src[:, :fill]
+            new_v_slot[:, :fill] = new_v_src[:, :fill]
+
+            # Extend existing cache in the sequence-length dimension if needed.
+            if combined_len > old_len:
+                extra = combined_len - old_len
+                ext_k = torch.zeros(B_old, extra, H, D, device=device, dtype=existing_k.dtype)
+                ext_v = torch.zeros(B_old, extra, H, D, device=device, dtype=existing_v.dtype)
+                existing_k = torch.cat([existing_k, ext_k], dim=1)
+                existing_v = torch.cat([existing_v, ext_v], dim=1)
+
+            layer.self_attn.kcache = torch.cat([existing_k, new_k_slot], dim=0)
+            layer.self_attn.vcache = torch.cat([existing_v, new_v_slot], dim=0)
+
+            # Extend cache_leftpad.
+            if layer.self_attn.cache_leftpad is not None:
+                new_lp = new_cache_leftpads.to(device)
+                layer.self_attn.cache_leftpad = torch.cat([layer.self_attn.cache_leftpad, new_lp])
 
     def _disable_cache(self):
         self.left_pad_attn_mask = None

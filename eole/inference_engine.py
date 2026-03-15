@@ -1,5 +1,7 @@
 import os
 import json
+import queue
+import threading
 from typing import List, Tuple, Optional, Dict, Any
 from time import time
 import torch
@@ -181,6 +183,10 @@ class InferenceEngine:
         pass
 
 
+# Seconds to wait when joining the inference thread during terminate().
+_INFERENCE_THREAD_SHUTDOWN_TIMEOUT_SECS = 5
+
+
 class InferenceEnginePY(InferenceEngine):
     """Inference engine subclass to run inference with `predict.py`.
 
@@ -255,11 +261,98 @@ class InferenceEnginePY(InferenceEngine):
         self.transforms = make_transforms(self.config, self.transforms_cls, self.vocabs)
         self.transform_pipe = TransformPipe.build_from(self.transforms.values())
 
+        # ------------------------------------------------------------------
+        # Continuous-batching manager (for infer_list_stream)
+        #
+        # The ContinuousBatchingManager owns the model while it has active
+        # streaming requests.  It exposes _model_lock (a threading.Lock) that
+        # the non-streaming inference thread MUST acquire before touching the
+        # predictor, ensuring the two never clobber each other's KV cache.
+        # ------------------------------------------------------------------
+        from eole.predict.continuous_batching import ContinuousBatchingManager
+
+        self._cbm = ContinuousBatchingManager(
+            predictor=self.predictor,
+            transforms=self.transforms,
+            transform_pipe=self.transform_pipe,
+            config=self.config,
+            device_id=self.device_id,
+            logger=self.logger,
+        )
+
+        # ------------------------------------------------------------------
+        # Non-streaming inference thread
+        #
+        # All non-streaming calls (_predict, _score) are serialised through
+        # this thread.  Before executing a task the thread acquires
+        # _cbm._model_lock so it doesn't overlap with an active streaming
+        # batch.  The lock is released after every task, giving the CBM a
+        # chance to insert new streaming requests between decode steps.
+        # ------------------------------------------------------------------
+        self._infer_queue: queue.Queue = queue.Queue()
+        self._infer_thread = threading.Thread(
+            target=self._inference_loop,
+            daemon=True,
+            name="eole-inference",
+        )
+        self._infer_thread.start()
+
+    def _inference_loop(self):
+        """Main loop of the non-streaming inference thread.
+
+        Picks tasks off :attr:`_infer_queue` and runs them one at a time.
+        Before executing each task the thread acquires
+        ``self._cbm._model_lock`` so that it never overlaps with an active
+        continuous-batching decode step.  A ``None`` sentinel shuts the loop
+        down (sent by :meth:`terminate`).
+        """
+        while True:
+            task = self._infer_queue.get()
+            if task is None:
+                break
+            func, done_event, result_holder = task
+            # Wait until no streaming batch is active, then own the model.
+            with self._cbm._model_lock:
+                try:
+                    result = func()
+                    result_holder.append(result)
+                except Exception as exc:  # noqa: BLE001
+                    # Broad catch is intentional: we must capture *any* exception
+                    # so it can be re-raised in the calling thread by
+                    # _submit_to_infer_thread.
+                    result_holder.append(exc)
+                finally:
+                    done_event.set()
+
+    def _submit_to_infer_thread(self, func) -> Any:
+        """Submit *func* to the non-streaming inference thread and wait.
+
+        Args:
+            func: A zero-argument callable to run on the inference thread.
+
+        Returns:
+            The return value of *func*.
+
+        Raises:
+            Exception: Any exception raised by *func* is re-raised here.
+        """
+        done_event = threading.Event()
+        result_holder: List[Any] = []
+        self._infer_queue.put((func, done_event, result_holder))
+        done_event.wait()
+        if result_holder and isinstance(result_holder[0], Exception):
+            raise result_holder[0]
+        return result_holder[0] if result_holder else None
+
     @torch.inference_mode()
-    def _predict(
+    def _predict_impl(
         self, infer_iter, settings: Optional[Dict[str, Any]] = None, streamer=None
     ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
-        """Run prediction on inference iterator."""
+        """Run prediction on the inference iterator.
+
+        Must be called while holding ``_cbm._model_lock`` (guaranteed when
+        routed through :meth:`_submit_to_infer_thread`).
+        """
         settings = settings or {}
         self.predictor.update_settings(**settings)
 
@@ -273,8 +366,20 @@ class InferenceEnginePY(InferenceEngine):
 
         return scores, estims, preds
 
-    def _score(self, infer_iter, settings: Optional[Dict[str, Any]] = None):
-        """Run scoring on inference iterator."""
+    def _predict(
+        self, infer_iter, settings: Optional[Dict[str, Any]] = None, streamer=None
+    ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
+        """Submit a prediction task and wait for the result.
+
+        Routes through the non-streaming inference thread which coordinates
+        with the continuous-batching manager to prevent KV-cache conflicts.
+        """
+        return self._submit_to_infer_thread(
+            lambda: self._predict_impl(infer_iter, settings=settings, streamer=streamer)
+        )
+
+    def _score_impl(self, infer_iter, settings: Optional[Dict[str, Any]] = None):
+        """Run scoring on the inference iterator (must hold ``_cbm._model_lock``)."""
         settings = settings or {}
         self.predictor.update_settings(**settings)
 
@@ -283,16 +388,24 @@ class InferenceEnginePY(InferenceEngine):
 
         return self.predictor._score(infer_iter)
 
+    def _score(self, infer_iter, settings: Optional[Dict[str, Any]] = None):
+        """Submit a scoring task to the inference thread and wait for the result."""
+        return self._submit_to_infer_thread(lambda: self._score_impl(infer_iter, settings=settings))
+
     def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None):
         """Stream inference results for a single input string.
 
-        Runs inference in a background thread and yields decoded text
-        chunks as they are produced token by token. This is the
-        recommended API for interactive / chatbot-style use cases.
+        Submits the request to the :class:`~eole.predict.continuous_batching.
+        ContinuousBatchingManager`.  If another request is already generating,
+        this request is **inserted into the running batch** between decode
+        steps (true continuous batching), so both requests generate tokens
+        concurrently rather than sequentially.
+
+        The generator blocks until the first token is ready (prefill complete)
+        then yields tokens as they arrive.
 
         Only supported for single-process mode (``world_size <= 1``) and
-        decoder-only (LM) models. Encoder-decoder models are not supported
-        for streaming.
+        decoder-only (LM) models.
 
         Args:
             src (str): A single input string.
@@ -312,39 +425,14 @@ class InferenceEnginePY(InferenceEngine):
                 print(chunk, end="", flush=True)
             print()
         """
-        import threading
-        from eole.predict.streamer import GenerationStreamer
-
         if self.config.world_size > 1:
             raise NotImplementedError("infer_list_stream is not supported in parallel (world_size > 1) mode.")
 
         settings = settings or {}
-
-        streamer = GenerationStreamer(
-            vocabs=self.vocabs,
-            transform_pipe=self.transform_pipe,
-        )
-
-        exception_holder = []
-
-        def _run_inference():
-            try:
-                infer_iter = self._build_inference_iterator(src=[src])
-                self._predict(infer_iter, settings=settings, streamer=streamer)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"Streaming inference failed: {exc}")
-                exception_holder.append(exc)
-                streamer.end()
-
-        thread = threading.Thread(target=_run_inference, daemon=True)
-        thread.start()
-
+        # submit() blocks until the prefill is done (started event), then the
+        # returned streamer yields tokens as they are produced.
+        streamer = self._cbm.submit(src_text=src, settings=settings)
         yield from streamer
-
-        thread.join()
-
-        if exception_holder:
-            raise exception_holder[0]
 
     def _distribute_parallel_task(self, task_name: str, task_arg: Any, settings: Optional[Dict[str, Any]] = None):
         """Distribute a task to all parallel workers.
@@ -454,8 +542,17 @@ class InferenceEnginePY(InferenceEngine):
         return self._aggregate_inference_results(scores, estims, preds)
 
     def terminate(self):
-        """Terminate all worker processes."""
+        """Terminate the inference thread, continuous-batching manager, and all worker processes."""
         if self.config.world_size <= 1:
+            # Stop the continuous-batching manager first so no new decode
+            # steps can start after we drain the non-streaming queue.
+            if hasattr(self, "_cbm"):
+                self._cbm.stop()
+            # Signal the non-streaming inference thread to stop.
+            if hasattr(self, "_infer_queue"):
+                self._infer_queue.put(None)
+            if hasattr(self, "_infer_thread"):
+                self._infer_thread.join(timeout=_INFERENCE_THREAD_SHUTDOWN_TIMEOUT_SECS)
             return
 
         # Ask workers to stop
