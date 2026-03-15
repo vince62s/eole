@@ -549,22 +549,21 @@ def fused_experts_int4_impl(
 
 
 # ---------------------------------------------------------------------------
-# Marlin MoE fast path (uses gptq_marlin_gemm per expert)
+# Marlin MoE fast path
 # ---------------------------------------------------------------------------
-# vLLM achieves maximum speed with ``moe_wna16_marlin_gemm``, a specialised
-# CUDA kernel that belongs to vLLM (vllm._custom_ops) and routes tokens to
-# all experts in a single launch.  That kernel is NOT part of
-# gptqmodel_marlin_kernels and cannot be used here without a vLLM dependency.
+# Two kernels are available for Marlin int4 MoE:
 #
-# We approximate the approach by calling ``gptq_marlin_gemm`` (the
-# single-expert Marlin kernel provided by gptqmodel_marlin_kernels) for each
-# expert individually, with tokens already sorted by expert.  This still
-# significantly reduces Python overhead vs the per-expert expert.forward()
-# path because:
-#   • W1 + activation + W2 are fused within the same Python loop iteration
-#     (fewer kernel launches and intermediate tensor allocations)
-#   • All per-expert tensors are pre-collected, avoiding per-call attribute
-#     lookups inside expert.forward()
+# 1. ``moe_wna16_marlin_gemm`` (vllm._custom_ops) — the preferred fast path.
+#    Routes ALL experts in a single CUDA kernel launch, minimising overhead.
+#    Available when vLLM is installed.
+#
+# 2. ``gptq_marlin_gemm`` (gptqmodel_marlin_kernels) — the per-expert
+#    fallback.  Calls the single-expert Marlin kernel for each expert
+#    individually with tokens pre-sorted by expert, which still significantly
+#    reduces Python overhead vs the plain expert.forward() path.
+#
+# The vLLM fast path is automatically preferred when ``_MOE_MARLIN_AVAILABLE``
+# is True (i.e. when vLLM is installed and exposes ``moe_wna16_marlin_gemm``).
 # ---------------------------------------------------------------------------
 
 try:
@@ -572,6 +571,14 @@ try:
     _MARLIN_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     _MARLIN_AVAILABLE = False
+
+# vLLM batched MoE Marlin kernel (preferred fast path)
+try:
+    import vllm._custom_ops as _vllm_ops
+    from vllm.scalar_type import ScalarType as _VllmScalarType
+    _MOE_MARLIN_AVAILABLE = hasattr(_vllm_ops, "moe_wna16_marlin_gemm")
+except (ImportError, ModuleNotFoundError):
+    _MOE_MARLIN_AVAILABLE = False
 
 
 def _act_fn(x: torch.Tensor, activation: str) -> torch.Tensor:
@@ -644,7 +651,112 @@ def fused_marlin_moe_impl(
     device = hidden_states.device
     dtype  = hidden_states.dtype
 
-    # Sort tokens by expert (GPU-native — single .item() call in moe_align_block_size)
+    # ── vLLM fast path: single batched kernel for all experts ──────────────
+    if _MOE_MARLIN_AVAILABLE:
+        # Stack per-expert lists into (E, ...) tensors expected by the kernel.
+        w1_qw = torch.stack(w1_qweight)
+        w1_sc = torch.stack(
+            [s.to(dtype) if s.dtype != dtype else s for s in w1_scales]
+        )
+        w2_qw = torch.stack(w2_qweight)
+        w2_sc = torch.stack(
+            [s.to(dtype) if s.dtype != dtype else s for s in w2_scales]
+        )
+
+        def _stack_opt(lst):
+            """Stack a list of optional tensors; return None if all empty."""
+            if all(t is None or t.numel() == 0 for t in lst):
+                return None
+            return torch.stack(list(lst))
+
+        w1_qz = _stack_opt(w1_qzeros)
+        w2_qz = _stack_opt(w2_qzeros)
+        w1_gi = _stack_opt(w1_g_idx)
+        w2_gi = _stack_opt(w2_g_idx)
+        w1_gs = _stack_opt(w1_g_idx_sort)
+        w2_gs = _stack_opt(w2_g_idx_sort)
+
+        # Workspace sized to cover the MoE kernel (all experts, all SMs).
+        sm_count   = torch.cuda.get_device_properties(device).multi_processor_count
+        workspace  = torch.zeros(sm_count * 8, dtype=torch.int32, device=device)
+
+        # Select block_size_m based on average tokens per expert.
+        block_size_m = 16
+        for candidate in [8, 16, 32, 48, 64]:
+            if M * topk / E / candidate < 0.9:
+                block_size_m = candidate
+                break
+
+        # Allocate outputs for moe_align_block_size (vLLM CUDA kernel).
+        max_num_tokens_padded = topk_ids.numel() + E * (block_size_m - 1)
+        sorted_ids = torch.empty(
+            (max_num_tokens_padded,), dtype=torch.int32, device=device
+        )
+        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
+        expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=torch.int32, device=device
+        )
+        num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
+        _vllm_ops.moe_align_block_size(
+            topk_ids.to(torch.int32),
+            E,
+            block_size_m,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            None,  # expert_map
+        )
+
+        vllm_qt = _VllmScalarType.from_id(quant_type.id)
+
+        # ── W1: gate+up projection ──────────────────────────────────────────
+        gate_up_output = torch.empty(
+            (M * topk, 2 * intermediate_features), device=device, dtype=dtype
+        )
+        gate_up_output = _vllm_ops.moe_wna16_marlin_gemm(
+            hidden_states, gate_up_output,
+            w1_qw, None, w1_sc,
+            None, None, w1_qz, w1_gi, w1_gs,
+            workspace, sorted_ids, expert_ids, num_tokens_post_pad, topk_weights,
+            moe_block_size=block_size_m,
+            top_k=topk,
+            mul_topk_weights=False,
+            b_q_type=vllm_qt,
+            size_m=M,
+            size_n=2 * intermediate_features,
+            size_k=in_features,
+            is_k_full=is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )  # (M * topk, 2*I)
+
+        # Gated activation → (M * topk, I)
+        act_out = _act_fn(gate_up_output, activation)
+
+        # ── W2: down projection ─────────────────────────────────────────────
+        down_output = torch.empty((M * topk, out_features), device=device, dtype=dtype)
+        out = _vllm_ops.moe_wna16_marlin_gemm(
+            act_out, down_output,
+            w2_qw, None, w2_sc,
+            None, None, w2_qz, w2_gi, w2_gs,
+            workspace, sorted_ids, expert_ids, num_tokens_post_pad, topk_weights,
+            moe_block_size=block_size_m,
+            top_k=1,
+            mul_topk_weights=True,
+            b_q_type=vllm_qt,
+            size_m=M * topk,
+            size_n=out_features,
+            size_k=intermediate_features,
+            is_k_full=is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )  # (M * topk, H)
+
+        return out.view(M, topk, out_features).sum(dim=1)
+
+    # ── Fallback: per-expert loop using gptq_marlin_gemm ───────────────────
     flat_ids   = topk_ids.flatten().long()
     sort_order = torch.argsort(flat_ids, stable=True)
     expert_counts = torch.bincount(flat_ids.int(), minlength=E)
