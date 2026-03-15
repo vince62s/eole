@@ -552,29 +552,26 @@ def fused_experts_int4_impl(
 # Marlin MoE fast path (uses gptq_marlin_gemm per expert)
 # ---------------------------------------------------------------------------
 # vLLM achieves maximum speed with ``moe_wna16_marlin_gemm``, a specialised
-# CUDA kernel that routes tokens to all experts in a single launch.
-# gptqmodel_marlin_kernels does not expose that kernel, so we approximate
-# the approach by calling ``gptq_marlin_gemm`` (the single-expert Marlin
-# kernel) for each expert individually, with tokens already sorted by expert.
-# This still significantly reduces Python overhead vs the per-expert
-# expert.forward() path because:
+# CUDA kernel that belongs to vLLM (vllm._custom_ops) and routes tokens to
+# all experts in a single launch.  That kernel is NOT part of
+# gptqmodel_marlin_kernels and cannot be used here without a vLLM dependency.
+#
+# We approximate the approach by calling ``gptq_marlin_gemm`` (the
+# single-expert Marlin kernel provided by gptqmodel_marlin_kernels) for each
+# expert individually, with tokens already sorted by expert.  This still
+# significantly reduces Python overhead vs the per-expert expert.forward()
+# path because:
 #   • W1 + activation + W2 are fused within the same Python loop iteration
 #     (fewer kernel launches and intermediate tensor allocations)
-#   • All per-expert tensors are pre-stacked, avoiding per-call dictionary
-#     lookups and attribute accesses inside expert.forward()
-#
-# If moe_wna16_marlin_gemm ever becomes available in gptqmodel_marlin_kernels
-# it will automatically be preferred via the _MOE_MARLIN_AVAILABLE check.
+#   • All per-expert tensors are pre-collected, avoiding per-call attribute
+#     lookups inside expert.forward()
 # ---------------------------------------------------------------------------
 
 try:
     import gptqmodel_marlin_kernels as _marlin_kernels
     _MARLIN_AVAILABLE = True
-    # Check for the batched MoE kernel (vLLM-style)
-    _MOE_MARLIN_AVAILABLE = hasattr(_marlin_kernels, "moe_wna16_marlin_gemm")
 except (ImportError, ModuleNotFoundError):
     _MARLIN_AVAILABLE = False
-    _MOE_MARLIN_AVAILABLE = False
 
 
 def _act_fn(x: torch.Tensor, activation: str) -> torch.Tensor:
@@ -672,11 +669,6 @@ def fused_marlin_moe_impl(
         # Marlin requires scales to have the same dtype as input.
         sc1 = w1_scales[e] if w1_scales[e].dtype == dtype else w1_scales[e].to(dtype)
         sc2 = w2_scales[e] if w2_scales[e].dtype == dtype else w2_scales[e].to(dtype)
-
-        if _MOE_MARLIN_AVAILABLE:
-            # Batched kernel: handles W1 and W2 in one call (vLLM style)
-            # (placeholder — moe_wna16_marlin_gemm not yet in gptqmodel)
-            pass
 
         # ── W1: gate+up projection ──────────────────────────────────────────
         ws1 = workspaces[e] if workspaces[e] is not None else _make_workspace(device)
