@@ -8,7 +8,7 @@ from torch.distributed import all_reduce
 
 try:
     from eole.triton.fused_moe import fused_experts_impl
-    from eole.triton.fused_moe_int4 import fused_experts_int4_impl
+    from eole.triton.fused_moe_int4 import fused_experts_int4_impl, fused_experts_marlin_impl
 
     _triton_moe = True
 except ImportError:
@@ -18,6 +18,7 @@ from eole.modules.moe_quant_utils import (
     detect_expert_quant_type,
     stack_gptq_moe_weights,
     stack_awq_moe_weights,
+    stack_marlin_moe_weights,
 )
 
 
@@ -151,6 +152,21 @@ class MoE(nn.Module):
 
         self._quant_weights_initialized = False
 
+        # Marlin MoE cache (gptqmodel Marlin + vLLM moe_wna16_marlin_gemm)
+        self._w1_marlin = None       # (E, K//16, 4*I) int32
+        self._w1_marlin_scales = None  # (E, K//gs, 2*I) fp16
+        self._w1_marlin_qzeros = None  # (E, 0) – empty for sym quant
+        self._w1_marlin_g_idx = None   # (E, 0) – empty
+        self._w1_marlin_perm = None    # (E, 0) – empty
+        self._w2_marlin = None       # (E, I//16, 2*K) int32
+        self._w2_marlin_scales = None  # (E, I//gs, K) fp16
+        self._w2_marlin_qzeros = None  # (E, 0) – empty
+        self._w2_marlin_g_idx = None   # (E, 0) – empty
+        self._w2_marlin_perm = None    # (E, 0) – empty
+        self._marlin_workspace = None  # shared Marlin workspace tensor
+        self._marlin_scalar_type_id = None  # int, e.g. uint4b8.id
+        self._marlin_num_experts = None     # int
+
     def _maybe_fuse_gates(self):
         """Fuse all expert gates, executed only once."""
         if self._gates_fused:
@@ -230,6 +246,27 @@ class MoE(nn.Module):
             ) = stack_awq_moe_weights(self.experts, device)
             self._kpacked = False
 
+        elif quant_type == "marlin":
+            # gptqmodel Marlin experts with vLLM's moe_wna16_marlin_gemm kernel.
+            # Weights are already in Marlin tile format after post_init().
+            (
+                self._w1_marlin,
+                self._w1_marlin_scales,
+                self._w1_marlin_qzeros,
+                self._w1_marlin_g_idx,
+                self._w1_marlin_perm,
+                self._w2_marlin,
+                self._w2_marlin_scales,
+                self._w2_marlin_qzeros,
+                self._w2_marlin_g_idx,
+                self._w2_marlin_perm,
+                self._marlin_workspace,
+                _num_bits,
+                self._marlin_scalar_type_id,
+                _group_size,
+            ) = stack_marlin_moe_weights(self.experts, device)
+            self._marlin_num_experts = len(self.experts)
+
         # Unknown quant type → silently fall through to vectorized_moe.
 
     def forward(self, x):
@@ -276,8 +313,29 @@ class MoE(nn.Module):
                 topk_ids=expert_indices,
                 activation=self.activation_function,
             ).view(B, T, C)
+        elif not self.training and self._w1_marlin is not None:
+            # Path 2: vLLM Marlin MoE (gptqmodel Marlin experts)
+            y = fused_experts_marlin_impl(
+                hidden_states=x_flat,
+                w1_qweight=self._w1_marlin,
+                w1_scales=self._w1_marlin_scales,
+                w1_qzeros=self._w1_marlin_qzeros,
+                w1_g_idx=self._w1_marlin_g_idx,
+                w1_perm=self._w1_marlin_perm,
+                w2_qweight=self._w2_marlin,
+                w2_scales=self._w2_marlin_scales,
+                w2_qzeros=self._w2_marlin_qzeros,
+                w2_g_idx=self._w2_marlin_g_idx,
+                w2_perm=self._w2_marlin_perm,
+                workspace=self._marlin_workspace,
+                topk_weights=expert_weights,
+                topk_ids=expert_indices,
+                scalar_type_id=self._marlin_scalar_type_id,
+                num_experts=self._marlin_num_experts,
+                activation=self.activation_function or "silu",
+            ).view(B, T, C)
         elif not self.training and self._w1_qweight is not None:
-            # Path 2: int4 Triton (GPTQ / AutoRound / AWQ)
+            # Path 3: int4 Triton (GPTQ / AutoRound / AWQ)
             y = fused_experts_int4_impl(
                 hidden_states=x_flat,
                 w1_qweight=self._w1_qweight,
