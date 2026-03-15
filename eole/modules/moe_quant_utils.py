@@ -104,17 +104,25 @@ def _marlin_make_workspace(device: torch.device, max_blocks_per_sm: int = 4) -> 
     return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int32, device=device)
 
 
+def _exclusive_cumsum(t: torch.Tensor) -> torch.Tensor:
+    """Return the exclusive prefix sum of 1-D tensor *t*.
+
+    ``result[i] = sum(t[0..i-1])``,  ``result[0] = 0``.
+    """
+    return torch.cat([torch.zeros(1, dtype=t.dtype, device=t.device), t.cumsum(0)])[:-1]
+
+
 def _moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-Python implementation of vLLM's moe_align_block_size.
+    """Build the routing structures required by the Marlin MoE GEMM kernel.
 
     Pads each expert's token set to a multiple of *block_size* and returns
     three tensors that drive the Marlin MoE GEMM kernel:
 
-    sorted_token_ids : (max_padded,) int32
+    sorted_token_ids : (total_padded,) int32
         Flat token-expert pair indices (position in topk_ids.flatten()) for
         real slots; value ``M * topk`` for padding slots.
     expert_ids : (num_blocks,) int32
@@ -122,51 +130,80 @@ def _moe_align_block_size(
     num_tokens_post_padded : (1,) int32
         Total number of slots including padding (= len(sorted_token_ids)).
 
-    See vLLM ``moe_align_block_size`` for the full semantics.
+    Two implementations are tried in order:
+
+    1. **Fast path** – ``vllm._custom_ops.moe_align_block_size``: the vLLM C++
+       kernel runs entirely on the GPU with zero Python-loop or CPU–GPU sync
+       overhead.  Output buffers are pre-allocated to the worst-case size
+       ``M * topk + num_experts * (block_size - 1)`` so no ``.item()`` call
+       is needed before launching the kernel.
+
+    2. **Vectorised fallback** – a pure-PyTorch implementation with **no
+       Python loops** and a single ``.item()`` call (vs. the previous
+       O(num_experts) CPU–GPU synchronisation round-trips).
     """
     M, topk = topk_ids.shape
+    num_tokens = M * topk  # also serves as the padding-sentinel value
+    device = topk_ids.device
+
+    # ── Fast path: vLLM C++ kernel ────────────────────────────────────────
+    # Pre-allocate worst-case buffers – no CPU–GPU sync needed for sizing.
+    try:
+        import vllm._custom_ops as _vllm_ops  # noqa: F401
+
+        if hasattr(_vllm_ops, "moe_align_block_size"):
+            max_padded = num_tokens + num_experts * (block_size - 1)
+            max_blocks = (max_padded + block_size - 1) // block_size
+            sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
+            sorted_token_ids.fill_(num_tokens)  # pre-fill padding sentinel
+            expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+            num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=device)
+            _vllm_ops.moe_align_block_size(
+                topk_ids.to(torch.int32),
+                num_experts,
+                block_size,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+            )
+            return sorted_token_ids, expert_ids, num_tokens_post_padded
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    # ── Vectorised fallback (no Python loops) ────────────────────────────
     flat_ids = topk_ids.reshape(-1).long()  # (M * topk,) – expert IDs
-    num_tokens = flat_ids.numel()  # M * topk (also used as padding sentinel)
-    device = flat_ids.device
 
-    # Tokens per expert (real)
-    counts = torch.bincount(flat_ids, minlength=num_experts)  # (E,)
-
-    # Padded counts rounded up to block_size
+    # Tokens per expert and their padded equivalents
+    counts = torch.bincount(flat_ids, minlength=num_experts)  # (E,) int64
     padded_counts = ((counts + block_size - 1) // block_size) * block_size  # (E,)
 
+    # Single .item() to determine output sizes (unavoidable for pre-allocation)
     total_padded = int(padded_counts.sum().item())
     num_blocks = total_padded // block_size
 
-    # Cumulative start positions in the sorted (padded) array per expert
-    padded_starts = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
-    padded_starts[1:] = padded_counts.cumsum(0)
+    # Exclusive prefix sums: padded_starts[e] = sum(padded_counts[0..e-1])
+    padded_starts = _exclusive_cumsum(padded_counts)  # (E,)
+    # Exclusive prefix sums: real_starts[e] = sum(counts[0..e-1])
+    real_starts = _exclusive_cumsum(counts)  # (E,)
 
-    # Cumulative start positions of real tokens per expert (in sort_order)
-    real_starts = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
-    real_starts[1:] = counts.cumsum(0)
-
-    # Sort flat token-expert pair indices by expert ID (stable → deterministic)
+    # Sort token-expert pair flat indices by expert ID (stable → deterministic)
     sort_order = torch.argsort(flat_ids, stable=True)  # (M * topk,)
+    sorted_flat_ids = flat_ids[sort_order]  # expert ID for each sorted slot
 
-    # Build sorted_token_ids: real flat indices followed by padding per expert
+    # Compute each sorted element's destination position in the padded output
+    arange = torch.arange(num_tokens, dtype=torch.long, device=device)
+    output_pos = padded_starts[sorted_flat_ids] + (arange - real_starts[sorted_flat_ids])
+
+    # Place real token indices; padding slots keep the sentinel value
     sorted_token_ids = torch.full((total_padded,), num_tokens, dtype=torch.int32, device=device)
-    for e in range(num_experts):
-        c = int(counts[e].item())
-        if c > 0:
-            out_start = int(padded_starts[e].item())
-            in_start = int(real_starts[e].item())
-            sorted_token_ids[out_start : out_start + c] = sort_order[in_start : in_start + c].to(
-                torch.int32
-            )
+    sorted_token_ids[output_pos] = sort_order.to(torch.int32)
 
-    # Build expert_ids: one entry per GEMM block
-    expert_ids = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
-    for e in range(num_experts):
-        block_start = int(padded_starts[e].item()) // block_size
-        num_e_blocks = int(padded_counts[e].item()) // block_size
-        if num_e_blocks > 0:
-            expert_ids[block_start : block_start + num_e_blocks] = e
+    # expert_ids: one entry per GEMM block (repeat_interleave is fully vectorised)
+    block_counts = padded_counts // block_size  # (E,) int64
+    expert_ids = torch.repeat_interleave(
+        torch.arange(num_experts, dtype=torch.int32, device=device),
+        block_counts,
+    )  # (num_blocks,) int32
 
     num_tokens_post_padded = torch.tensor([total_padded], dtype=torch.int32, device=device)
     return sorted_token_ids, expert_ids, num_tokens_post_padded
@@ -499,6 +536,8 @@ def stack_marlin_moe_weights(experts, device: torch.device):
                 scalar_type_id = int(weight_type.id)
             else:
                 # Fallback: derive ID from bits assuming symmetric quantization.
+                # Only 4-bit (uint4b8) and 8-bit (uint8b128) are supported;
+                # other bit-widths are not used by the Marlin kernel path.
                 scalar_type_id = MARLIN_UINT4B8_TYPE_ID if num_bits == 4 else MARLIN_UINT8B128_TYPE_ID
 
         # ── W1: concatenate gate and up along the N (last) dimension ─────────
