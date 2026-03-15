@@ -59,6 +59,7 @@ def _fake_gptq_layer(in_f, out_f, group_size=128):
     layer.scales = torch.ones(in_f // group_size, out_f, dtype=torch.float16)
     layer.qzeros = torch.zeros(in_f // group_size, out_f // 8, dtype=torch.int32)
     layer.group_size = group_size
+    # detect_expert_quant_type checks both 'infeatures' and 'in_features' attribute names
     layer.infeatures = in_f
     layer.in_features = in_f
     return layer

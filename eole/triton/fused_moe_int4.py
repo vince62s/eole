@@ -660,7 +660,6 @@ def fused_marlin_moe_impl(
     for e in range(E):
         count = int(expert_counts[e].item())
         if count == 0:
-            valid_off += 0
             continue
 
         # Indices into sort_order for this expert's tokens
