@@ -31,22 +31,52 @@ import triton.language as tl
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional vLLM integration – probed once at import time
 # ─────────────────────────────────────────────────────────────────────────────
-# Cache the vLLM Marlin MoE GEMM wrapper and ScalarType constructor here so
-# that fused_experts_marlin_impl() can call them without per-call imports or
-# attribute lookups.
+# Cache the vLLM Marlin MoE GEMM wrapper, ScalarType constructor, and fused
+# activation kernels so that fused_experts_marlin_impl() can call them without
+# per-call imports or attribute lookups.
 try:
     import vllm._custom_ops as _vllm_ops
     from vllm.scalar_type import ScalarType as _VllmScalarType
 
     _vllm_moe_wna16_marlin_gemm = _vllm_ops.moe_wna16_marlin_gemm
     _HAS_VLLM_MARLIN = True
+    # Fused gated-activation kernels: silu_and_mul(out, inp) / gelu_and_mul(out, inp)
+    # where inp shape is (M, 2*N) and out shape is (M, N).  They replace the
+    # two-kernel F.silu + element-wise multiply with a single CUDA kernel and
+    # require no intermediate allocation.
+    _ops_C = getattr(torch.ops, "_C", None)
+    _silu_and_mul_fn = getattr(_ops_C, "silu_and_mul", None)
+    _gelu_and_mul_fn = getattr(_ops_C, "gelu_and_mul", None)
 except (ImportError, ModuleNotFoundError, AttributeError):
     _vllm_ops = None  # type: ignore[assignment]
     _VllmScalarType = None  # type: ignore[assignment,misc]
     _vllm_moe_wna16_marlin_gemm = None  # type: ignore[assignment]
     _HAS_VLLM_MARLIN = False
+    _silu_and_mul_fn = None
+    _gelu_and_mul_fn = None
 
 from eole.modules.moe_quant_utils import _moe_align_block_size  # noqa: E402
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Buffer view helper (mirrors vLLM's _resize_cache)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _view_cache(flat: torch.Tensor, *shape: int) -> torch.Tensor:
+    """Return a view of *flat* with the given *shape*.
+
+    The total number of elements in *shape* must be ≤ flat.numel().  This is
+    the equivalent of vLLM's ``_resize_cache`` and lets two differently-shaped
+    views share the same underlying storage (e.g. the W1 GEMM output and the
+    W2 GEMM output both live in the same flat buffer since they are never live
+    at the same time).
+    """
+    n = 1
+    for s in shape:
+        n *= s
+    return flat[:n].view(*shape)
+
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +532,16 @@ def fused_experts_marlin_impl(
     b_q_type,  # vllm.scalar_type.ScalarType – pre-created once at setup time
     num_experts: int,
     activation: str = "silu",
+    # ── Pre-allocated intermediate buffers (grown lazily in moe.py) ─────────
+    # cache13: flat buffer used for both the W1 GEMM output (M*topk, 2*I) and
+    # the W2 GEMM output (M*topk, K) via non-overlapping views – exactly the
+    # ``intermediate_cache13`` strategy from vLLM's _fused_marlin_moe().
+    # cache2 : flat buffer for the activation output (M*topk, I).
+    # out    : pre-allocated (M, K) output tensor for the final topk sum.
+    # When any of these is None the function falls back to dynamic allocation.
+    cache13: "torch.Tensor | None" = None,
+    cache2: "torch.Tensor | None" = None,
+    out: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """MoE forward pass using vLLM's ``moe_wna16_marlin_gemm`` fused kernel.
 
@@ -529,17 +569,22 @@ def fused_experts_marlin_impl(
     b_q_type      : ScalarType           – Marlin scalar type (pre-built at setup)
     num_experts   : int                  – total number of experts
     activation    : "silu" | "gelu" | "relu"
+    cache13       : flat buffer ≥ M*topk*max(2*I, K) elements (optional)
+    cache2        : flat buffer ≥ M*topk*I elements (optional)
+    out           : pre-allocated (M, K) output tensor (optional)
 
     Returns
     -------
-    (M, K) output tensor
+    (M, K) output tensor (= *out* when provided)
     """
     M, K = hidden_states.shape
     topk = topk_ids.shape[1]
+    M_topk = M * topk
     device = hidden_states.device
+    dtype = hidden_states.dtype
 
     # Derive intermediate size I from W2 shape: w2_qweight (E, I//16, 2*K)
-    # I//16 = w2_qweight.size(1)  →  I = w2_qweight.size(1) * 16
+    # Matches vLLM's marlin_moe_intermediate_size: I = w2.size(1) * 16
     I = w2_qweight.size(1) * 16  # noqa: E741
 
     # Ensure routing weights are float32 as required by the Marlin kernel.
@@ -563,16 +608,32 @@ def fused_experts_marlin_impl(
         num_experts,
     )
 
-    # ── W1: gate+up projection → (M*topk, 2*I) ────────────────────────────
-    # Output shape: (size_m * top_k, size_n) = (M * topk, 2*I)
-    intermediate_w1 = _vllm_moe_wna16_marlin_gemm(
+    # ── Prepare intermediate buffers ─────────────────────────────────────
+    # cache13 is a flat buffer large enough to hold both:
+    #   cache_w1  (M_topk, 2*I)  – W1 GEMM output
+    #   cache_w2  (M_topk, K)    – W2 GEMM output (reuses same memory)
+    # The two views never overlap in time so sharing is safe.
+    # cache2 holds the activation output (M_topk, I).
+    need13 = M_topk * max(2 * I, K)
+    need2 = M_topk * I
+    if cache13 is None or cache13.numel() < need13:
+        cache13 = torch.empty(need13, device=device, dtype=dtype)
+    if cache2 is None or cache2.numel() < need2:
+        cache2 = torch.empty(need2, device=device, dtype=dtype)
+
+    cache_w1 = _view_cache(cache13, M_topk, 2 * I)   # W1 output view
+    cache_w2 = _view_cache(cache13, M_topk, K)        # W2 output view (same flat buffer)
+    cache_act = _view_cache(cache2, M_topk, I)        # activation output
+
+    # ── W1: gate+up projection → cache_w1 (M*topk, 2*I) ──────────────────
+    _vllm_moe_wna16_marlin_gemm(
         hidden_states,
-        None,  # allocate new output
+        cache_w1,  # write directly into pre-allocated buffer
         w1_qweight,
-        None,  # no bias
+        None,   # no bias
         w1_scales,
-        None,  # no activation scales (fp16 input)
-        None,  # no global scale
+        None,   # no activation scales (fp16 input)
+        None,   # no global scale
         w1_qzeros if w1_qzeros.numel() > 0 else None,
         w1_g_idx if w1_g_idx.numel() > 0 else None,
         w1_perm if w1_perm.numel() > 0 else None,
@@ -583,7 +644,7 @@ def fused_experts_marlin_impl(
         topk_weights_f32,
         moe_block_size=moe_block_size,
         top_k=topk,
-        mul_topk_weights=False,  # apply weights during W2 instead
+        mul_topk_weights=False,   # apply weights during W2 instead
         b_q_type=b_q_type,
         size_m=M,
         size_n=2 * I,  # gate + up combined
@@ -593,33 +654,40 @@ def fused_experts_marlin_impl(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
-    # intermediate_w1 shape: (M * topk, 2 * I) – gate and up interleaved
 
-    # ── Gated activation: split gate / up and apply activation ────────────
-    # gate = intermediate_w1[:, :I],  up = intermediate_w1[:, I:]
-    gate = intermediate_w1[:, :I]
-    up = intermediate_w1[:, I:]
-
+    # ── Gated activation: cache_w1 (M*topk, 2*I) → cache_act (M*topk, I) ─
+    # Prefer vLLM's fused silu_and_mul / gelu_and_mul which fuse the gate/up
+    # split, activation, and element-wise multiply into a single CUDA kernel,
+    # writing directly into the pre-allocated cache_act buffer.
     act_str = activation.lower()
-    if act_str == "silu":
-        intermediate_w2 = F.silu(gate) * up
-    elif act_str == "gelu":
-        intermediate_w2 = F.gelu(gate, approximate="tanh") * up
-    else:  # relu
-        intermediate_w2 = F.relu(gate) * up
+    if act_str == "silu" and _silu_and_mul_fn is not None:
+        _silu_and_mul_fn(cache_act, cache_w1)
+    elif act_str == "gelu" and _gelu_and_mul_fn is not None:
+        _gelu_and_mul_fn(cache_act, cache_w1)
+    else:
+        # Pure-PyTorch fallback (silu/gelu/relu without fused CUDA op).
+        # Use torch.mul(..., out=cache_act) to write the final result directly
+        # into the pre-allocated buffer, avoiding an extra intermediate tensor.
+        gate = cache_w1[:, :I]
+        up = cache_w1[:, I:]
+        if act_str == "silu":
+            torch.mul(F.silu(gate), up, out=cache_act)
+        elif act_str == "gelu":
+            torch.mul(F.gelu(gate, approximate="tanh"), up, out=cache_act)
+        else:  # relu
+            torch.mul(F.relu(gate), up, out=cache_act)
 
-    # intermediate_w2 shape: (M * topk, I)
-
-    # ── W2: down projection with routing-weight accumulation ──────────────
-    # Output shape: (size_m * top_k, size_n) = (M * topk * 1, K) = (M*topk, K)
-    output_w2 = _vllm_moe_wna16_marlin_gemm(
-        intermediate_w2,
-        None,  # allocate new output
+    # ── W2: down projection → cache_w2 (M*topk, K) ───────────────────────
+    # cache_w2 reuses the same flat buffer as cache_w1 since cache_w1 data
+    # is no longer needed after the activation step.
+    _vllm_moe_wna16_marlin_gemm(
+        cache_act,
+        cache_w2,  # write directly into pre-allocated buffer (reuses cache13)
         w2_qweight,
-        None,  # no bias
+        None,   # no bias
         w2_scales,
-        None,  # no activation scales
-        None,  # no global scale
+        None,   # no activation scales
+        None,   # no global scale
         w2_qzeros if w2_qzeros.numel() > 0 else None,
         w2_g_idx if w2_g_idx.numel() > 0 else None,
         w2_perm if w2_perm.numel() > 0 else None,
@@ -629,10 +697,10 @@ def fused_experts_marlin_impl(
         num_tokens_post_padded,
         topk_weights_f32,
         moe_block_size=moe_block_size,
-        top_k=1,  # each intermediate slot is an independent token
-        mul_topk_weights=True,  # multiply routing weight into W2 output
+        top_k=1,   # each intermediate slot is an independent token
+        mul_topk_weights=True,   # multiply routing weight into W2 output
         b_q_type=b_q_type,
-        size_m=M * topk,  # M * topk intermediate tokens
+        size_m=M_topk,
         size_n=K,
         size_k=I,
         is_k_full=True,
@@ -640,11 +708,12 @@ def fused_experts_marlin_impl(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
-    # output_w2 shape: (M * topk, K) in flat token-expert pair order
 
     # ── Reduce over topk: weighted sum → (M, K) ───────────────────────────
-    # output_w2[m * topk + k] already carries routing_weight[m, k] * W2_result
-    # Reshape to (M, topk, K) and sum over the topk dimension.
-    final_output = output_w2.view(M, topk, K).sum(dim=1)
+    # cache_w2[m * topk + k] already carries routing_weight[m, k] * W2_result.
+    # Sum over the topk dimension directly into the pre-allocated output buffer.
+    if out is None:
+        out = torch.empty((M, K), device=device, dtype=dtype)
+    torch.sum(cache_w2.view(M, topk, K), dim=1, out=out)
 
-    return final_output
+    return out

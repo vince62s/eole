@@ -167,6 +167,18 @@ class MoE(nn.Module):
         self._marlin_scalar_type_id = None  # int, e.g. uint4b8.id
         self._marlin_b_q_type = None        # vllm.scalar_type.ScalarType (created once)
         self._marlin_num_experts = None     # int
+        # Intermediate buffer caches – grown lazily to avoid per-call allocations.
+        # cache13 is a flat buffer shared (non-overlapping views) by the W1 GEMM
+        # output (M*topk, 2*I) and the W2 GEMM output (M*topk, K), exactly
+        # mirroring vLLM's ``intermediate_cache13`` strategy.
+        # cache2 holds the activation output (M*topk, I).
+        # out_buf is a 2D (BT, K_mar) buffer for the final reduced output.
+        self._marlin_I = None              # per-stream intermediate size
+        self._marlin_K = None              # model hidden size
+        self._marlin_cache13 = None        # flat buffer: cap ≥ M*topk*max(2*I, K)
+        self._marlin_cache2 = None         # flat buffer: cap ≥ M*topk*I
+        self._marlin_out_buf = None        # (BT, K_mar) output buffer
+        self._marlin_buf_M_topk = 0        # M*topk capacity of current caches
 
     def _maybe_fuse_gates(self):
         """Fuse all expert gates, executed only once."""
@@ -272,6 +284,12 @@ class MoE(nn.Module):
             from vllm.scalar_type import ScalarType as _ScalarType
 
             self._marlin_b_q_type = _ScalarType.from_id(self._marlin_scalar_type_id)
+            # Cache I and K from weight shapes for intermediate buffer management.
+            # w1_marlin: (E, K//16, 4*I) → K = shape[1]*16 (per-expert hidden size)
+            # w2_marlin: (E, I//16, 2*K) → I = shape[1]*16 (per-stream intermediate)
+            # These match the marlin_moe_intermediate_size() formula in vLLM.
+            self._marlin_K = self._w1_marlin.shape[1] * 16
+            self._marlin_I = self._w2_marlin.shape[1] * 16
 
         # Unknown quant type → silently fall through to vectorized_moe.
 
@@ -321,6 +339,28 @@ class MoE(nn.Module):
             ).view(B, T, C)
         elif not self.training and self._w1_marlin is not None:
             # Path 2: vLLM Marlin MoE (gptqmodel Marlin experts)
+            # Grow intermediate buffers lazily (no reallocation if M_topk fits).
+            # K here is self.num_experts_per_tok (the topk value), NOT the hidden size.
+            topk_val = K                        # number of experts per token
+            BT = x_flat.shape[0]               # number of (batch * seq) tokens
+            M_topk = BT * topk_val             # total (token, expert) slots
+            I_mar = self._marlin_I              # per-stream intermediate size
+            K_mar = self._marlin_K              # model hidden size (= C)
+            if (
+                self._marlin_buf_M_topk < M_topk
+                or self._marlin_cache13 is None
+                or self._marlin_cache13.dtype != x_flat.dtype
+            ):
+                dev = x_flat.device
+                dt = x_flat.dtype
+                cap13 = M_topk * max(2 * I_mar, K_mar)
+                self._marlin_cache13 = torch.empty(cap13, device=dev, dtype=dt)
+                self._marlin_cache2 = torch.empty(M_topk * I_mar, device=dev, dtype=dt)
+                # Allocate as 2D (BT, K_mar) so forward passes just slice rows.
+                self._marlin_out_buf = torch.empty(BT, K_mar, device=dev, dtype=dt)
+                self._marlin_buf_M_topk = M_topk
+            # Slice the first BT rows of the pre-allocated output buffer.
+            out_view = self._marlin_out_buf[:BT, :]
             y = fused_experts_marlin_impl(
                 hidden_states=x_flat,
                 w1_qweight=self._w1_marlin,
@@ -339,6 +379,9 @@ class MoE(nn.Module):
                 b_q_type=self._marlin_b_q_type,
                 num_experts=self._marlin_num_experts,
                 activation=self.activation_function or "silu",
+                cache13=self._marlin_cache13,
+                cache2=self._marlin_cache2,
+                out=out_view,
             ).view(B, T, C)
         elif not self.training and self._w1_qweight is not None:
             # Path 3: int4 Triton (GPTQ / AutoRound / AWQ)
