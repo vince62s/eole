@@ -165,6 +165,7 @@ class MoE(nn.Module):
         self._w2_marlin_perm = None    # (E, 0) – empty
         self._marlin_workspace = None  # shared Marlin workspace tensor
         self._marlin_scalar_type_id = None  # int, e.g. uint4b8.id
+        self._marlin_b_q_type = None        # vllm.scalar_type.ScalarType (created once)
         self._marlin_num_experts = None     # int
 
     def _maybe_fuse_gates(self):
@@ -266,6 +267,11 @@ class MoE(nn.Module):
                 _group_size,
             ) = stack_marlin_moe_weights(self.experts, device)
             self._marlin_num_experts = len(self.experts)
+            # Build the ScalarType object once so fused_experts_marlin_impl
+            # can use it directly on every forward pass without recreating it.
+            from vllm.scalar_type import ScalarType as _ScalarType
+
+            self._marlin_b_q_type = _ScalarType.from_id(self._marlin_scalar_type_id)
 
         # Unknown quant type → silently fall through to vectorized_moe.
 
@@ -330,7 +336,7 @@ class MoE(nn.Module):
                 workspace=self._marlin_workspace,
                 topk_weights=expert_weights,
                 topk_ids=expert_indices,
-                scalar_type_id=self._marlin_scalar_type_id,
+                b_q_type=self._marlin_b_q_type,
                 num_experts=self._marlin_num_experts,
                 activation=self.activation_function or "silu",
             ).view(B, T, C)

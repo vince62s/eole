@@ -24,8 +24,29 @@ directly into the output buffer.
 """
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional vLLM integration – probed once at import time
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache the vLLM Marlin MoE GEMM wrapper and ScalarType constructor here so
+# that fused_experts_marlin_impl() can call them without per-call imports or
+# attribute lookups.
+try:
+    import vllm._custom_ops as _vllm_ops
+    from vllm.scalar_type import ScalarType as _VllmScalarType
+
+    _vllm_moe_wna16_marlin_gemm = _vllm_ops.moe_wna16_marlin_gemm
+    _HAS_VLLM_MARLIN = True
+except (ImportError, ModuleNotFoundError, AttributeError):
+    _vllm_ops = None  # type: ignore[assignment]
+    _VllmScalarType = None  # type: ignore[assignment,misc]
+    _vllm_moe_wna16_marlin_gemm = None  # type: ignore[assignment]
+    _HAS_VLLM_MARLIN = False
+
+from eole.modules.moe_quant_utils import _moe_align_block_size  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +499,7 @@ def fused_experts_marlin_impl(
     workspace: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    scalar_type_id: int,
+    b_q_type,  # vllm.scalar_type.ScalarType – pre-created once at setup time
     num_experts: int,
     activation: str = "silu",
 ) -> torch.Tensor:
@@ -505,7 +526,7 @@ def fused_experts_marlin_impl(
     workspace     : (sms * 4,) int32     – Marlin workspace
     topk_weights  : (M, topk)  float32   – routing weights (sum to 1 per token)
     topk_ids      : (M, topk)  int32/int64 – selected expert indices
-    scalar_type_id : int                 – Marlin scalar type (e.g. uint4b8.id)
+    b_q_type      : ScalarType           – Marlin scalar type (pre-built at setup)
     num_experts   : int                  – total number of experts
     activation    : "silu" | "gelu" | "relu"
 
@@ -513,14 +534,6 @@ def fused_experts_marlin_impl(
     -------
     (M, K) output tensor
     """
-    from eole.modules.moe_quant_utils import _moe_align_block_size
-    import vllm._custom_ops as _vllm_ops
-    from vllm.scalar_type import ScalarType
-
-    # Convert the integer scalar type ID to the ScalarType object required by
-    # the vLLM wrapper (which then extracts .id before calling the C++ kernel).
-    b_q_type = ScalarType.from_id(scalar_type_id)
-
     M, K = hidden_states.shape
     topk = topk_ids.shape[1]
     device = hidden_states.device
@@ -529,8 +542,9 @@ def fused_experts_marlin_impl(
     # I//16 = w2_qweight.size(1)  →  I = w2_qweight.size(1) * 16
     I = w2_qweight.size(1) * 16  # noqa: E741
 
-    # Ensure routing weights are float32 as required by the Marlin kernel
-    topk_weights_f32 = topk_weights.float()
+    # Ensure routing weights are float32 as required by the Marlin kernel.
+    # Guard avoids a redundant GPU copy when weights are already float32.
+    topk_weights_f32 = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
 
     # ── Pick moe_block_size based on heuristic from vLLM ──────────────────
     # Smaller block sizes work better when tokens per expert is low.
@@ -541,15 +555,17 @@ def fused_experts_marlin_impl(
         moe_block_size = bs
 
     # ── Build sorted routing structures ───────────────────────────────────
+    # topk_ids is passed directly; _moe_align_block_size handles type
+    # conversion internally, so no pre-cast to int64 is needed here.
     sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size(
-        topk_ids.to(torch.int64).view(M, topk),
+        topk_ids.view(M, topk),
         moe_block_size,
         num_experts,
     )
 
     # ── W1: gate+up projection → (M*topk, 2*I) ────────────────────────────
     # Output shape: (size_m * top_k, size_n) = (M * topk, 2*I)
-    intermediate_w1 = _vllm_ops.moe_wna16_marlin_gemm(
+    intermediate_w1 = _vllm_moe_wna16_marlin_gemm(
         hidden_states,
         None,  # allocate new output
         w1_qweight,
@@ -584,8 +600,6 @@ def fused_experts_marlin_impl(
     gate = intermediate_w1[:, :I]
     up = intermediate_w1[:, I:]
 
-    import torch.nn.functional as F  # local import to avoid circular issues
-
     act_str = activation.lower()
     if act_str == "silu":
         intermediate_w2 = F.silu(gate) * up
@@ -598,7 +612,7 @@ def fused_experts_marlin_impl(
 
     # ── W2: down projection with routing-weight accumulation ──────────────
     # Output shape: (size_m * top_k, size_n) = (M * topk * 1, K) = (M*topk, K)
-    output_w2 = _vllm_ops.moe_wna16_marlin_gemm(
+    output_w2 = _vllm_moe_wna16_marlin_gemm(
         intermediate_w2,
         None,  # allocate new output
         w2_qweight,

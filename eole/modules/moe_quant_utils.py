@@ -42,6 +42,23 @@ from __future__ import annotations
 import torch
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Optional vLLM integration – probed once at import time
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Cache the vLLM moe_align_block_size C++ kernel as a direct callable so that
+# _moe_align_block_size() can call it without doing an import or attribute
+# lookup on every forward pass.
+try:
+    import vllm._custom_ops as _vllm_custom_ops
+
+    _vllm_moe_align_block_size_fn = getattr(_vllm_custom_ops, "moe_align_block_size", None)
+    _vllm_moe_wna16_marlin_gemm_fn = getattr(_vllm_custom_ops, "moe_wna16_marlin_gemm", None)
+except (ImportError, ModuleNotFoundError):
+    _vllm_custom_ops = None
+    _vllm_moe_align_block_size_fn = None
+    _vllm_moe_wna16_marlin_gemm_fn = None
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Named constants
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -74,12 +91,7 @@ def _vllm_moe_marlin_available() -> bool:
     Importing ``vllm._custom_ops`` both loads the shared-library extension
     *and* exposes a proper Python function for ``moe_wna16_marlin_gemm``.
     """
-    try:
-        import vllm._custom_ops as _vllm_ops  # noqa: F401
-
-        return hasattr(_vllm_ops, "moe_wna16_marlin_gemm")
-    except (ImportError, ModuleNotFoundError):
-        return False
+    return _vllm_moe_wna16_marlin_gemm_fn is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,27 +160,25 @@ def _moe_align_block_size(
 
     # ── Fast path: vLLM C++ kernel ────────────────────────────────────────
     # Pre-allocate worst-case buffers – no CPU–GPU sync needed for sizing.
-    try:
-        import vllm._custom_ops as _vllm_ops  # noqa: F401
-
-        if hasattr(_vllm_ops, "moe_align_block_size"):
-            max_padded = num_tokens + num_experts * (block_size - 1)
-            max_blocks = (max_padded + block_size - 1) // block_size
-            sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
-            sorted_token_ids.fill_(num_tokens)  # pre-fill padding sentinel
-            expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
-            num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=device)
-            _vllm_ops.moe_align_block_size(
-                topk_ids.to(torch.int32),
-                num_experts,
-                block_size,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-            )
-            return sorted_token_ids, expert_ids, num_tokens_post_padded
-    except (ImportError, ModuleNotFoundError):
-        pass
+    # _vllm_moe_align_block_size_fn is a module-level cached reference; no
+    # per-call import or attribute lookup needed.
+    if _vllm_moe_align_block_size_fn is not None:
+        max_padded = num_tokens + num_experts * (block_size - 1)
+        max_blocks = (max_padded + block_size - 1) // block_size
+        sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
+        expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+        num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=device)
+        # The C++ kernel writes all slots [0, num_tokens_post_padded) including
+        # padding sentinels, so no pre-fill of sorted_token_ids is needed.
+        _vllm_moe_align_block_size_fn(
+            topk_ids.to(torch.int32),
+            num_experts,
+            block_size,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+        )
+        return sorted_token_ids, expert_ids, num_tokens_post_padded
 
     # ── Vectorised fallback (no Python loops) ────────────────────────────
     flat_ids = topk_ids.reshape(-1).long()  # (M * topk,) – expert IDs
