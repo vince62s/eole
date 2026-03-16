@@ -179,6 +179,19 @@ class MoE(nn.Module):
         self._marlin_cache2 = None         # flat buffer: cap ≥ M*topk*I
         self._marlin_out_buf = None        # (BT, K_mar) output buffer
         self._marlin_buf_M_topk = 0        # M*topk capacity of current caches
+        # Routing structure buffers – grown lazily; pre-allocated at worst-case
+        # block_size=64 so they are always reusable across any moe_block_size.
+        # Eliminating these 4 per-call GPU allocations per MoE layer per decode
+        # step is important for GPU utilization: at decode (M=1) the ~480+ total
+        # kernel launches for a 32-layer model result in ~5ms of CPU dispatch
+        # overhead vs ~1ms of GPU compute → ~17-25% GPU utilization.  Removing
+        # per-call allocations also enables future CUDA graph capture via
+        # EOLE_COMPILE_MODE=2/3 since CUDA graphs require static tensor shapes.
+        self._marlin_sorted_ids_buf = None  # (M*topk + E*(MAX_BLOCK-1),) int32
+        self._marlin_expert_ids_buf = None  # (ceil(above/MAX_BLOCK)+1,) int32
+        self._marlin_ntpp_buf = None        # (1,) int32
+        self._marlin_topk_ids_i32 = None    # (BT, topk) int32 – avoids .to(int32) alloc
+        self._marlin_routing_cap = 0        # capacity of routing buffers (sorted_ids length)
 
     def _maybe_fuse_gates(self):
         """Fuse all expert gates, executed only once."""
@@ -346,6 +359,9 @@ class MoE(nn.Module):
             M_topk = BT * topk_val             # total (token, expert) slots
             I_mar = self._marlin_I              # per-stream intermediate size
             K_mar = self._marlin_K              # model hidden size (= C)
+            E = self._marlin_num_experts        # number of experts
+
+            # Grow GEMM buffers if the current M_topk exceeds capacity or dtype changed.
             if (
                 self._marlin_buf_M_topk < M_topk
                 or self._marlin_cache13 is None
@@ -359,6 +375,31 @@ class MoE(nn.Module):
                 # Allocate as 2D (BT, K_mar) so forward passes just slice rows.
                 self._marlin_out_buf = torch.empty(BT, K_mar, device=dev, dtype=dt)
                 self._marlin_buf_M_topk = M_topk
+
+            # Grow routing buffers at worst-case block_size=64 so they cover any
+            # moe_block_size (8–64) that _moe_align_block_size may compute.
+            # Layout: sorted_ids can hold M*topk + E*(MAX_BLOCK-1) entries.
+            _MAX_BLOCK = 64
+            routing_need = M_topk + E * (_MAX_BLOCK - 1)
+            if self._marlin_routing_cap < routing_need or self._marlin_sorted_ids_buf is None:
+                dev = x_flat.device
+                self._marlin_sorted_ids_buf = torch.empty(routing_need, dtype=torch.int32, device=dev)
+                self._marlin_expert_ids_buf = torch.empty(
+                    (routing_need + _MAX_BLOCK - 1) // _MAX_BLOCK + 1,
+                    dtype=torch.int32, device=dev,
+                )
+                self._marlin_ntpp_buf = torch.empty(1, dtype=torch.int32, device=dev)
+                self._marlin_routing_cap = routing_need
+
+            # Grow the topk_ids int32 buffer if the (BT, topk) shape changed.
+            if (
+                self._marlin_topk_ids_i32 is None
+                or self._marlin_topk_ids_i32.numel() < expert_indices.numel()
+            ):
+                self._marlin_topk_ids_i32 = torch.empty(
+                    BT, topk_val, dtype=torch.int32, device=x_flat.device
+                )
+
             # Slice the first BT rows of the pre-allocated output buffer.
             out_view = self._marlin_out_buf[:BT, :]
             y = fused_experts_marlin_impl(
@@ -377,11 +418,15 @@ class MoE(nn.Module):
                 topk_weights=expert_weights,
                 topk_ids=expert_indices,
                 b_q_type=self._marlin_b_q_type,
-                num_experts=self._marlin_num_experts,
+                num_experts=E,
                 activation=self.activation_function or "silu",
                 cache13=self._marlin_cache13,
                 cache2=self._marlin_cache2,
                 out=out_view,
+                sorted_ids_buf=self._marlin_sorted_ids_buf,
+                expert_ids_buf=self._marlin_expert_ids_buf,
+                ntpp_buf=self._marlin_ntpp_buf,
+                topk_ids_i32=self._marlin_topk_ids_i32[:BT, :],
             ).view(B, T, C)
         elif not self.training and self._w1_qweight is not None:
             # Path 3: int4 Triton (GPTQ / AutoRound / AWQ)

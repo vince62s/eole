@@ -542,6 +542,17 @@ def fused_experts_marlin_impl(
     cache13: "torch.Tensor | None" = None,
     cache2: "torch.Tensor | None" = None,
     out: "torch.Tensor | None" = None,
+    # ── Pre-allocated routing buffers (grown lazily in moe.py) ──────────────
+    # These eliminate 4 small GPU allocations per decode step per MoE layer:
+    #   sorted_ids_buf : (M*topk + E*(MAX_BLOCK-1),) int32
+    #   expert_ids_buf : (ceil(above / MAX_BLOCK) + 1,) int32
+    #   ntpp_buf       : (1,) int32 – num_tokens_post_padded
+    #   topk_ids_i32   : (M, topk) int32 – avoids per-call .to(int32) alloc
+    # When None, _moe_align_block_size falls back to dynamic allocation.
+    sorted_ids_buf: "torch.Tensor | None" = None,
+    expert_ids_buf: "torch.Tensor | None" = None,
+    ntpp_buf: "torch.Tensor | None" = None,
+    topk_ids_i32: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """MoE forward pass using vLLM's ``moe_wna16_marlin_gemm`` fused kernel.
 
@@ -572,6 +583,10 @@ def fused_experts_marlin_impl(
     cache13       : flat buffer ≥ M*topk*max(2*I, K) elements (optional)
     cache2        : flat buffer ≥ M*topk*I elements (optional)
     out           : pre-allocated (M, K) output tensor (optional)
+    sorted_ids_buf: pre-allocated routing buffer, numel ≥ M*topk+E*(MAX_BLOCK-1)
+    expert_ids_buf: pre-allocated routing buffer, numel ≥ ceil(above/MAX_BLOCK)+1
+    ntpp_buf      : pre-allocated (1,) int32 for num_tokens_post_padded
+    topk_ids_i32  : pre-allocated (M, topk) int32 buffer (avoids per-call cast)
 
     Returns
     -------
@@ -600,12 +615,17 @@ def fused_experts_marlin_impl(
         moe_block_size = bs
 
     # ── Build sorted routing structures ───────────────────────────────────
-    # topk_ids is passed directly; _moe_align_block_size handles type
-    # conversion internally, so no pre-cast to int64 is needed here.
+    # Pass pre-allocated routing buffers to avoid per-call GPU allocations.
+    # The pre-allocated buffers are sized at worst-case (block_size=64) by the
+    # caller in moe.py, so they are always large enough for any moe_block_size.
     sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size(
         topk_ids.view(M, topk),
         moe_block_size,
         num_experts,
+        pre_sorted_ids=sorted_ids_buf,
+        pre_expert_ids=expert_ids_buf,
+        pre_ntpp=ntpp_buf,
+        pre_topk_ids_i32=topk_ids_i32,
     )
 
     # ── Prepare intermediate buffers ─────────────────────────────────────

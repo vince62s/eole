@@ -63,9 +63,9 @@ except (ImportError, ModuleNotFoundError):
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Fallback SM count used when torch.cuda.get_device_properties() is unavailable.
-# 108 is the A100-SXM4-80GB value; a larger number only wastes a few KB of
-# workspace memory so erring on the high side is safe for any modern GPU.
-_DEFAULT_SM_COUNT_FALLBACK = 108
+# 160 covers H100 SXM5 (132 SMs) and future high-end GPUs with headroom; a
+# larger value only wastes a few KB of workspace memory so erring high is safe.
+_DEFAULT_SM_COUNT_FALLBACK = 160
 
 # Marlin scalar type IDs as used by vLLM / gptqmodel_marlin_kernels.
 # These map to the ScalarType enum values inside the C++ extension.
@@ -128,6 +128,10 @@ def _moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
+    pre_sorted_ids: "torch.Tensor | None" = None,
+    pre_expert_ids: "torch.Tensor | None" = None,
+    pre_ntpp: "torch.Tensor | None" = None,
+    pre_topk_ids_i32: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the routing structures required by the Marlin MoE GEMM kernel.
 
@@ -141,6 +145,23 @@ def _moe_align_block_size(
         Expert index for every GEMM block (one block = *block_size* slots).
     num_tokens_post_padded : (1,) int32
         Total number of slots including padding (= len(sorted_token_ids)).
+
+    Optional pre-allocated output buffers
+    --------------------------------------
+    When the caller provides *pre_sorted_ids*, *pre_expert_ids*, and
+    *pre_ntpp* that are large enough (see sizing notes below), those buffers
+    are used directly and no GPU memory allocation occurs.  This eliminates
+    3–4 small CUDA malloc/free calls per MoE layer per decode step, which at
+    M=1 can represent a meaningful fraction of total dispatch overhead.
+
+    Buffer sizing (worst-case pre-allocation for any block_size ≤ MAX_BLOCK):
+      pre_sorted_ids.numel()  ≥ M*topk + num_experts * (MAX_BLOCK - 1)
+      pre_expert_ids.numel()  ≥ ceil(above / MAX_BLOCK) + 1
+      pre_ntpp.numel()        ≥ 1
+
+    Passing *pre_topk_ids_i32* (shape matching topk_ids, dtype int32) avoids
+    the per-call ``topk_ids.to(int32)`` allocation when ``topk_ids`` is int64.
+    The buffer is filled in-place using ``copy_`` before the kernel call.
 
     Two implementations are tried in order:
 
@@ -159,19 +180,43 @@ def _moe_align_block_size(
     device = topk_ids.device
 
     # ── Fast path: vLLM C++ kernel ────────────────────────────────────────
-    # Pre-allocate worst-case buffers – no CPU–GPU sync needed for sizing.
-    # _vllm_moe_align_block_size_fn is a module-level cached reference; no
-    # per-call import or attribute lookup needed.
+    # Use pre-allocated buffers when provided and large enough; otherwise fall
+    # back to dynamic allocation.  The C++ kernel only writes the valid prefix
+    # [0, num_tokens_post_padded[0]) so passing a larger-than-minimum buffer
+    # is always safe.
     if _vllm_moe_align_block_size_fn is not None:
         max_padded = num_tokens + num_experts * (block_size - 1)
         max_blocks = (max_padded + block_size - 1) // block_size
-        sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
-        expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
-        num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=device)
+
+        if pre_sorted_ids is not None and pre_sorted_ids.numel() >= max_padded:
+            sorted_token_ids = pre_sorted_ids
+        else:
+            sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=device)
+
+        if pre_expert_ids is not None and pre_expert_ids.numel() >= max_blocks:
+            expert_ids = pre_expert_ids
+        else:
+            expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+
+        if pre_ntpp is not None:
+            num_tokens_post_padded = pre_ntpp
+        else:
+            num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=device)
+
+        # Resolve int32 topk_ids: reuse pre-allocated buffer when available to
+        # avoid the per-call allocation from .to(torch.int32).
+        if topk_ids.dtype == torch.int32:
+            topk_ids_i32 = topk_ids
+        elif pre_topk_ids_i32 is not None and pre_topk_ids_i32.numel() >= topk_ids.numel():
+            pre_topk_ids_i32.view_as(topk_ids).copy_(topk_ids)
+            topk_ids_i32 = pre_topk_ids_i32.view_as(topk_ids)
+        else:
+            topk_ids_i32 = topk_ids.to(torch.int32)
+
         # The C++ kernel writes all slots [0, num_tokens_post_padded) including
         # padding sentinels, so no pre-fill of sorted_token_ids is needed.
         _vllm_moe_align_block_size_fn(
-            topk_ids.to(torch.int32),
+            topk_ids_i32,
             num_experts,
             block_size,
             sorted_token_ids,
