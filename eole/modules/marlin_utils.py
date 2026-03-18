@@ -104,7 +104,10 @@ def _transform_param(
 def should_use_atomic_add_reduce(
     m: int, n: int, k: int, device: torch.device, dtype: torch.dtype
 ) -> bool:
-    if n >= 2048 or k < 2048 or device.type != "cuda":
+    # atomicAdd is faster only for small N (narrow output) with large K.
+    _ATOMIC_ADD_MAX_N = 2048  # atomicAdd not beneficial above this output width
+    _ATOMIC_ADD_MIN_K = 2048  # need sufficient reduction depth for atomicAdd to win
+    if n >= _ATOMIC_ADD_MAX_N or k < _ATOMIC_ADD_MIN_K or device.type != "cuda":
         return False
     device_capability = torch.cuda.get_device_capability(device)
     if device_capability[0] < 9 and dtype == torch.bfloat16:
@@ -176,10 +179,13 @@ def gptq_marlin_gemm(
     n_blocks = (size_m + moe_block_size - 1) // moe_block_size
     padded = n_blocks * moe_block_size
 
-    # sorted_token_ids: [0, 1, ..., m-1, sentinel, sentinel, ...]
+    # sorted_token_ids[i] / top_k gives the source row in A.
+    # With top_k=1, identity routing means sorted_token_ids[i] = i.
+    # Padding slots use sentinel value `size_m` (>= all valid row indices),
+    # which causes the MoE kernel to detect them as out-of-range and skip them.
     sorted_ids = torch.arange(padded, dtype=torch.int32, device=device)
     if padded > size_m:
-        sorted_ids[size_m:] = size_m  # sentinel: out-of-range → skipped
+        sorted_ids[size_m:] = size_m  # sentinel: kernel skips rows >= size_m
 
     expert_ids = torch.zeros(n_blocks, dtype=torch.int32, device=device)
     ntpp = torch.tensor([padded], dtype=torch.int32, device=device)

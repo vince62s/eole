@@ -5,10 +5,13 @@ from eole.ops import _MARLIN_AVAILABLE
 
 
 def _preflight_marlin_import():
-    """No-op compatibility shim kept for callers in model.py.
+    """No-op compatibility shim retained for callers in model.py.
 
-    The old implementation imported gptqmodel Marlin and patched triton.Autotuner.
-    Since the gptqmodel dependency has been removed, no patching is needed.
+    The original implementation imported gptqmodel Marlin and patched
+    triton.Autotuner for thread-safety.  Since gptqmodel has been replaced
+    by eole's own MarlinQuantLinear (which uses no background threads),
+    no patching is needed.  This shim keeps the call site in model.py
+    unchanged so that future callers do not break.
     """
     pass
 

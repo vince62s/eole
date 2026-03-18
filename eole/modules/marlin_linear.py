@@ -88,7 +88,9 @@ class MarlinQuantLinear(nn.Module):
         if out_features % _MIN_OUT_FEATURES_MULT != 0:
             raise NotImplementedError(
                 f"MarlinQuantLinear: out_features={out_features} must be divisible by "
-                f"{_MIN_OUT_FEATURES_MULT}."
+                f"{_MIN_OUT_FEATURES_MULT} (Marlin tile size). "
+                f"For layers with non-aligned dimensions, use the PyTorch or Triton backend "
+                f"by setting sym=False or force_pytorch=True."
             )
 
         if desc_act and group_size == -1:
@@ -162,7 +164,7 @@ class MarlinQuantLinear(nn.Module):
         module has been moved to a CUDA device.
         """
         device = self.qweight.device
-        if not device.type == "cuda":
+        if device.type != "cuda":
             raise RuntimeError("MarlinQuantLinear.post_init() requires CUDA.")
 
         self.is_k_full = marlin_is_k_full(self.desc_act, is_row_parallel=False)
