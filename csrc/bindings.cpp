@@ -2,6 +2,13 @@
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 
+torch::Tensor gptq_marlin_repack(
+    torch::Tensor& b_q_weight,
+    torch::Tensor& perm,
+    int64_t        size_k,
+    int64_t        size_n,
+    int64_t        num_bits);
+
 void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
               double epsilon, bool gemma);
 
@@ -58,6 +65,15 @@ torch::Tensor moe_wna16_marlin_gemm(
 // ── Module ────────────────────────────────────────────────────────────────────
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+
+  // GPTQ Marlin weight repack
+  m.def("gptq_marlin_repack", &gptq_marlin_repack,
+        "Repack GPTQ int4/int8 weights into Marlin tiled layout",
+        py::arg("b_q_weight"),
+        py::arg("perm"),
+        py::arg("size_k"),
+        py::arg("size_n"),
+        py::arg("num_bits"));
 
   // RMS Norm
   m.def("rms_norm", &rms_norm,

@@ -319,129 +319,45 @@ else:
 
 
 # ============================================================================
-# GPTQ Marlin GEMM
+# GPTQ Marlin GEMM (dense)
 # ============================================================================
-try:
-    import gptqmodel_marlin_kernels as _marlin_kernels
+# Dense Marlin GEMM is implemented in eole.modules.marlin_utils and uses the
+# MoE kernel (moe_wna16_marlin_gemm) with trivial single-expert routing.
+# No gptqmodel_marlin_kernels dependency is required.
+#
+# _MARLIN_AVAILABLE mirrors _CPP_OPS_AVAILABLE because both dense and MoE
+# Marlin use eole's own compiled extension.
 
-    _MARLIN_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    _MARLIN_AVAILABLE = False
+_MARLIN_AVAILABLE = _CPP_OPS_AVAILABLE
 
-if EOLE_TORCH_COMPILE:
-    if _MARLIN_AVAILABLE:
 
-        @custom_op("eole::gptq_marlin_gemm", mutates_args={})
-        def _gptq_marlin_gemm_kernel(
-            a: torch.Tensor,
-            c: Optional[torch.Tensor],
-            b_q_weight: torch.Tensor,
-            b_bias: Optional[torch.Tensor],
-            b_scales: torch.Tensor,
-            global_scale: Optional[torch.Tensor],
-            b_zeros: Optional[torch.Tensor],
-            g_idx: Optional[torch.Tensor],
-            perm: Optional[torch.Tensor],
-            workspace: torch.Tensor,
-            b_q_type_id: int,  # ScalarType.id — already an int
-            size_m: int,
-            size_n: int,
-            size_k: int,
-            is_k_full: bool = True,
-            use_atomic_add: bool = False,
-            use_fp32_reduce: bool = False,
-            is_zp_float: bool = False,
-        ) -> torch.Tensor:
-            return _marlin_kernels.gptq_marlin_gemm(
-                a,
-                c,
-                b_q_weight,
-                b_bias,
-                b_scales,
-                global_scale,
-                b_zeros,
-                g_idx,
-                perm,
-                workspace,
-                b_q_type_id,
-                size_m,
-                size_n,
-                size_k,
-                is_k_full,
-                use_atomic_add,
-                use_fp32_reduce,
-                is_zp_float,
-            )
+def gptq_marlin_gemm(*args, **kwargs):
+    """Dense Marlin GEMM via MoE kernel with trivial routing.
 
-        @_gptq_marlin_gemm_kernel.register_fake
-        def _(
-            a,
-            c,
-            b_q_weight,
-            b_bias,
-            b_scales,
-            global_scale,
-            b_zeros,
-            g_idx,
-            perm,
-            workspace,
-            b_q_type_id,
-            size_m,
-            size_n,
-            size_k,
-            is_k_full=True,
-            use_atomic_add=False,
-            use_fp32_reduce=False,
-            is_zp_float=False,
-        ):
-            return torch.empty(size_m, size_n, dtype=a.dtype, device=a.device)
+    Delegates to eole.modules.marlin_utils.gptq_marlin_gemm which accepts a
+    ScalarType object as ``b_q_type``.  The MoE kernel (already compiled into
+    eole._ops) is called with identity routing tensors so it behaves like a
+    plain GEMM.
+    """
+    from eole.modules.marlin_utils import gptq_marlin_gemm as _gemm
 
-        # Patch at the Python wrapper level, extracting .id before the custom op
-        def _patched_gptq_marlin_gemm(
-            a,
-            c,
-            b_q_weight,
-            b_bias,
-            b_scales,
-            global_scale,
-            b_zeros,
-            g_idx,
-            perm,
-            workspace,
-            b_q_type,
-            size_m,
-            size_n,
-            size_k,
-            is_k_full=True,
-            use_atomic_add=False,
-            use_fp32_reduce=False,
-            is_zp_float=False,
-        ):
-            return _gptq_marlin_gemm_kernel(
-                a,
-                c,
-                b_q_weight,
-                b_bias,
-                b_scales,
-                global_scale,
-                b_zeros,
-                g_idx,
-                perm,
-                workspace,
-                b_q_type.id,  # extract here so custom_op only sees an int
-                size_m,
-                size_n,
-                size_k,
-                is_k_full,
-                use_atomic_add,
-                use_fp32_reduce,
-                is_zp_float,
-            )
+    return _gemm(*args, **kwargs)
 
-    else:
 
-        def gptq_marlin_gemm(*args, **kwargs):
-            raise RuntimeError("gptq_marlin_gemm is not available.")
+def gptq_marlin_repack(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    """Repack GPTQ-packed weights into Marlin tiled layout."""
+    if not _CPP_OPS_AVAILABLE:
+        raise RuntimeError(
+            "gptq_marlin_repack is not available: eole._ops C++ extension not loaded."
+        )
+    return _ops.gptq_marlin_repack(b_q_weight, perm, size_k, size_n, num_bits)
+
 
 
 # ── MoE Marlin GEMM availability ─────────────────────────────────────────────
@@ -760,6 +676,7 @@ __all__ = [
     "gelu_and_mul",
     "gelu_tanh_and_mul",
     "gptq_marlin_gemm",
+    "gptq_marlin_repack",
     "moe_align_block_size",
     "moe_wna16_marlin_gemm",
 ]

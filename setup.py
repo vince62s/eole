@@ -48,6 +48,7 @@ def get_ext_modules_and_cmdclass():
         "csrc/activation_kernels.cu",
         "csrc/moe_align.cu",
         "csrc/marlin_moe_wna16.cu",
+        "csrc/marlin_repack.cu",
         "csrc/bindings.cpp",
     ]
 

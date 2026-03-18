@@ -219,10 +219,8 @@ class BaseModel(nn.Module):
         """Build a complete model with all components."""
         logger.info("Building model...")
 
-        # Retroactively patch any pre-existing triton.Autotuner instances for gptqmodel
-        # thread-safety.  FLA (gated_delta_net.py) creates Autotuner instances at module-load
-        # time, before this point; _preflight_marlin_import() finds and fixes them all so that
-        # gptqmodel's second thread can safely use FLA kernels during inference.
+        # _preflight_marlin_import() is a no-op kept for API compatibility now that
+        # the gptqmodel dependency has been removed from the Marlin implementation.
         if getattr(running_config, "quant_type", "") == "autoround" and getattr(running_config, "autoround_sym", True):
             from eole.modules.autoround_linear import _preflight_marlin_import
 
