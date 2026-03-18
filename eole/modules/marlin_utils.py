@@ -148,73 +148,47 @@ def gptq_marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
-    """Dense Marlin GEMM implemented via the MoE kernel with trivial routing.
+    """Dense GPTQ-Marlin GEMM using the dedicated dense kernel.
 
-    Adds an expert dimension (E=1) to the weight/scale tensors and creates
-    identity routing structures so that the MoE kernel behaves as a regular
-    matrix multiplication.
+    Calls ``eole._ops.gptq_marlin_gemm`` directly — no MoE routing tensors
+    are allocated or passed.
+
+    Args:
+        a: Activation tensor of shape ``(M, K)``, half or bfloat16.
+        c: Optional pre-allocated output tensor of shape ``(M, N)``.
+        b_q_weight: Marlin-repacked quantized weight, shape ``(K//16, N*bits//32)``.
+        b_bias: Optional bias tensor of shape ``(N,)``.
+        b_scales: Scale tensor, shape ``(num_groups, N)``.
+        global_scale: Reserved for nvfp4 (pass ``None`` for GPTQ).
+        b_zeros: Optional zero-points tensor (asymmetric quant).
+        g_idx: Optional group-index tensor for act-order (shape ``(K,)``).
+        perm: Optional permutation tensor for act-order (shape ``(K,)``).
+        workspace: Zeros tensor used as lock buffer (see marlin_make_workspace).
+        b_q_type: ScalarType describing the weight quantisation (e.g. uint4b8).
+        size_m: Batch size (number of rows of A/C).
+        size_n: Output dimension (number of columns of C).
+        size_k: Reduction dimension (number of columns of A / rows of B).
+        is_k_full: Whether K is fully covered by groups (True for GPTQ).
+        use_atomic_add: Use atomic-add for small-N cross-block reduction.
+        use_fp32_reduce: Use fp32 tmp buffer for cross-block reduction.
+        is_zp_float: Whether zero-points are stored as float (HQQ).
+
+    Returns:
+        Output tensor of shape ``(M, N)`` in the same dtype as ``a``.
     """
-    from eole.ops import moe_wna16_marlin_gemm
+    from eole import _ops
 
-    device = a.device
-    dtype = a.dtype
-
-    # Add expert dimension: (K//16, 2N) → (1, K//16, 2N)
-    w_q = b_q_weight.unsqueeze(0)
-    # Scales: (K//gs, N) → (1, K//gs, N)
-    w_s = b_scales.unsqueeze(0)
-
-    # Bias: (N,) → (1, N)
-    b_bias_2d: Optional[torch.Tensor] = None
-    if b_bias is not None:
-        b_bias_2d = b_bias.unsqueeze(0)
-
-    # Zero-points: only pass if non-empty
-    w_z: Optional[torch.Tensor] = None
-    if b_zeros is not None and b_zeros.numel() > 0:
-        w_z = b_zeros.unsqueeze(0)
-
-    # Build trivial MoE routing: every token → expert 0
-    moe_block_size = 16
-    n_blocks = (size_m + moe_block_size - 1) // moe_block_size
-    padded = n_blocks * moe_block_size
-
-    # sorted_token_ids[i] / top_k gives the source row in A.
-    # With top_k=1, identity routing means sorted_token_ids[i] = i.
-    # Padding slots use sentinel value `size_m` (>= all valid row indices),
-    # which causes the MoE kernel to detect them as out-of-range and skip them.
-    sorted_ids = torch.arange(padded, dtype=torch.int32, device=device)
-    if padded > size_m:
-        sorted_ids[size_m:] = size_m  # sentinel: kernel skips rows >= size_m
-
-    expert_ids = torch.zeros(n_blocks, dtype=torch.int32, device=device)
-    ntpp = torch.tensor([padded], dtype=torch.int32, device=device)
-    # topk_weights unused (mul_topk_weights=False), but kernel requires a valid ptr
-    topk_weights = torch.ones(size_m, dtype=torch.float32, device=device)
-
-    if c is None:
-        c = torch.empty(size_m, size_n, dtype=dtype, device=device)
-
-    moe_wna16_marlin_gemm(
+    return _ops.gptq_marlin_gemm(
         a,
         c,
-        None,  # c_tmp
-        w_q,
-        b_bias_2d,
-        w_s,
-        None,  # a_scales
+        b_q_weight,
+        b_bias,
+        b_scales,
         global_scale,
-        w_z,
+        b_zeros,
         g_idx,
         perm,
         workspace,
-        sorted_ids,
-        expert_ids,
-        ntpp,
-        topk_weights,
-        moe_block_size,
-        1,      # top_k
-        False,  # mul_topk_weights
         b_q_type.id,
         size_m,
         size_n,
@@ -224,8 +198,6 @@ def gptq_marlin_gemm(
         use_fp32_reduce,
         is_zp_float,
     )
-
-    return c
 
 
 def apply_gptq_marlin_linear(

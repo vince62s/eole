@@ -321,23 +321,20 @@ else:
 # ============================================================================
 # GPTQ Marlin GEMM (dense)
 # ============================================================================
-# Dense Marlin GEMM is implemented in eole.modules.marlin_utils and uses the
-# MoE kernel (moe_wna16_marlin_gemm) with trivial single-expert routing.
-# No gptqmodel_marlin_kernels dependency is required.
+# Dense Marlin GEMM uses the dedicated marlin_dense.cu kernel compiled into
+# eole._ops.  This avoids MoE routing overhead (no sorted_token_ids /
+# expert_ids / ntpp allocations on each call).
 #
-# _MARLIN_AVAILABLE mirrors _CPP_OPS_AVAILABLE because both dense and MoE
-# Marlin use eole's own compiled extension.
+# _MARLIN_AVAILABLE mirrors _CPP_OPS_AVAILABLE.
 
 _MARLIN_AVAILABLE = _CPP_OPS_AVAILABLE
 
 
 def gptq_marlin_gemm(*args, **kwargs):
-    """Dense Marlin GEMM via MoE kernel with trivial routing.
+    """Dense Marlin GEMM via the dedicated dense kernel (no MoE routing).
 
-    Delegates to eole.modules.marlin_utils.gptq_marlin_gemm which accepts a
-    ScalarType object as ``b_q_type``.  The MoE kernel (already compiled into
-    eole._ops) is called with identity routing tensors so it behaves like a
-    plain GEMM.
+    Delegates to eole.modules.marlin_utils.gptq_marlin_gemm which calls
+    _ops.gptq_marlin_gemm directly.
     """
     from eole.modules.marlin_utils import gptq_marlin_gemm as _gemm
 

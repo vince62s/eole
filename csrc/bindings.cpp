@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <optional>
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 
@@ -8,6 +9,26 @@ torch::Tensor gptq_marlin_repack(
     int64_t        size_k,
     int64_t        size_n,
     int64_t        num_bits);
+
+torch::Tensor gptq_marlin_gemm(
+    torch::Tensor&                          a,
+    std::optional<torch::Tensor>            c_or_none,
+    torch::Tensor&                          b_q_weight,
+    std::optional<torch::Tensor> const&     b_bias_or_none,
+    torch::Tensor&                          b_scales,
+    std::optional<torch::Tensor> const&     global_scale_or_none,
+    std::optional<torch::Tensor> const&     b_zeros_or_none,
+    std::optional<torch::Tensor> const&     g_idx_or_none,
+    std::optional<torch::Tensor> const&     perm_or_none,
+    torch::Tensor&                          workspace,
+    int64_t                                 b_q_type_id,
+    int64_t                                 size_m,
+    int64_t                                 size_n,
+    int64_t                                 size_k,
+    bool                                    is_k_full,
+    bool                                    use_atomic_add,
+    bool                                    use_fp32_reduce,
+    bool                                    is_zp_float);
 
 void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
               double epsilon, bool gemma);
@@ -74,6 +95,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("size_k"),
         py::arg("size_n"),
         py::arg("num_bits"));
+
+  // Dense Marlin GEMM (gptqmodel-compatible, no MoE routing overhead)
+  m.def("gptq_marlin_gemm", &gptq_marlin_gemm,
+        "Dense Marlin GEMM for GPTQ-quantized weights",
+        py::arg("a"),
+        py::arg("c") = py::none(),
+        py::arg("b_q_weight"),
+        py::arg("b_bias") = py::none(),
+        py::arg("b_scales"),
+        py::arg("global_scale") = py::none(),
+        py::arg("b_zeros") = py::none(),
+        py::arg("g_idx") = py::none(),
+        py::arg("perm") = py::none(),
+        py::arg("workspace"),
+        py::arg("b_q_type_id"),
+        py::arg("size_m"),
+        py::arg("size_n"),
+        py::arg("size_k"),
+        py::arg("is_k_full") = true,
+        py::arg("use_atomic_add") = false,
+        py::arg("use_fp32_reduce") = true,
+        py::arg("is_zp_float") = false);
 
   // RMS Norm
   m.def("rms_norm", &rms_norm,

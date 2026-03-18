@@ -8,7 +8,7 @@ Original source: https://github.com/ModelCloud/GPTQModel
 This implementation has no dependency on the gptqmodel Python package.
 It uses eole's own CUDA kernels (via eole._ops and eole.ops) for both
 weight repacking (gptq_marlin_repack) and inference (gptq_marlin_gemm
-routed through the MoE kernel with trivial routing).
+via the dedicated dense Marlin CUDA kernel — no MoE routing overhead).
 """
 
 from typing import Optional
