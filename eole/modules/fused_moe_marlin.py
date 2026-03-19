@@ -10,7 +10,13 @@ from eole.ops import silu_and_mul
 
 
 def _view_cache(flat: torch.Tensor, *shape: int) -> torch.Tensor:
-    """Return a view of *flat* with the given *shape*."""
+    """Return a view of *flat* with the given *shape*.
+
+    The total number of elements in *shape* must be ≤ flat.numel().  This lets
+    two differently-shaped views share the same underlying storage (e.g. the W1
+    GEMM output and the W2 GEMM output both live in the same flat buffer since
+    they are never live at the same time).
+    """
     n = 1
     for s in shape:
         n *= s
@@ -92,7 +98,31 @@ def fused_experts_marlin_impl(
     out: "torch.Tensor | None" = None,
     topk_ids_i32: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    """MoE forward pass using moe_wna16_marlin_gemm fused kernel."""
+    """MoE forward pass using moe_wna16_marlin_gemm fused kernel.
+
+    Parameters
+    ----------
+    hidden_states : (M, K)
+    w1_qweight    : (E, K//16, 4*I)    Marlin-tiled gate+up weight
+    w1_scales     : (E, K//gs, 2*I)
+    w1_qzeros     : (E, 0)             empty for symmetric quant
+    w1_g_idx      : (E, 0)             empty
+    w1_perm       : (E, 0)             empty
+    w2_qweight    : (E, I//16, 2*K)
+    w2_scales     : (E, I//gs, K)
+    w2_qzeros/g_idx/perm: (E, 0)       empty
+    workspace     : (sms*4,) int32
+    topk_weights  : (M, topk) float32
+    topk_ids      : (M, topk) int32/int64
+    b_q_type      : ScalarType
+    num_experts   : int
+    activation    : "silu" | "gelu" | "relu"
+    cache13/cache2/out/topk_ids_i32: pre-allocated buffers (optional, grown lazily in moe.py)
+
+    Returns
+    -------
+    (M, K) output tensor (= *out* when provided)
+    """
     M, K = hidden_states.shape
     topk = topk_ids.shape[1]
     M_topk = M * topk
