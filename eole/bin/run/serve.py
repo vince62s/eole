@@ -329,6 +329,13 @@ def _content_to_text(content: Optional[Union[str, List[Any]]]) -> str:
     return str(content)
 
 
+def _normalize_generated_text(text: str) -> str:
+    """
+    Normalize model-generated text for API responses.
+    """
+    return text.replace(DefaultTokens.SEP, "\n")
+
+
 def estimate_tokens(text: str) -> int:
     """
     Rough token estimation (about 4 chars per token).
@@ -874,6 +881,7 @@ def create_app(config_file):
                             break
                         if isinstance(item, Exception):
                             raise item
+                        item = _normalize_generated_text(item)
                         content_chunk = OpenAIStreamChunk(
                             id=completion_id,
                             created=created_ts,
@@ -928,6 +936,7 @@ def create_app(config_file):
             prompt_text = " ".join([_content_to_text(msg.content) for msg in request.messages])
             prompt_tokens = estimate_tokens(prompt_text)
             completion_text = preds[0][0] if preds and preds[0] else ""
+            completion_text = _normalize_generated_text(completion_text)
             completion_tokens = estimate_tokens(completion_text)
 
             # Build OpenAI-compatible response
@@ -1041,6 +1050,7 @@ def create_app(config_file):
                             break
                         if isinstance(item, Exception):
                             raise item
+                        item = _normalize_generated_text(item)
                         output_text += item
                         delta_payload = {
                             "type": "content_block_delta",
@@ -1072,6 +1082,7 @@ def create_app(config_file):
             )
 
             completion_text = preds[0][0] if preds and preds[0] else ""
+            completion_text = _normalize_generated_text(completion_text)
             input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
             output_tokens = estimate_tokens(completion_text)
 

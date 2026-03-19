@@ -291,6 +291,23 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         self.assertEqual(infer_kwargs["inputs"][1], {"role": "user", "content": "Hi"})
         self.assertEqual(infer_kwargs["settings"]["max_length"], 16)
 
+    def test_v1_messages_normalizes_sep_token(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[-0.1]], [[f"line1{self.serve.DefaultTokens.SEP}line2"]]))
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                max_tokens=16,
+                stream=False,
+            )
+            response = asyncio.run(endpoint(request))
+
+        payload = response.model_dump()
+        self.assertEqual(payload["content"][0]["text"], "line1\nline2")
+
     def test_anthropic_path_model_not_found(self):
         app = self.serve.create_app(self.config_path)
         endpoint = app.routes[("POST", "/anthropic/v1/messages")]
@@ -304,6 +321,22 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         payload = response.content
         self.assertEqual(payload["type"], "error")
         self.assertEqual(payload["error"]["type"], "not_found_error")
+
+    def test_openai_non_streaming_normalizes_sep_token(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/chat/completions")]
+        infer_mock = AsyncMock(return_value=([[-0.1]], [[f"hello{self.serve.DefaultTokens.SEP}world"]]))
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.OpenAIChatRequest(
+                model="test-model",
+                messages=[self.serve.OpenAIMessage(role="user", content="Hi")],
+                stream=False,
+            )
+            response = asyncio.run(endpoint(request))
+
+        payload = response.model_dump()
+        self.assertEqual(payload["choices"][0]["message"]["content"], "hello\nworld")
 
 
 if __name__ == "__main__":
