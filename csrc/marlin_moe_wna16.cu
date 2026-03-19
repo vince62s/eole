@@ -567,6 +567,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     int64_t thread_n        = -1,
     int64_t blocks_per_sm   = -1)
 {
+  using namespace marlin;
   int dev = a.get_device();
   const marlin::CachedDeviceProps& dp =
       marlin::get_device_props(dev);
