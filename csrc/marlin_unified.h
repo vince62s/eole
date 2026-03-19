@@ -339,7 +339,6 @@ __global__ void Marlin(
 
       block_num_valid_tokens = reinterpret_cast<int*>(sh_new)[0];
       __syncthreads();
-    };
     } else {
       // Dense: valid tokens = rows remaining in this block.
       block_num_valid_tokens = min(moe_block_size, prob_m - block_id * moe_block_size);
