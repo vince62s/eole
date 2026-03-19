@@ -81,7 +81,7 @@ using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
 #define INST(A, B, C, S, TH, TM, TN, TK, M8, ST, GB)            \
   template __global__ void Marlin<A, B, C, S,                    \
-      TH, TM, TN, TK, M8, ST, GB, false>(MARLIN_KERNEL_PARAMS);
+      TH, TM, TN, TK, M8, ST, GB, false, true>(MARLIN_KERNEL_PARAMS);
 
 // Macros for the two common dtype/weight-type combinations
 #define INST_FP16_U4B8(TH, TM, TN, TK, M8, ST) \
@@ -348,7 +348,7 @@ MarlinFuncPtr get_marlin_kernel(
    threads==(TH) && tm==(TM_) && tn==(TN_) && tk==(TK_) && m8==(M8_))
 
 #define K(A,B,C,S,TH,TM_,TN_,TK_,M8_) \
-  Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, 4, 8, false>
+  Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, 4, 8, false, true>
 
   // fp16 + uint4b8
   if (a_id==FP16_ID && b_id==U4B8_ID && c_id==FP16_ID && s_id==FP16_ID) {

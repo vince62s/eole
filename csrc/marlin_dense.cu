@@ -3,13 +3,12 @@
  * Adapted from gptqmodel/gptqmodel_ext/marlin/gptq_marlin.cu (Apache-2.0).
  * Original: https://github.com/ModelCloud/GPTQModel
  *
- * Key difference from the MoE path: no sorted_token_ids / expert_ids / ntpp
- * tensors — rows of A are addressed directly and sequentially, eliminating
- * per-call tensor allocations and routing kernel overhead.
- *
- * The marlin_dense_template.h file is the eole Marlin kernel with MoE routing
- * stripped.  Its Marlin<> template takes ScalarTypeId non-type parameters
- * (not typename) matching the same convention as marlin_template.h.
+ * The dense path uses the unified Marlin<> kernel from marlin_unified.h with
+ * is_moe=false.  The 6 MoE routing parameters (sorted_token_ids_ptr, etc.)
+ * are present in the kernel signature but are passed as nullptr/0 by the
+ * launcher and are never accessed (if constexpr(is_moe) elides them).
+ * Rows of A are addressed directly and sequentially, eliminating per-call
+ * tensor allocations and routing kernel overhead.
  */
 
 #define MARLIN_NAMESPACE_NAME marlin_dense
@@ -33,17 +32,25 @@ __global__ void permute_cols_kernel(
     int4* __restrict__ out_int4_ptr,
     int size_m, int size_k, int lda, int block_rows);
     
-// ── Kernel parameters macro (must match Marlin<> signature) ──────────────────
+// ── Kernel parameters macro (must match unified Marlin<> signature) ───────────
+// The 6 MoE routing params (sorted_token_ids_ptr … mul_topk_weights) are
+// present here to satisfy the unified function signature; the kernel launcher
+// passes nullptr/0 for them and if constexpr(is_moe==false) elides all access.
 
-#define MARLIN_DENSE_KERNEL_PARAMS                                           \
-  const int4* __restrict__ A, const int4* __restrict__ B,                   \
-      int4* __restrict__ C, int4* __restrict__ C_tmp,                       \
-      const int4* __restrict__ b_bias_ptr,                                   \
-      const float* __restrict__ a_scales_ptr,                               \
-      const int4* __restrict__ scales_ptr,                                  \
-      const uint16_t* __restrict__ global_scale_ptr,                        \
-      const int4* __restrict__ zp_ptr, const int* __restrict__ g_idx,       \
-      int num_groups, int prob_m, int prob_n, int prob_k, int* locks,        \
+#define MARLIN_DENSE_KERNEL_PARAMS                                             \
+  const int4* __restrict__ A, const int4* __restrict__ B,                     \
+      int4* __restrict__ C, int4* __restrict__ C_tmp,                         \
+      const int4* __restrict__ b_bias_ptr,                                     \
+      const float* __restrict__ a_scales_ptr,                                  \
+      const int4* __restrict__ scales_ptr,                                     \
+      const uint16_t* __restrict__ global_scale_ptr,                           \
+      const int4* __restrict__ zp_ptr, const int* __restrict__ g_idx,         \
+      const int32_t* __restrict__ sorted_token_ids_ptr,                        \
+      const int32_t* __restrict__ expert_ids_ptr,                              \
+      const int32_t* __restrict__ num_tokens_past_padded_ptr,                  \
+      const float* __restrict__ topk_weights_ptr,                              \
+      int top_k, bool mul_topk_weights,                                        \
+      int num_groups, int prob_m, int prob_n, int prob_k, int* locks,          \
       bool has_bias, bool use_atomic_add, bool use_fp32_reduce
 
 using MarlinFuncPtr = void (*)(MARLIN_DENSE_KERNEL_PARAMS);
@@ -177,7 +184,7 @@ MarlinFuncPtr get_marlin_kernel(
    m8==(M8_) && group_blocks==(GB_) && is_zp_float==(ZPF_))
 
 #define K(A,B,C,S,TH,TM_,TN_,TK_,M8_,GB_,ZPF_) \
-  Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, pipe_stages, GB_, ZPF_>
+  Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, pipe_stages, GB_, ZPF_, false>
 
   // ── FP16 weight types ────────────────────────────────────────────────────
   // uint4b8  (symmetric 4-bit), fp16 activations
@@ -461,6 +468,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp,
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr,
         /*a_scales_ptr=*/nullptr,
         s_ptr, /*global_scale_ptr=*/nullptr, zp_ptr, g_idx_ptr,
+        /*sorted_token_ids_ptr=*/nullptr, /*expert_ids_ptr=*/nullptr,
+        /*num_tokens_past_padded_ptr=*/nullptr, /*topk_weights_ptr=*/nullptr,
+        /*top_k=*/0, /*mul_topk_weights=*/false,
         num_groups, prob_m_split, prob_n, prob_k, locks,
         has_bias, part_use_atomic_add, use_fp32_reduce);
 
