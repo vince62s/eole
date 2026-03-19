@@ -379,6 +379,48 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         self.assertEqual(payload["model"], "claude-haiku-4-5-20251001")
         self.assertEqual(payload["choices"][0]["message"]["content"], "Hello OpenAI")
 
+    def test_openai_tools_are_forwarded_to_chat_template(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/chat/completions")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello with tools"]]))
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+        tool_choice = {"type": "function", "function": {"name": "get_weather"}}
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.OpenAIChatRequest(
+                model="test-model",
+                messages=[self.serve.OpenAIMessage(role="user", content="Hi")],
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        infer_kwargs = infer_mock.await_args.kwargs
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tools"], tools)
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tool_choice"], tool_choice)
+
+    def test_claude_tools_are_forwarded_to_chat_template(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello with tools"]]))
+        tools = [{"name": "get_weather", "description": "Fetch weather", "input_schema": {"type": "object"}}]
+        tool_choice = {"type": "tool", "name": "get_weather"}
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        infer_kwargs = infer_mock.await_args.kwargs
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tools"], tools)
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tool_choice"], tool_choice)
+
 
 if __name__ == "__main__":
     unittest.main()

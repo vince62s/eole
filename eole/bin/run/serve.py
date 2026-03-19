@@ -152,6 +152,8 @@ class OpenAIChatRequest(BaseModel):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict] = None
     user: Optional[str] = None
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
 
 
 class ClaudeContentBlock(BaseModel):
@@ -179,6 +181,8 @@ class ClaudeMessagesRequest(BaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = None
     stream: Optional[bool] = False
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
 
 
 class OpenAIUsage(BaseModel):
@@ -414,6 +418,7 @@ class QueuedRequest:
     inputs: any
     settings: dict
     is_chat: bool
+    chat_template_kwargs: Optional[dict]
     future: asyncio.Future
     timestamp: float
 
@@ -491,7 +496,12 @@ class Model(object):
 
                     if is_chat:
                         # Chat mode: single input per request
-                        all_inputs.append(self.apply_chat_template(req.inputs))
+                        all_inputs.append(
+                            self.apply_chat_template(
+                                req.inputs,
+                                **(req.chat_template_kwargs or {}),
+                            )
+                        )
                         end_idx = len(all_inputs)
                     elif isinstance(req.inputs, str):
                         # Single string input
@@ -613,7 +623,7 @@ class Model(object):
         self.loaded = False
         logger.info(f"Unloaded model {self.model_id}")
 
-    def apply_chat_template(self, inputs):
+    def apply_chat_template(self, inputs, tools=None, tool_choice=None):
         """
         Render the model input based on the model chat template
         and the request inputs.
@@ -671,13 +681,15 @@ class Model(object):
         rendered_output = template.render(
             **{
                 "messages": inputs,
+                "tools": tools,
+                "tool_choice": tool_choice,
                 "bos_token": "",  # handled in numericalize
                 "add_generation_prompt": True,
             }
         )
         return rendered_output
 
-    async def infer_async(self, inputs, settings={}, is_chat=False):
+    async def infer_async(self, inputs, settings={}, is_chat=False, chat_template_kwargs=None):
         """
         Queue inference request and wait for result.
         """
@@ -689,7 +701,14 @@ class Model(object):
         await self.ensure_batch_processor()
 
         future = asyncio.Future()
-        req = QueuedRequest(inputs=inputs, settings=settings, is_chat=is_chat, future=future, timestamp=time.time())
+        req = QueuedRequest(
+            inputs=inputs,
+            settings=settings,
+            is_chat=is_chat,
+            chat_template_kwargs=chat_template_kwargs,
+            future=future,
+            timestamp=time.time(),
+        )
         await self.request_queue.put(req)
         return await future
 
@@ -817,6 +836,7 @@ def create_app(config_file):
 
             # Convert OpenAI messages to the format expected by your engine
             messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+            chat_template_kwargs = {"tools": request.tools, "tool_choice": request.tool_choice}
 
             # Map OpenAI parameters to Eole settings
             settings = map_openai_to_eole_settings(request)
@@ -847,7 +867,7 @@ def create_app(config_file):
                 if not model_obj.loaded:
                     model_obj.load()
 
-                chat_input = model_obj.apply_chat_template(messages)
+                chat_input = model_obj.apply_chat_template(messages, **chat_template_kwargs)
                 completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
                 created_ts = int(time.time())
 
@@ -944,6 +964,7 @@ def create_app(config_file):
                 inputs=messages,
                 settings=settings,
                 is_chat=True,
+                chat_template_kwargs=chat_template_kwargs,
             )
 
             # Calculate token usage (rough estimation)
@@ -1008,6 +1029,7 @@ def create_app(config_file):
             messages = [{"role": msg.role, "content": _content_to_text(msg.content)} for msg in request.messages]
             if request.system is not None:
                 messages = [{"role": "system", "content": _content_to_text(request.system)}] + messages
+            chat_template_kwargs = {"tools": request.tools, "tool_choice": request.tool_choice}
 
             settings = map_claude_to_eole_settings(request)
             await server.maybe_load_model(resolved_model_id)
@@ -1017,7 +1039,7 @@ def create_app(config_file):
                 if not model_obj.loaded:
                     model_obj.load()
 
-                chat_input = model_obj.apply_chat_template(messages)
+                chat_input = model_obj.apply_chat_template(messages, **chat_template_kwargs)
                 message_id = f"msg_{uuid.uuid4().hex[:8]}"
                 input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
 
@@ -1095,6 +1117,7 @@ def create_app(config_file):
                 inputs=messages,
                 settings=settings,
                 is_chat=True,
+                chat_template_kwargs=chat_template_kwargs,
             )
 
             completion_text = preds[0][0] if preds and preds[0] else ""
