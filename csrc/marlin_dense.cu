@@ -3,17 +3,12 @@
  * Adapted from gptqmodel/gptqmodel_ext/marlin/gptq_marlin.cu (Apache-2.0).
  * Original: https://github.com/ModelCloud/GPTQModel
  *
- * The dense path uses the unified Marlin<> kernel from marlin_unified.h with
- * is_moe=false.  The 6 MoE routing parameters (sorted_token_ids_ptr, etc.)
- * are present in the kernel signature but are passed as nullptr/0 by the
- * launcher and are never accessed (if constexpr(is_moe) elides them).
- * Rows of A are addressed directly and sequentially, eliminating per-call
- * tensor allocations and routing kernel overhead.
+ * The dense path uses the unified Marlin<> kernel (is_moe=false).  The 6 MoE
+ * routing parameters are present in the signature but are passed as nullptr/0
+ * and are never accessed – if constexpr(is_moe==false) elides them entirely.
  */
 
-#define MARLIN_NAMESPACE_NAME marlin_dense
-#include "eole_scalar_type.hpp"
-#include "marlin_dense_template.h"   // marlin.cuh, marlin_dtypes.cuh, dequant.h, marlin_mma.h at global scope
+#include "marlin_kernel.h"   // deps + MARLIN_KERNEL_PARAMS + namespace marlin { Marlin<> }
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -23,30 +18,7 @@
 #include <optional>
 #include <type_traits>
 
-// ── Kernel parameters macro – global scope ────────────────────────────────────
-// Defined before the namespace (matches marlin_moe_wna16.cu style).
-// The 6 MoE routing params are present to satisfy the unified Marlin<>
-// signature; the launcher passes nullptr/0 and if constexpr(is_moe==false)
-// elides all access.
-#define MARLIN_KERNEL_PARAMS                                                   \
-  const int4* __restrict__ A, const int4* __restrict__ B,                     \
-      int4* __restrict__ C, int4* __restrict__ C_tmp,                         \
-      const int4* __restrict__ b_bias_ptr,                                     \
-      const float* __restrict__ a_scales_ptr,                                  \
-      const int4* __restrict__ scales_ptr,                                     \
-      const uint16_t* __restrict__ global_scale_ptr,                           \
-      const int4* __restrict__ zp_ptr, const int* __restrict__ g_idx,         \
-      const int32_t* __restrict__ sorted_token_ids_ptr,                        \
-      const int32_t* __restrict__ expert_ids_ptr,                              \
-      const int32_t* __restrict__ num_tokens_past_padded_ptr,                  \
-      const float* __restrict__ topk_weights_ptr,                              \
-      int top_k, bool mul_topk_weights,                                        \
-      int num_groups, int prob_m, int prob_n, int prob_k, int* locks,          \
-      bool has_bias, bool use_atomic_add, bool use_fp32_reduce
-
-// ── Single namespace – kernel template + helpers + dispatch table ─────────────
-namespace marlin_dense {
-#include "marlin_unified.h"
+namespace marlin {
 
 __global__ void permute_cols_kernel(
     int4 const* __restrict__ a_int4_ptr,
@@ -55,8 +27,6 @@ __global__ void permute_cols_kernel(
     int size_m, int size_k, int lda, int block_rows);
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
-
-__global__ void MarlinDefault(MARLIN_KERNEL_PARAMS) {}
 
 // ── ScalarTypeId constants ────────────────────────────────────────────────────
 // Defined once in eole_scalar_type.hpp (namespace vllm); imported here.
@@ -169,7 +139,7 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
 }
 
 // ── Kernel selection ──────────────────────────────────────────────────────────
-// The Marlin<> template in marlin_dense_template.h takes ScalarTypeId non-type
+// The Marlin<> template from marlin_kernel.h takes ScalarTypeId non-type
 // parameters (a_type_id, b_type_id, c_type_id, s_type_id, ...).
 // We enumerate instantiations via MATCH/K macros (same style as MoE dispatch).
 
@@ -185,7 +155,7 @@ MarlinFuncPtr get_marlin_kernel(
    m8==(M8_) && group_blocks==(GB_) && is_zp_float==(ZPF_))
 
 #define K(A,B,C,S,TH,TM_,TN_,TK_,M8_,GB_,ZPF_) \
-  Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, pipe_stages, GB_, ZPF_, false>
+  Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, pipe_stages, GB_, ZPF_, /*is_moe=*/false>
 
   // ── FP16 weight types ────────────────────────────────────────────────────
   // uint4b8  (symmetric 4-bit), fp16 activations
@@ -314,7 +284,7 @@ MarlinFuncPtr get_marlin_kernel(
 #undef ENUMERATE_U8B128_BF16
 #undef ENUMERATE_U4_FP16_ZP
 
-  return MarlinDefault;
+  return nullptr;
 }
 
 // ── Exec config selection ─────────────────────────────────────────────────────
@@ -348,7 +318,7 @@ exec_config_t determine_exec_config(
                                     th.num_threads, thread_m_blocks,
                                     th.thread_n / 16, th.thread_k / 16,
                                     m_block_size_8, group_blocks, is_zp_float);
-    if (kernel == MarlinDefault) continue;
+    if (kernel == nullptr) continue;
     return {1, th};
   }
   return best;
@@ -455,7 +425,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp,
                                     thread_n_blocks, thread_k_blocks,
                                     m_block_size_8, group_blocks, is_zp_float);
 
-    TORCH_CHECK(kernel != MarlinDefault,
+    TORCH_CHECK(kernel != nullptr,
                 "Unsupported dense Marlin shape MNK=[", prob_m, ",", prob_n,
                 ",", prob_k, "]");
 
@@ -520,7 +490,7 @@ __global__ void permute_cols_kernel(
   }
 }
 
-}  // namespace marlin_dense
+}  // namespace marlin
 
 // ── Host entry point ──────────────────────────────────────────────────────────
 
@@ -543,7 +513,7 @@ torch::Tensor gptq_marlin_gemm(
     bool                                    use_atomic_add,
     bool                                    use_fp32_reduce,
     bool                                    is_zp_float) {
-  using namespace marlin_dense;
+  using namespace marlin;
 
   vllm::ScalarType b_q_type = vllm::ScalarType::from_id(b_q_type_id);
   int pack_factor = 32 / b_q_type.size_bits();
@@ -634,7 +604,7 @@ torch::Tensor gptq_marlin_gemm(
 
   auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
-  marlin_dense::marlin_mm(
+  marlin::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       has_bias  ? b_bias.data_ptr()   : nullptr,
       b_scales.data_ptr(),

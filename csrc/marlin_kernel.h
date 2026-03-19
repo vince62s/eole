@@ -1,32 +1,211 @@
 /*
- * marlin_unified.h – unified Marlin<> GEMM kernel (MoE and dense).
+ * marlin_kernel.h – single Marlin GEMM kernel header (MoE and dense).
  *
- * This file is included INSIDE namespace MARLIN_NAMESPACE_NAME:
- *   - MoE path: via the #else branch of marlin_template.h
- *   - Dense path: directly from the single namespace block in marlin_dense.cu
- * It must NOT open a namespace of its own or add include guards; the enclosing
- * namespace is provided by the caller.
- *
- * The unified Marlin<> kernel adds one boolean template parameter:
- *
- *   const bool is_moe
- *     true  → MoE path: expects sorted_token_ids_ptr / expert_ids_ptr /
- *               num_tokens_past_padded_ptr / topk_weights_ptr / top_k /
- *               mul_topk_weights to carry valid data; does expert routing
- *               and optional topk weight scaling.
- *     false → Dense path: the 6 MoE routing parameters are present in the
- *               kernel signature (required by the unified MARLIN_KERNEL_PARAMS
- *               macro) but are NEVER accessed – all MoE-specific code paths
- *               are guarded by `if constexpr (is_moe)` and elided by the
- *               compiler at zero runtime cost.
+ * Replaces marlin_template.h, marlin_dense_template.h, marlin_helpers.h,
+ * and marlin_unified.h.  Both marlin_moe_wna16.cu and marlin_dense.cu
+ * include this header and open a single "namespace marlin {}" for their
+ * dispatch code.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Adapted from https://github.com/IST-DASLab/marlin
  */
-// Device helper functions (ldsm, scale, scale_and_sub, sub_zp, scale4,
-// scale_float, barrier_acquire, barrier_release, wait_negative_and_add)
-// are shared with the dense kernel via marlin_helpers.h.
-#include "marlin_helpers.h"
+
+#pragma once
+
+// ── Dependencies (global scope) ───────────────────────────────────────────────
+// These headers also open/close "namespace marlin" for constants and types
+// (default MARLIN_NAMESPACE_NAME = marlin from marlin.cuh).
+#include "eole_scalar_type.hpp"
+#include "quantization/marlin/marlin.cuh"
+#include "quantization/marlin/marlin_dtypes.cuh"
+#include "quantization/marlin/dequant.h"
+#include "quantization/marlin/marlin_mma.h"
+
+#define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
+  static_assert(std::is_same<scalar_t, half>::value ||          \
+                    std::is_same<scalar_t, nv_bfloat16>::value, \
+                "only float16 and bfloat16 is supported");
+
+// ── Kernel parameter list ─────────────────────────────────────────────────────
+// Shared by both the MoE (is_moe=true) and dense (is_moe=false) Marlin<>
+// instantiations.  The 6 MoE routing parameters are passed as nullptr/0 by
+// the dense launcher; all MoE-specific code paths are guarded by
+// `if constexpr (is_moe)` and elided at zero runtime cost.
+#define MARLIN_KERNEL_PARAMS                                                   \
+  const int4* __restrict__ A, const int4* __restrict__ B,                     \
+      int4* __restrict__ C, int4* __restrict__ C_tmp,                         \
+      const int4* __restrict__ b_bias_ptr,                                     \
+      const float* __restrict__ a_scales_ptr,                                  \
+      const int4* __restrict__ scales_ptr,                                     \
+      const uint16_t* __restrict__ global_scale_ptr,                           \
+      const int4* __restrict__ zp_ptr, const int* __restrict__ g_idx,         \
+      const int32_t* __restrict__ sorted_token_ids_ptr,                        \
+      const int32_t* __restrict__ expert_ids_ptr,                              \
+      const int32_t* __restrict__ num_tokens_past_padded_ptr,                  \
+      const float* __restrict__ topk_weights_ptr,                              \
+      int top_k, bool mul_topk_weights,                                        \
+      int num_groups, int prob_m, int prob_n, int prob_k, int* locks,          \
+      bool has_bias, bool use_atomic_add, bool use_fp32_reduce
+
+// ── namespace marlin – device helpers + unified Marlin<> kernel template ──────
+namespace marlin {
+
+// Instruction for loading a full 16x16 matrix fragment of operand A from shared
+// memory, directly in tensor core layout.
+template <int count, vllm::ScalarTypeId type_id>
+__device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
+                            const void* smem_ptr) {
+  uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  if constexpr (count == 4) {
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+        : "r"(smem));
+  } else if constexpr (count == 2) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(a[0]), "=r"(a[1])
+                 : "r"(smem));
+  } else if constexpr (count == 1) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];\n"
+                 : "=r"(a[0])
+                 : "r"(smem));
+  } else {
+    static_assert(count == 1 || count == 2 || count == 4, "invalid count");
+  }
+}
+
+// Multiply dequantized values by the corresponding quantization scale; used
+// only for grouped quantization.
+template <vllm::ScalarTypeId type_id>
+__device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
+                             typename MarlinScalarType<type_id>::FragS& frag_s,
+                             int i) {
+  using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
+  using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
+  scalar_t2 s = MarlinScalarType<type_id>::num2num2(
+      reinterpret_cast<scalar_t*>(&frag_s)[i]);
+  frag_b[0] = __hmul2(frag_b[0], s);
+  frag_b[1] = __hmul2(frag_b[1], s);
+}
+
+template <vllm::ScalarTypeId type_id>
+__device__ inline void scale_and_sub(
+    typename MarlinScalarType<type_id>::FragB& frag_b,
+    typename MarlinScalarType<type_id>::scalar_t s,
+    typename MarlinScalarType<type_id>::scalar_t zp) {
+  using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
+  using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
+  scalar_t2 s2 = MarlinScalarType<type_id>::num2num2(s);
+  scalar_t2 zp2 = MarlinScalarType<type_id>::num2num2(zp);
+  frag_b[0] = __hfma2(frag_b[0], s2, __hneg2(zp2));
+  frag_b[1] = __hfma2(frag_b[1], s2, __hneg2(zp2));
+}
+
+template <vllm::ScalarTypeId type_id>
+__device__ inline void sub_zp(
+    typename MarlinScalarType<type_id>::FragB& frag_b,
+    typename MarlinScalarType<type_id>::scalar_t2& frag_zp, int i) {
+  using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
+  using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
+  scalar_t2 zp = MarlinScalarType<type_id>::num2num2(
+      reinterpret_cast<scalar_t*>(&frag_zp)[i]);
+  frag_b[0] = __hsub2(frag_b[0], zp);
+  frag_b[1] = __hsub2(frag_b[1], zp);
+}
+
+// Same as above, but for act_order (each K is multiplied individually)
+template <vllm::ScalarTypeId type_id>
+__device__ inline void scale4(
+    typename MarlinScalarType<type_id>::FragB& frag_b,
+    typename MarlinScalarType<type_id>::FragS& frag_s_1,
+    typename MarlinScalarType<type_id>::FragS& frag_s_2,
+    typename MarlinScalarType<type_id>::FragS& frag_s_3,
+    typename MarlinScalarType<type_id>::FragS& frag_s_4, int i) {
+  using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
+  using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
+
+  scalar_t2 s_val_1_2;
+  s_val_1_2.x = reinterpret_cast<scalar_t*>(&frag_s_1)[i];
+  s_val_1_2.y = reinterpret_cast<scalar_t*>(&frag_s_2)[i];
+
+  scalar_t2 s_val_3_4;
+  s_val_3_4.x = reinterpret_cast<scalar_t*>(&frag_s_3)[i];
+  s_val_3_4.y = reinterpret_cast<scalar_t*>(&frag_s_4)[i];
+
+  frag_b[0] = __hmul2(frag_b[0], s_val_1_2);
+  frag_b[1] = __hmul2(frag_b[1], s_val_3_4);
+}
+
+// Given 2 floats multiply by 2 scales (halves)
+template <vllm::ScalarTypeId type_id>
+__device__ inline void scale_float(
+    float* c, typename MarlinScalarType<type_id>::FragS& s) {
+  using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
+  scalar_t* s_ptr = reinterpret_cast<scalar_t*>(&s);
+  c[0] = __fmul_rn(c[0], MarlinScalarType<type_id>::num2float(s_ptr[0]));
+  c[1] = __fmul_rn(c[1], MarlinScalarType<type_id>::num2float(s_ptr[1]));
+}
+
+// Wait until barrier reaches `count`, then lock for current threadblock.
+__device__ inline void barrier_acquire(int* lock, int count) {
+  if (threadIdx.x == 0) {
+    int state = -1;
+    do
+      // Guarantee that subsequent writes by this threadblock will be visible
+      // globally.
+      asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
+                   : "=r"(state)
+                   : "l"(lock));
+    while (state != count);
+  }
+  __syncthreads();
+}
+
+// Release barrier and increment visitation count.
+__device__ inline void barrier_release(int* lock, bool reset = false) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (reset) {
+      lock[0] = 0;
+      return;
+    }
+    int val = 1;
+    // Make sure that all writes since acquiring this barrier are visible
+    // globally, while releasing the barrier.
+    asm volatile("fence.acq_rel.gpu;\n");
+    asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
+                 :
+                 : "l"(lock), "r"(val));
+  }
+}
+
+// Wait until value of lock to be negative, and then add 1
+__device__ inline void wait_negative_and_add(int* lock) {
+  if (threadIdx.x == 0) {
+    int state = 0;
+    do
+      // Guarantee that subsequent writes by this threadblock will be visible
+      // globally.
+      asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
+                   : "=r"(state)
+                   : "l"(lock));
+    while (state >= 0);
+    atomicAdd(lock, 1);
+  }
+  __syncthreads();
+}
 
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const vllm::ScalarTypeId b_type_id,  // B ScalarType id
@@ -2102,3 +2281,5 @@ __global__ void Marlin(
   }
 }
 
+
+}  // namespace marlin
