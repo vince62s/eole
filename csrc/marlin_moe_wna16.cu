@@ -14,6 +14,7 @@
  */
 
 #include "marlin_kernel.h"   // deps + MARLIN_KERNEL_PARAMS + namespace marlin { Marlin<> }
+#include "marlin_kernel_shapes.h"
 #include "marlin_type_ids.h"
 
 #include <mutex>
@@ -309,47 +310,22 @@ MarlinFuncPtr get_marlin_kernel(
 #define K(A,B,C,S,TH,TM_,TN_,TK_,M8_) \
   Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, /*stages=*/4, /*group_blocks=*/8, /*is_zp_float=*/false, /*is_moe=*/true>
 
+#define DISPATCH_CASE(A,B,C,S,TH,TM_,TN_,TK_,M8_) \
+  if (MATCH(A,B,C,S,TH,TM_,TN_,TK_,M8_)) return K(A,B,C,S,TH,TM_,TN_,TK_,M8_);
+
   // fp16 + uint4b8
   if (a_id==FP16_ID && b_id==U4B8_ID && c_id==FP16_ID && s_id==FP16_ID) {
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,1,8,8,true))  return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,1,8,8,true);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,8,4,true))  return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,8,4,true);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,4,8,true))  return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,4,8,true);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,1,8,8,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,1,8,8,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,8,4,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,8,4,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,4,8,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,1,4,8,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,2,16,4,false))return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,2,16,4,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,2,8,4,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,2,8,4,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,2,4,8,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,2,4,8,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,3,16,4,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,3,16,4,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,3, 8,4,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,3, 8,4,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,3, 4,8,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,3, 4,8,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,4,16,4,false))return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,256,4,16,4,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,4,8,4,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,4,8,4,false);
-    if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,4,4,8,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,128,4,4,8,false);
-
+    MARLIN_FOR_EACH_SHAPE(DISPATCH_CASE)
   }
 
   // bfloat16 + uint4b8
   if (a_id==BF16_ID && b_id==U4B8_ID && c_id==BF16_ID && s_id==BF16_ID) {
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,1,8,8,true))  return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,1,8,8,true);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,8,4,true))  return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,8,4,true);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,4,8,true))  return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,4,8,true);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,1,8,8,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,1,8,8,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,8,4,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,8,4,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,4,8,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,1,4,8,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,2,16,4,false))return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,2,16,4,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,2,8,4,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,2,8,4,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,2,4,8,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,2,4,8,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,3,16,4,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,3,16,4,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,3, 8,4,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,3, 8,4,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,3, 4,8,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,3, 4,8,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,4,16,4,false))return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,256,4,16,4,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,4,8,4,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,4,8,4,false);
-    if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,4,4,8,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,128,4,4,8,false);
+    MARLIN_FOR_EACH_SHAPE(DISPATCH_CASE)
   }
 
 #undef MATCH
 #undef K
+#undef DISPATCH_CASE
   return nullptr;
 }
 
