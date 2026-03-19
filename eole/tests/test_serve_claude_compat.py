@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 
 import yaml
 
+MOCK_SCORE = -0.1
+
 
 def _install_stub_modules():
     """Install lightweight module stubs required to import serve.py."""
@@ -186,7 +188,11 @@ def _install_stub_modules():
     _stub("eole.bin", bin_mod)
 
     logging_mod = types.ModuleType("eole.utils.logging")
-    logging_mod.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None, error=lambda *args, **kwargs: None)
+
+    def _noop(*args, **kwargs):
+        return None
+
+    logging_mod.logger = types.SimpleNamespace(info=_noop, error=_noop)
     _stub("eole.utils.logging", logging_mod)
 
     constants_mod = types.ModuleType("eole.constants")
@@ -258,7 +264,7 @@ class TestClaudeServeCompatibility(unittest.TestCase):
     def test_v1_messages_non_streaming(self):
         app = self.serve.create_app(self.config_path)
         endpoint = app.routes[("POST", "/v1/messages")]
-        infer_mock = AsyncMock(return_value=([[-0.1]], [["Hello Claude"]]))
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello Claude"]]))
 
         with patch.object(self.serve.Model, "infer_async", infer_mock):
             request = self.serve.ClaudeMessagesRequest(
@@ -294,7 +300,7 @@ class TestClaudeServeCompatibility(unittest.TestCase):
     def test_v1_messages_normalizes_sep_token(self):
         app = self.serve.create_app(self.config_path)
         endpoint = app.routes[("POST", "/v1/messages")]
-        infer_mock = AsyncMock(return_value=([[-0.1]], [[f"line1{self.serve.DefaultTokens.SEP}line2"]]))
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [[f"line1{self.serve.DefaultTokens.SEP}line2"]]))
 
         with patch.object(self.serve.Model, "infer_async", infer_mock):
             request = self.serve.ClaudeMessagesRequest(
@@ -325,7 +331,7 @@ class TestClaudeServeCompatibility(unittest.TestCase):
     def test_openai_non_streaming_normalizes_sep_token(self):
         app = self.serve.create_app(self.config_path)
         endpoint = app.routes[("POST", "/v1/chat/completions")]
-        infer_mock = AsyncMock(return_value=([[-0.1]], [[f"hello{self.serve.DefaultTokens.SEP}world"]]))
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [[f"hello{self.serve.DefaultTokens.SEP}world"]]))
 
         with patch.object(self.serve.Model, "infer_async", infer_mock):
             request = self.serve.OpenAIChatRequest(
