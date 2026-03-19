@@ -1,0 +1,310 @@
+"""Unit tests for Claude-compatible serve endpoint."""
+
+import asyncio
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import yaml
+
+
+def _install_stub_modules():
+    """Install lightweight module stubs required to import serve.py."""
+    previous_modules = {}
+
+    def _stub(name, module):
+        previous_modules[name] = sys.modules.get(name)
+        sys.modules[name] = module
+
+    # --- pydantic ---
+    pydantic_mod = types.ModuleType("pydantic")
+
+    class BaseModel:
+        model_config = {}
+
+        def __init__(self, **kwargs):
+            annotations = {}
+            for cls in reversed(self.__class__.__mro__):
+                annotations.update(getattr(cls, "__annotations__", {}))
+            for field_name in annotations:
+                if field_name in kwargs:
+                    setattr(self, field_name, kwargs[field_name])
+                elif hasattr(self.__class__, field_name):
+                    setattr(self, field_name, getattr(self.__class__, field_name))
+                else:
+                    setattr(self, field_name, None)
+            for k, v in kwargs.items():
+                if k not in annotations:
+                    setattr(self, k, v)
+
+        def model_dump(self):
+            def _convert(value):
+                if isinstance(value, BaseModel):
+                    return value.model_dump()
+                if isinstance(value, list):
+                    return [_convert(v) for v in value]
+                if isinstance(value, dict):
+                    return {k: _convert(v) for k, v in value.items()}
+                return value
+
+            return {k: _convert(v) for k, v in self.__dict__.items()}
+
+        def model_dump_json(self):
+            return json.dumps(self.model_dump())
+
+    def ConfigDict(**kwargs):
+        return kwargs
+
+    def Field(default=None, **kwargs):
+        return default
+
+    def model_validator(*args, **kwargs):
+        def _decorator(fn):
+            return fn
+
+        return _decorator
+
+    pydantic_mod.BaseModel = BaseModel
+    pydantic_mod.ConfigDict = ConfigDict
+    pydantic_mod.Field = Field
+    pydantic_mod.model_validator = model_validator
+    _stub("pydantic", pydantic_mod)
+
+    # --- fastapi ---
+    fastapi_mod = types.ModuleType("fastapi")
+
+    class FastAPI:
+        def __init__(self, **kwargs):
+            self.routes = {}
+
+        def get(self, path, **kwargs):
+            def _decorator(fn):
+                self.routes[("GET", path)] = fn
+                return fn
+
+            return _decorator
+
+        def post(self, path, **kwargs):
+            def _decorator(fn):
+                self.routes[("POST", path)] = fn
+                return fn
+
+            return _decorator
+
+    class Request:
+        def __init__(self, url="http://localhost/"):
+            self.url = url
+
+    def Body(*args, **kwargs):
+        return None
+
+    fastapi_mod.FastAPI = FastAPI
+    fastapi_mod.Request = Request
+    fastapi_mod.Body = Body
+    _stub("fastapi", fastapi_mod)
+
+    fastapi_responses_mod = types.ModuleType("fastapi.responses")
+
+    class HTMLResponse:
+        def __init__(self, content, status_code=200):
+            self.content = content
+            self.status_code = status_code
+
+    class StreamingResponse:
+        def __init__(self, content, media_type=None, headers=None):
+            self.content = content
+            self.media_type = media_type
+            self.headers = headers or {}
+
+    class JSONResponse:
+        def __init__(self, status_code=200, content=None):
+            self.status_code = status_code
+            self.content = content or {}
+
+    fastapi_responses_mod.HTMLResponse = HTMLResponse
+    fastapi_responses_mod.StreamingResponse = StreamingResponse
+    fastapi_responses_mod.JSONResponse = JSONResponse
+    _stub("fastapi.responses", fastapi_responses_mod)
+
+    # --- runtime deps used by serve.py ---
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = types.SimpleNamespace(empty_cache=lambda: None)
+    _stub("torch", torch_mod)
+
+    uvicorn_mod = types.ModuleType("uvicorn")
+    uvicorn_mod.run = lambda **kwargs: None
+    _stub("uvicorn", uvicorn_mod)
+
+    eole_mod = types.ModuleType("eole")
+    eole_mod.__version__ = "test"
+    _stub("eole", eole_mod)
+
+    inference_engine_mod = types.ModuleType("eole.inference_engine")
+
+    class InferenceEnginePY:
+        def __init__(self, config):
+            self.config = config
+
+    inference_engine_mod.InferenceEnginePY = InferenceEnginePY
+    _stub("eole.inference_engine", inference_engine_mod)
+
+    config_run_mod = types.ModuleType("eole.config.run")
+
+    class PredictConfig:
+        def __init__(self, **kwargs):
+            self.chat_template = kwargs.get("chat_template", "{{ messages }}")
+
+    config_run_mod.PredictConfig = PredictConfig
+    _stub("eole.config.run", config_run_mod)
+
+    config_inference_mod = types.ModuleType("eole.config.inference")
+
+    class DecodingConfig(BaseModel):
+        pass
+
+    config_inference_mod.DecodingConfig = DecodingConfig
+    _stub("eole.config.inference", config_inference_mod)
+
+    bin_mod = types.ModuleType("eole.bin")
+
+    class BaseBin:
+        pass
+
+    def register_bin(name):
+        def _decorator(cls):
+            return cls
+
+        return _decorator
+
+    bin_mod.BaseBin = BaseBin
+    bin_mod.register_bin = register_bin
+    _stub("eole.bin", bin_mod)
+
+    logging_mod = types.ModuleType("eole.utils.logging")
+    logging_mod.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None, error=lambda *args, **kwargs: None)
+    _stub("eole.utils.logging", logging_mod)
+
+    constants_mod = types.ModuleType("eole.constants")
+    constants_mod.DefaultTokens = types.SimpleNamespace(SEP="<sep>")
+    _stub("eole.constants", constants_mod)
+
+    return previous_modules
+
+
+def _restore_modules(previous_modules):
+    for name, previous in previous_modules.items():
+        if previous is None:
+            del sys.modules[name]
+        else:
+            sys.modules[name] = previous
+
+
+def _import_serve_module():
+    """Import serve.py with dependency stubs."""
+    serve_path = os.path.join(os.path.dirname(__file__), "..", "bin", "run", "serve.py")
+    spec = importlib.util.spec_from_file_location("eole_test_serve", serve_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestClaudeServeCompatibility(unittest.TestCase):
+    def setUp(self):
+        self._previous_modules = _install_stub_modules()
+        self.serve = _import_serve_module()
+        fd, self.config_path = tempfile.mkstemp(suffix=".yaml")
+        os.close(fd)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                {
+                    "models_root": ".",
+                    "models": [
+                        {
+                            "id": "test-model",
+                            "path": "dummy/path",
+                            "preload": False,
+                            "config": {},
+                        }
+                    ],
+                },
+                f,
+            )
+
+    def tearDown(self):
+        if os.path.exists(self.config_path):
+            os.remove(self.config_path)
+        _restore_modules(self._previous_modules)
+
+    def test_map_claude_settings(self):
+        request = self.serve.ClaudeMessagesRequest(
+            model="test-model",
+            messages=[self.serve.ClaudeMessage(role="user", content="hello")],
+            temperature=0.2,
+            top_p=0.8,
+            max_tokens=42,
+            stop_sequences=["END"],
+        )
+        settings = self.serve.map_claude_to_eole_settings(request)
+        self.assertEqual(settings["temperature"], 0.2)
+        self.assertEqual(settings["top_p"], 0.8)
+        self.assertEqual(settings["max_length"], 42)
+        self.assertEqual(settings["stop"], ["END"])
+
+    def test_v1_messages_non_streaming(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[-0.1]], [["Hello Claude"]]))
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                system="You are a helper",
+                messages=[
+                    self.serve.ClaudeMessage(
+                        role="user",
+                        content=[self.serve.ClaudeContentBlock(type="text", text="Hi")],
+                    )
+                ],
+                max_tokens=16,
+                temperature=0.5,
+                top_p=0.9,
+                stream=False,
+            )
+            response = asyncio.run(endpoint(request))
+
+        payload = response.model_dump()
+        self.assertEqual(payload["type"], "message")
+        self.assertEqual(payload["role"], "assistant")
+        self.assertEqual(payload["content"][0]["type"], "text")
+        self.assertEqual(payload["content"][0]["text"], "Hello Claude")
+        self.assertIn("input_tokens", payload["usage"])
+        self.assertIn("output_tokens", payload["usage"])
+
+        infer_kwargs = infer_mock.await_args.kwargs
+        self.assertTrue(infer_kwargs["is_chat"])
+        self.assertEqual(infer_kwargs["inputs"][0], {"role": "system", "content": "You are a helper"})
+        self.assertEqual(infer_kwargs["inputs"][1], {"role": "user", "content": "Hi"})
+        self.assertEqual(infer_kwargs["settings"]["max_length"], 16)
+
+    def test_anthropic_path_model_not_found(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/anthropic/v1/messages")]
+        request = self.serve.ClaudeMessagesRequest(
+            model="missing-model",
+            messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+            max_tokens=8,
+        )
+        response = asyncio.run(endpoint(request))
+        self.assertEqual(response.status_code, 404)
+        payload = response.content
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "not_found_error")
+
+
+if __name__ == "__main__":
+    unittest.main()

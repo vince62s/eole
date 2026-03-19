@@ -152,6 +152,33 @@ class OpenAIChatRequest(BaseModel):
     user: Optional[str] = None
 
 
+class ClaudeContentBlock(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    type: str = "text"
+    text: Optional[str] = None
+
+
+class ClaudeMessage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    role: Literal["user", "assistant"]
+    content: Union[str, List[ClaudeContentBlock]]
+
+
+class ClaudeMessagesRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    messages: List[ClaudeMessage]
+    system: Optional[Union[str, List[ClaudeContentBlock]]] = None
+    max_tokens: Optional[int] = None
+    stop_sequences: Optional[List[str]] = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = None
+    stream: Optional[bool] = False
+
+
 class OpenAIUsage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
@@ -221,6 +248,27 @@ class OpenAIStreamChunk(BaseModel):
     choices: List[OpenAIStreamChoice]
 
 
+class ClaudeUsage(BaseModel):
+    input_tokens: int
+    output_tokens: int
+
+
+class ClaudeResponseContent(BaseModel):
+    type: Literal["text"] = "text"
+    text: str
+
+
+class ClaudeMessageResponse(BaseModel):
+    id: str
+    type: Literal["message"] = "message"
+    role: Literal["assistant"] = "assistant"
+    content: List[ClaudeResponseContent]
+    model: str
+    stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence"]] = "end_turn"
+    stop_sequence: Optional[str] = None
+    usage: ClaudeUsage
+
+
 def map_openai_to_eole_settings(openai_request: OpenAIChatRequest) -> dict:
     """
     Map OpenAI parameters to Eole settings.
@@ -247,6 +295,38 @@ def map_openai_to_eole_settings(openai_request: OpenAIChatRequest) -> dict:
     # You can add custom mappings if your engine supports similar features
 
     return settings
+
+
+def map_claude_to_eole_settings(claude_request: ClaudeMessagesRequest) -> dict:
+    """
+    Map Claude parameters to Eole settings.
+    """
+    settings = {}
+
+    if claude_request.temperature is not None:
+        settings["temperature"] = claude_request.temperature
+
+    if claude_request.top_p is not None:
+        settings["top_p"] = claude_request.top_p
+
+    if claude_request.max_tokens is not None:
+        settings["max_length"] = claude_request.max_tokens
+
+    if claude_request.stop_sequences:
+        settings["stop"] = claude_request.stop_sequences
+
+    return settings
+
+
+def _content_to_text(content: Optional[Union[str, List[Any]]]) -> str:
+    """
+    Normalize API message content payloads into plain text.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") if isinstance(p, dict) else getattr(p, "text", str(p)) for p in content)
+    return str(content)
 
 
 def estimate_tokens(text: str) -> int:
@@ -845,14 +925,7 @@ def create_app(config_file):
             # Calculate token usage (rough estimation)
             # content can be None (tool-call-only message) or a list (multipart);
             # normalise to plain text for token counting.
-            def _content_as_str(c):
-                if c is None:
-                    return ""
-                if isinstance(c, list):
-                    return " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
-                return str(c)
-
-            prompt_text = " ".join([_content_as_str(msg.content) for msg in request.messages])
+            prompt_text = " ".join([_content_to_text(msg.content) for msg in request.messages])
             prompt_tokens = estimate_tokens(prompt_text)
             completion_text = preds[0][0] if preds and preds[0] else ""
             completion_tokens = estimate_tokens(completion_text)
@@ -886,6 +959,143 @@ def create_app(config_file):
             return JSONResponse(
                 status_code=500,
                 content={"error": {"message": str(e), "type": "internal_error", "code": "internal_error"}},
+            )
+
+    @app.post("/v1/messages", response_model=ClaudeMessageResponse)
+    @app.post("/anthropic/v1/messages", response_model=ClaudeMessageResponse)  # Alternative path
+    async def claude_messages(request: ClaudeMessagesRequest):
+        """
+        Claude-compatible messages endpoint.
+        """
+        try:
+            model_id = request.model
+            if model_id not in server.models:
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "type": "error",
+                        "error": {"type": "not_found_error", "message": f"model '{model_id}' not found"},
+                    },
+                )
+
+            messages = [{"role": msg.role, "content": _content_to_text(msg.content)} for msg in request.messages]
+            if request.system is not None:
+                messages = [{"role": "system", "content": _content_to_text(request.system)}] + messages
+
+            settings = map_claude_to_eole_settings(request)
+            await server.maybe_load_model(model_id)
+
+            if request.stream:
+                model_obj = server.models[model_id]
+                if not model_obj.loaded:
+                    model_obj.load()
+
+                chat_input = model_obj.apply_chat_template(messages)
+                message_id = f"msg_{uuid.uuid4().hex[:8]}"
+                input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
+
+                async def _stream_sse():
+                    loop = asyncio.get_event_loop()
+                    chunk_queue: asyncio.Queue = asyncio.Queue()
+
+                    import concurrent.futures
+
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+                    def _produce():
+                        try:
+                            for chunk in model_obj.engine.infer_list_stream(chat_input, settings=settings):
+                                loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
+                        except Exception as exc:  # noqa: BLE001
+                            loop.call_soon_threadsafe(chunk_queue.put_nowait, exc)
+                        finally:
+                            loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
+
+                    executor.submit(_produce)
+
+                    start_payload = {
+                        "type": "message_start",
+                        "message": {
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": model_id,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                        },
+                    }
+                    yield f"event: message_start\ndata: {json.dumps(start_payload)}\n\n"
+                    yield (
+                        "event: content_block_start\n"
+                        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                    )
+
+                    output_text = ""
+                    while True:
+                        item = await chunk_queue.get()
+                        if item is None:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        output_text += item
+                        delta_payload = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": item},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(delta_payload)}\n\n"
+
+                    output_tokens = estimate_tokens(output_text)
+                    yield 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                    message_delta_payload = {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": output_tokens},
+                    }
+                    yield f"event: message_delta\ndata: {json.dumps(message_delta_payload)}\n\n"
+                    yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+                return StreamingResponse(
+                    _stream_sse(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+
+            scores, preds = await server.models[model_id].infer_async(
+                inputs=messages,
+                settings=settings,
+                is_chat=True,
+            )
+
+            completion_text = preds[0][0] if preds and preds[0] else ""
+            input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
+            output_tokens = estimate_tokens(completion_text)
+
+            return ClaudeMessageResponse(
+                id=f"msg_{uuid.uuid4().hex[:8]}",
+                type="message",
+                role="assistant",
+                content=[ClaudeResponseContent(type="text", text=completion_text)],
+                model=model_id,
+                stop_reason="end_turn",
+                stop_sequence=None,
+                usage=ClaudeUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+            )
+
+        except Exception as e:
+            logger.error(f"Error in Claude messages endpoint: {e}")
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(e)},
+                },
             )
 
     return app
