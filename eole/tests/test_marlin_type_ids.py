@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CSRC = ROOT / "csrc"
+CSRC = ROOT / "csrc" / "quantization" / "marlin"
 
 
 def test_marlin_type_ids_header_contains_expected_aliases():
