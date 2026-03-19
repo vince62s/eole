@@ -206,7 +206,7 @@ def _restore_modules(previous_modules):
 
 def _import_serve_module():
     """Import serve.py with dependency stubs."""
-    serve_path = os.path.join(os.path.dirname(__file__), "..", "bin", "run", "serve.py")
+    serve_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin", "run", "serve.py"))
     spec = importlib.util.spec_from_file_location("eole_test_serve", serve_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
