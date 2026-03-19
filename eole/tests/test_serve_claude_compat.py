@@ -421,6 +421,46 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         self.assertEqual(infer_kwargs["chat_template_kwargs"]["tools"], tools)
         self.assertEqual(infer_kwargs["chat_template_kwargs"]["tool_choice"], tool_choice)
 
+    def test_openai_logs_request_and_response_payloads(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/chat/completions")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello OpenAI"]]))
+
+        with (
+            patch.object(self.serve.Model, "infer_async", infer_mock),
+            patch.object(self.serve.logger, "info") as info_mock,
+        ):
+            request = self.serve.OpenAIChatRequest(
+                model="test-model",
+                messages=[self.serve.OpenAIMessage(role="user", content="Hi")],
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        logged_lines = [call.args[0] for call in info_mock.call_args_list]
+        self.assertTrue(any(line.startswith("OpenAI request: ") for line in logged_lines))
+        self.assertTrue(any(line.startswith("OpenAI response: ") for line in logged_lines))
+
+    def test_claude_logs_request_and_response_payloads(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello Claude"]]))
+
+        with (
+            patch.object(self.serve.Model, "infer_async", infer_mock),
+            patch.object(self.serve.logger, "info") as info_mock,
+        ):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        logged_lines = [call.args[0] for call in info_mock.call_args_list]
+        self.assertTrue(any(line.startswith("Claude request: ") for line in logged_lines))
+        self.assertTrue(any(line.startswith("Claude response: ") for line in logged_lines))
+
     def test_apply_chat_template_supports_generation_block(self):
         model = self.serve.Model(
             model_id="test-model",

@@ -381,6 +381,23 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def _log_json_payload(label: str, payload: Any):
+    """
+    Best-effort JSON logging for request/response payload debugging.
+    """
+    try:
+        if hasattr(payload, "model_dump"):
+            try:
+                serializable = payload.model_dump(mode="json")
+            except TypeError:
+                serializable = payload.model_dump()
+        else:
+            serializable = payload
+        logger.info(f"{label}: {json.dumps(serializable, ensure_ascii=False)}")
+    except Exception as exc:
+        logger.info(f"{label}: <unserializable payload: {exc}>")
+
+
 class Server(object):
     """
     Main server class to manage configuration, models and corresponding constraints.
@@ -844,11 +861,12 @@ def create_app(config_file):
         for OpenAI or other LLM APIs.
         """
         try:
+            _log_json_payload("OpenAI request", request)
             # Check if n > 1 (multiple completions not supported in simple implementation)
             if request.n > 1:
                 from fastapi.responses import JSONResponse
 
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=400,
                     content={
                         "error": {
@@ -858,6 +876,8 @@ def create_app(config_file):
                         }
                     },
                 )
+                _log_json_payload("OpenAI response", response.content)
+                return response
 
             # Convert OpenAI messages to the format expected by your engine
             messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
@@ -871,7 +891,7 @@ def create_app(config_file):
             if resolved_model_id is None:
                 from fastapi.responses import JSONResponse
 
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=404,
                     content={
                         "error": {
@@ -881,6 +901,8 @@ def create_app(config_file):
                         }
                     },
                 )
+                _log_json_payload("OpenAI response", response.content)
+                return response
 
             await server.maybe_load_model(resolved_model_id)
 
@@ -895,6 +917,15 @@ def create_app(config_file):
                 chat_input = model_obj.apply_chat_template(messages, **chat_template_kwargs)
                 completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
                 created_ts = int(time.time())
+                _log_json_payload(
+                    "OpenAI response",
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "model": response_model_id,
+                        "stream": True,
+                    },
+                )
 
                 async def _stream_sse():
                     """Async generator that yields SSE-formatted data lines."""
@@ -1021,16 +1052,19 @@ def create_app(config_file):
                 ),
             )
 
+            _log_json_payload("OpenAI response", response)
             return response
 
         except Exception as e:
             logger.error(f"Error in OpenAI chat endpoint: {e}")
             from fastapi.responses import JSONResponse
 
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=500,
                 content={"error": {"message": str(e), "type": "internal_error", "code": "internal_error"}},
             )
+            _log_json_payload("OpenAI response", response.content)
+            return response
 
     @app.post("/v1/messages", response_model=ClaudeMessageResponse)
     @app.post("/anthropic/v1/messages", response_model=ClaudeMessageResponse)  # Alternative path
@@ -1039,17 +1073,20 @@ def create_app(config_file):
         Claude-compatible messages endpoint.
         """
         try:
+            _log_json_payload("Claude request", request)
             resolved_model_id, response_model_id = _resolve_model_id(server, request.model)
             if resolved_model_id is None:
                 from fastapi.responses import JSONResponse
 
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=404,
                     content={
                         "type": "error",
                         "error": {"type": "not_found_error", "message": f"model '{request.model}' not found"},
                     },
                 )
+                _log_json_payload("Claude response", response.content)
+                return response
 
             messages = [{"role": msg.role, "content": _content_to_text(msg.content)} for msg in request.messages]
             if request.system is not None:
@@ -1067,6 +1104,10 @@ def create_app(config_file):
                 chat_input = model_obj.apply_chat_template(messages, **chat_template_kwargs)
                 message_id = f"msg_{uuid.uuid4().hex[:8]}"
                 input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
+                _log_json_payload(
+                    "Claude response",
+                    {"id": message_id, "type": "message_start", "model": response_model_id, "stream": True},
+                )
 
                 async def _stream_sse():
                     loop = asyncio.get_event_loop()
@@ -1150,7 +1191,7 @@ def create_app(config_file):
             input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
             output_tokens = estimate_tokens(completion_text)
 
-            return ClaudeMessageResponse(
+            response = ClaudeMessageResponse(
                 id=f"msg_{uuid.uuid4().hex[:8]}",
                 type="message",
                 role="assistant",
@@ -1160,18 +1201,22 @@ def create_app(config_file):
                 stop_sequence=None,
                 usage=ClaudeUsage(input_tokens=input_tokens, output_tokens=output_tokens),
             )
+            _log_json_payload("Claude response", response)
+            return response
 
         except Exception as e:
             logger.error(f"Error in Claude messages endpoint: {e}")
             from fastapi.responses import JSONResponse
 
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=500,
                 content={
                     "type": "error",
                     "error": {"type": "api_error", "message": str(e)},
                 },
             )
+            _log_json_payload("Claude response", response.content)
+            return response
 
     return app
 
