@@ -421,6 +421,33 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         self.assertEqual(infer_kwargs["chat_template_kwargs"]["tools"], tools)
         self.assertEqual(infer_kwargs["chat_template_kwargs"]["tool_choice"], tool_choice)
 
+    def test_apply_chat_template_supports_generation_block(self):
+        model = self.serve.Model(
+            model_id="test-model",
+            model_path="dummy/path",
+            preload=False,
+            models_root=".",
+            pre_config={},
+        )
+        model.config = type("Cfg", (), {"chat_template": "{% for m in messages %}{% generation %}{{ m['content'] }}{% endgeneration %}{% endfor %}"})()
+
+        rendered = model.apply_chat_template([{"role": "user", "content": "hello"}])
+        self.assertEqual(rendered, "hello")
+
+    def test_apply_chat_template_supports_strftime_now_global(self):
+        model = self.serve.Model(
+            model_id="test-model",
+            model_path="dummy/path",
+            preload=False,
+            models_root=".",
+            pre_config={},
+        )
+        model.config = type("Cfg", (), {"chat_template": "{{ strftime_now('%Y') }}"})()
+
+        rendered = model.apply_chat_template([{"role": "user", "content": "hello"}])
+        self.assertEqual(len(rendered), 4)
+        self.assertTrue(rendered.isdigit())
+
 
 if __name__ == "__main__":
     unittest.main()

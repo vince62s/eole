@@ -6,6 +6,7 @@ import gc
 import yaml
 import json
 import uuid
+from datetime import datetime
 from typing import Any, List, Union, Optional, Literal
 
 import torch
@@ -15,6 +16,8 @@ from fastapi import FastAPI, Request, Body
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from jinja2.exceptions import TemplateError
+from jinja2.ext import Extension
+from jinja2 import nodes
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 import asyncio
@@ -32,6 +35,20 @@ CLAUDE_HAIKU_MODEL_ALIAS = "claude-haiku-4-5-20251001"
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
+
+
+class GenerationExtension(Extension):
+    """Pass-through support for HuggingFace chat templates using {% generation %} blocks."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.CallBlock(self.call_method("_render_generation"), [], [], body).set_lineno(lineno)
+
+    def _render_generation(self, caller):
+        return caller()
 
 
 class TextRequest(DecodingConfig):
@@ -632,6 +649,9 @@ class Model(object):
         def raise_exception(message):
             raise TemplateError(message)
 
+        def strftime_now(format_string):
+            return datetime.now().strftime(format_string)
+
         chat_template = self.config.chat_template
         if chat_template is None:
             # Fall back to a standalone chat_template.jinja file in the model
@@ -675,8 +695,13 @@ class Model(object):
                 "Check the model's config.json or chat_template.jinja file."
             )
 
-        jinja_env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        jinja_env = ImmutableSandboxedEnvironment(
+            trim_blocks=True,
+            lstrip_blocks=True,
+            extensions=[GenerationExtension],
+        )
         jinja_env.globals["raise_exception"] = raise_exception
+        jinja_env.globals["strftime_now"] = strftime_now
         template = jinja_env.from_string(chat_template)
         rendered_output = template.render(
             **{
