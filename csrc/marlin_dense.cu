@@ -9,6 +9,7 @@
  */
 
 #include "marlin_kernel.h"   // deps + MARLIN_KERNEL_PARAMS + namespace marlin { Marlin<> }
+#include "marlin_type_ids.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -27,16 +28,6 @@ __global__ void permute_cols_kernel(
     int size_m, int size_k, int lda, int block_rows);
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
-
-// ── ScalarTypeId constants ────────────────────────────────────────────────────
-// Defined once in eole_scalar_type.hpp (namespace vllm); imported here.
-
-using vllm::FP16_ID;
-using vllm::BF16_ID;
-using vllm::U4B8_ID;
-using vllm::U8B128_ID;
-using vllm::U4_ID;
-using vllm::U8_ID;
 
 // ── Thread / exec config ──────────────────────────────────────────────────────
 

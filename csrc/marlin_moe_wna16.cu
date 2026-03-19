@@ -14,17 +14,12 @@
  */
 
 #include "marlin_kernel.h"   // deps + MARLIN_KERNEL_PARAMS + namespace marlin { Marlin<> }
+#include "marlin_type_ids.h"
 
 #include <mutex>
 #include <unordered_map>
 
 namespace marlin {
-
-// ScalarTypeId convenience aliases.
-using vllm::FP16_ID;
-using vllm::BF16_ID;
-using vllm::U4B8_ID;
-using vllm::U8B128_ID;
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
