@@ -344,6 +344,41 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         payload = response.model_dump()
         self.assertEqual(payload["choices"][0]["message"]["content"], "hello\nworld")
 
+    def test_claude_alias_model_id_is_accepted(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello Claude"]]))
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="claude-haiku-4-5-20251001",
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                max_tokens=16,
+                stream=False,
+            )
+            response = asyncio.run(endpoint(request))
+
+        payload = response.model_dump()
+        self.assertEqual(payload["model"], "claude-haiku-4-5-20251001")
+        self.assertEqual(payload["content"][0]["text"], "Hello Claude")
+
+    def test_openai_alias_model_id_is_accepted(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/chat/completions")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello OpenAI"]]))
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.OpenAIChatRequest(
+                model="claude-haiku-4-5-20251001",
+                messages=[self.serve.OpenAIMessage(role="user", content="Hi")],
+                stream=False,
+            )
+            response = asyncio.run(endpoint(request))
+
+        payload = response.model_dump()
+        self.assertEqual(payload["model"], "claude-haiku-4-5-20251001")
+        self.assertEqual(payload["choices"][0]["message"]["content"], "Hello OpenAI")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,8 @@ from eole.bin import register_bin, BaseBin
 from eole.utils.logging import logger
 from eole.constants import DefaultTokens
 
+CLAUDE_HAIKU_MODEL_ALIAS = "claude-haiku-4-5-20251001"
+
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
 
@@ -334,6 +336,20 @@ def _normalize_generated_text(text: str) -> str:
     Normalize model-generated text for API responses.
     """
     return text.replace(DefaultTokens.SEP, "\n")
+
+
+def _resolve_model_id(server, requested_model_id: str):
+    """
+    Resolve an incoming model id to a configured model id.
+    """
+    if requested_model_id in server.models:
+        return requested_model_id, requested_model_id
+
+    if requested_model_id == CLAUDE_HAIKU_MODEL_ALIAS and server.models:
+        fallback_model_id = next(iter(server.models))
+        return fallback_model_id, requested_model_id
+
+    return None, requested_model_id
 
 
 def estimate_tokens(text: str) -> int:
@@ -806,28 +822,28 @@ def create_app(config_file):
             settings = map_openai_to_eole_settings(request)
 
             # Ensure model is loaded
-            model_id = request.model
-            if model_id not in server.models:
+            resolved_model_id, response_model_id = _resolve_model_id(server, request.model)
+            if resolved_model_id is None:
                 from fastapi.responses import JSONResponse
 
                 return JSONResponse(
                     status_code=404,
                     content={
                         "error": {
-                            "message": f"Model '{model_id}' not found",
+                            "message": f"Model '{request.model}' not found",
                             "type": "invalid_request_error",
                             "code": "model_not_found",
                         }
                     },
                 )
 
-            await server.maybe_load_model(model_id)
+            await server.maybe_load_model(resolved_model_id)
 
             # ----------------------------------------------------------------
             # Streaming path
             # ----------------------------------------------------------------
             if request.stream:
-                model_obj = server.models[model_id]
+                model_obj = server.models[resolved_model_id]
                 if not model_obj.loaded:
                     model_obj.load()
 
@@ -865,7 +881,7 @@ def create_app(config_file):
                     first_chunk = OpenAIStreamChunk(
                         id=completion_id,
                         created=created_ts,
-                        model=model_id,
+                        model=response_model_id,
                         choices=[
                             OpenAIStreamChoice(
                                 index=0,
@@ -885,7 +901,7 @@ def create_app(config_file):
                         content_chunk = OpenAIStreamChunk(
                             id=completion_id,
                             created=created_ts,
-                            model=model_id,
+                            model=response_model_id,
                             choices=[
                                 OpenAIStreamChoice(
                                     index=0,
@@ -899,7 +915,7 @@ def create_app(config_file):
                     final_chunk = OpenAIStreamChunk(
                         id=completion_id,
                         created=created_ts,
-                        model=model_id,
+                        model=response_model_id,
                         choices=[
                             OpenAIStreamChoice(
                                 index=0,
@@ -924,7 +940,7 @@ def create_app(config_file):
             # Non-streaming path
             # ----------------------------------------------------------------
             # Run inference using chat mode
-            scores, preds = await server.models[model_id].infer_async(
+            scores, preds = await server.models[resolved_model_id].infer_async(
                 inputs=messages,
                 settings=settings,
                 is_chat=True,
@@ -944,7 +960,7 @@ def create_app(config_file):
                 id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
                 object="chat.completion",
                 created=int(time.time()),
-                model=model_id,
+                model=response_model_id,
                 choices=[
                     OpenAIChoice(
                         index=0,
@@ -977,15 +993,15 @@ def create_app(config_file):
         Claude-compatible messages endpoint.
         """
         try:
-            model_id = request.model
-            if model_id not in server.models:
+            resolved_model_id, response_model_id = _resolve_model_id(server, request.model)
+            if resolved_model_id is None:
                 from fastapi.responses import JSONResponse
 
                 return JSONResponse(
                     status_code=404,
                     content={
                         "type": "error",
-                        "error": {"type": "not_found_error", "message": f"model '{model_id}' not found"},
+                        "error": {"type": "not_found_error", "message": f"model '{request.model}' not found"},
                     },
                 )
 
@@ -994,10 +1010,10 @@ def create_app(config_file):
                 messages = [{"role": "system", "content": _content_to_text(request.system)}] + messages
 
             settings = map_claude_to_eole_settings(request)
-            await server.maybe_load_model(model_id)
+            await server.maybe_load_model(resolved_model_id)
 
             if request.stream:
-                model_obj = server.models[model_id]
+                model_obj = server.models[resolved_model_id]
                 if not model_obj.loaded:
                     model_obj.load()
 
@@ -1031,7 +1047,7 @@ def create_app(config_file):
                             "type": "message",
                             "role": "assistant",
                             "content": [],
-                            "model": model_id,
+                            "model": response_model_id,
                             "stop_reason": None,
                             "stop_sequence": None,
                             "usage": {"input_tokens": input_tokens, "output_tokens": 0},
@@ -1075,7 +1091,7 @@ def create_app(config_file):
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
 
-            scores, preds = await server.models[model_id].infer_async(
+            scores, preds = await server.models[resolved_model_id].infer_async(
                 inputs=messages,
                 settings=settings,
                 is_chat=True,
@@ -1091,7 +1107,7 @@ def create_app(config_file):
                 type="message",
                 role="assistant",
                 content=[ClaudeResponseContent(type="text", text=completion_text)],
-                model=model_id,
+                model=response_model_id,
                 stop_reason="end_turn",
                 stop_sequence=None,
                 usage=ClaudeUsage(input_tokens=input_tokens, output_tokens=output_tokens),
