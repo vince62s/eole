@@ -1,11 +1,11 @@
 /*
  * marlin_unified.h – unified Marlin<> GEMM kernel (MoE and dense).
  *
- * This file is included INSIDE namespace MARLIN_NAMESPACE_NAME, in the
- * #else branch (CUDA_ARCH >= 750) of both marlin_template.h (MoE) and
- * marlin_dense_template.h (dense).  It must NOT open a namespace or add
- * include guards; the enclosing namespace and header guards are provided
- * by the thin wrapper files.
+ * This file is included INSIDE namespace MARLIN_NAMESPACE_NAME:
+ *   - MoE path: via the #else branch of marlin_template.h
+ *   - Dense path: directly from the single namespace block in marlin_dense.cu
+ * It must NOT open a namespace of its own or add include guards; the enclosing
+ * namespace is provided by the caller.
  *
  * The unified Marlin<> kernel adds one boolean template parameter:
  *

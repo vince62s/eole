@@ -13,7 +13,7 @@
 
 #define MARLIN_NAMESPACE_NAME marlin_dense
 #include "eole_scalar_type.hpp"
-#include "marlin_dense_template.h"
+#include "marlin_dense_template.h"   // marlin.cuh, marlin_dtypes.cuh, dequant.h, marlin_mma.h at global scope
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -23,21 +23,12 @@
 #include <optional>
 #include <type_traits>
 
-using marlin_dense::default_threads;
-namespace marlin_dense {
-
-__global__ void permute_cols_kernel(
-    int4 const* __restrict__ a_int4_ptr,
-    int const* __restrict__ perm_int_ptr,
-    int4* __restrict__ out_int4_ptr,
-    int size_m, int size_k, int lda, int block_rows);
-    
-// ── Kernel parameters macro (must match unified Marlin<> signature) ───────────
-// The 6 MoE routing params (sorted_token_ids_ptr … mul_topk_weights) are
-// present here to satisfy the unified function signature; the kernel launcher
-// passes nullptr/0 for them and if constexpr(is_moe==false) elides all access.
-
-#define MARLIN_DENSE_KERNEL_PARAMS                                             \
+// ── Kernel parameters macro – global scope ────────────────────────────────────
+// Defined before the namespace (matches marlin_moe_wna16.cu style).
+// The 6 MoE routing params are present to satisfy the unified Marlin<>
+// signature; the launcher passes nullptr/0 and if constexpr(is_moe==false)
+// elides all access.
+#define MARLIN_KERNEL_PARAMS                                                   \
   const int4* __restrict__ A, const int4* __restrict__ B,                     \
       int4* __restrict__ C, int4* __restrict__ C_tmp,                         \
       const int4* __restrict__ b_bias_ptr,                                     \
@@ -53,9 +44,19 @@ __global__ void permute_cols_kernel(
       int num_groups, int prob_m, int prob_n, int prob_k, int* locks,          \
       bool has_bias, bool use_atomic_add, bool use_fp32_reduce
 
-using MarlinFuncPtr = void (*)(MARLIN_DENSE_KERNEL_PARAMS);
+// ── Single namespace – kernel template + helpers + dispatch table ─────────────
+namespace marlin_dense {
+#include "marlin_unified.h"
 
-__global__ void MarlinDefault(MARLIN_DENSE_KERNEL_PARAMS) {}
+__global__ void permute_cols_kernel(
+    int4 const* __restrict__ a_int4_ptr,
+    int const* __restrict__ perm_int_ptr,
+    int4* __restrict__ out_int4_ptr,
+    int size_m, int size_k, int lda, int block_rows);
+
+using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+
+__global__ void MarlinDefault(MARLIN_KERNEL_PARAMS) {}
 
 // ── ScalarTypeId constants ────────────────────────────────────────────────────
 // Defined once in eole_scalar_type.hpp (namespace vllm); imported here.
