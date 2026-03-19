@@ -310,22 +310,25 @@ MarlinFuncPtr get_marlin_kernel(
 #define K(A,B,C,S,TH,TM_,TN_,TK_,M8_) \
   Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, /*stages=*/4, /*group_blocks=*/8, /*is_zp_float=*/false, /*is_moe=*/true>
 
-#define DISPATCH_CASE(A,B,C,S,TH,TM_,TN_,TK_,M8_) \
-  if (MATCH(A,B,C,S,TH,TM_,TN_,TK_,M8_)) return K(A,B,C,S,TH,TM_,TN_,TK_,M8_);
+#define DISPATCH_U4B8_FP16(TH,TM_,TN_,TK_,M8_) \
+  if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_);
+#define DISPATCH_U4B8_BF16(TH,TM_,TN_,TK_,M8_) \
+  if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,TH,TM_,TN_,TK_,M8_)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,TH,TM_,TN_,TK_,M8_);
 
   // fp16 + uint4b8
   if (a_id==FP16_ID && b_id==U4B8_ID && c_id==FP16_ID && s_id==FP16_ID) {
-    MARLIN_FOR_EACH_SHAPE(DISPATCH_CASE)
+    MARLIN_FOR_EACH_SHAPE(DISPATCH_U4B8_FP16)
   }
 
   // bfloat16 + uint4b8
   if (a_id==BF16_ID && b_id==U4B8_ID && c_id==BF16_ID && s_id==BF16_ID) {
-    MARLIN_FOR_EACH_SHAPE(DISPATCH_CASE)
+    MARLIN_FOR_EACH_SHAPE(DISPATCH_U4B8_BF16)
   }
 
 #undef MATCH
 #undef K
-#undef DISPATCH_CASE
+#undef DISPATCH_U4B8_FP16
+#undef DISPATCH_U4B8_BF16
   return nullptr;
 }
 

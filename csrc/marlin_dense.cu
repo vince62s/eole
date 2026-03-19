@@ -149,14 +149,22 @@ MarlinFuncPtr get_marlin_kernel(
 #define K(A,B,C,S,TH,TM_,TN_,TK_,M8_,GB_,ZPF_) \
   Marlin<A, B, C, S, TH, TM_, TN_, TK_, M8_, pipe_stages, GB_, ZPF_, /*is_moe=*/false>
 
-#define DISPATCH_CASE_WITH_GB(A,B,C,S,TH,TM_,TN_,TK_,M8_,GB_) \
-  if (MATCH(A,B,C,S,TH,TM_,TN_,TK_,M8_,GB_,false)) return K(A,B,C,S,TH,TM_,TN_,TK_,M8_,GB_,false);
+#define DISPATCH_U4B8_FP16(TH,TM_,TN_,TK_,M8_,GB_) \
+  if (MATCH(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_,GB_,false)) return K(FP16_ID,U4B8_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_,GB_,false);
+#define DISPATCH_U4B8_BF16(TH,TM_,TN_,TK_,M8_,GB_) \
+  if (MATCH(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,TH,TM_,TN_,TK_,M8_,GB_,false)) return K(BF16_ID,U4B8_ID,BF16_ID,BF16_ID,TH,TM_,TN_,TK_,M8_,GB_,false);
+#define DISPATCH_U8B128_FP16(TH,TM_,TN_,TK_,M8_,GB_) \
+  if (MATCH(FP16_ID,U8B128_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_,GB_,false)) return K(FP16_ID,U8B128_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_,GB_,false);
+#define DISPATCH_U8B128_BF16(TH,TM_,TN_,TK_,M8_,GB_) \
+  if (MATCH(BF16_ID,U8B128_ID,BF16_ID,BF16_ID,TH,TM_,TN_,TK_,M8_,GB_,false)) return K(BF16_ID,U8B128_ID,BF16_ID,BF16_ID,TH,TM_,TN_,TK_,M8_,GB_,false);
+#define DISPATCH_U4_FP16_ZP(TH,TM_,TN_,TK_,M8_,GB_) \
+  if (MATCH(FP16_ID,U4_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_,GB_,false)) return K(FP16_ID,U4_ID,FP16_ID,FP16_ID,TH,TM_,TN_,TK_,M8_,GB_,false);
 
   // ── FP16 weight types ────────────────────────────────────────────────────
   // uint4b8  (symmetric 4-bit), fp16 activations
   // Group layouts: -1 (per-col), 2, 4, 8 blocks; act-order (gb=0)
 #define ENUMERATE_U4B8_FP16(GB) \
-  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_CASE_WITH_GB, GB)
+  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_U4B8_FP16, GB)
 
   ENUMERATE_U4B8_FP16(-1)
   ENUMERATE_U4B8_FP16(2)
@@ -166,7 +174,7 @@ MarlinFuncPtr get_marlin_kernel(
 
   // ── BF16 weight types ────────────────────────────────────────────────────
 #define ENUMERATE_U4B8_BF16(GB) \
-  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_CASE_WITH_GB, GB)
+  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_U4B8_BF16, GB)
 
   ENUMERATE_U4B8_BF16(-1)
   ENUMERATE_U4B8_BF16(2)
@@ -176,7 +184,7 @@ MarlinFuncPtr get_marlin_kernel(
 
   // ── uint8b128 (symmetric 8-bit) ──────────────────────────────────────────
 #define ENUMERATE_U8B128_FP16(GB) \
-  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_CASE_WITH_GB, GB)
+  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_U8B128_FP16, GB)
 
   ENUMERATE_U8B128_FP16(-1)
   ENUMERATE_U8B128_FP16(2)
@@ -184,7 +192,7 @@ MarlinFuncPtr get_marlin_kernel(
   ENUMERATE_U8B128_FP16(8)
 
 #define ENUMERATE_U8B128_BF16(GB) \
-  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_CASE_WITH_GB, GB)
+  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_U8B128_BF16, GB)
 
   ENUMERATE_U8B128_BF16(-1)
   ENUMERATE_U8B128_BF16(2)
@@ -194,7 +202,7 @@ MarlinFuncPtr get_marlin_kernel(
   // ── Asymmetric (u4 with zero-points, fp16 only / is_zp_float=false) ──────
   // group_blocks=4 is the most common for AWQ/GPTQ asymmetric
 #define ENUMERATE_U4_FP16_ZP(GB) \
-  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_CASE_WITH_GB, GB)
+  MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_U4_FP16_ZP, GB)
 
   ENUMERATE_U4_FP16_ZP(-1)
   ENUMERATE_U4_FP16_ZP(2)
@@ -203,7 +211,11 @@ MarlinFuncPtr get_marlin_kernel(
 
 #undef MATCH
 #undef K
-#undef DISPATCH_CASE_WITH_GB
+#undef DISPATCH_U4B8_FP16
+#undef DISPATCH_U4B8_BF16
+#undef DISPATCH_U8B128_FP16
+#undef DISPATCH_U8B128_BF16
+#undef DISPATCH_U4_FP16_ZP
 #undef ENUMERATE_U4B8_FP16
 #undef ENUMERATE_U4B8_BF16
 #undef ENUMERATE_U8B128_FP16

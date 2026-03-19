@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CSRC = ROOT / "csrc"
 
 
-def test_marlin_type_ids_header_is_single_alias_source():
+def test_marlin_type_ids_header_contains_expected_aliases():
     header = (CSRC / "marlin_type_ids.h").read_text()
     assert "using vllm::FP16_ID;" in header
     assert "using vllm::BF16_ID;" in header
@@ -15,7 +15,7 @@ def test_marlin_type_ids_header_is_single_alias_source():
     assert "using vllm::U8_ID;" in header
 
 
-def test_marlin_cuda_files_include_type_ids_header_without_local_alias_duplication():
+def test_marlin_cuda_files_use_shared_type_ids():
     dense = (CSRC / "marlin_dense.cu").read_text()
     moe = (CSRC / "marlin_moe_wna16.cu").read_text()
 
@@ -47,5 +47,5 @@ def test_marlin_dispatch_shape_list_is_shared_between_dense_and_moe():
     assert '#include "marlin_kernel_shapes.h"' in dense
     assert '#include "marlin_kernel_shapes.h"' in moe
 
-    assert "MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_CASE_WITH_GB, GB)" in dense
-    assert "MARLIN_FOR_EACH_SHAPE(DISPATCH_CASE)" in moe
+    assert "MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_U4B8_FP16, GB)" in dense
+    assert "MARLIN_FOR_EACH_SHAPE(DISPATCH_U4B8_FP16)" in moe
