@@ -49,3 +49,17 @@ def test_marlin_dispatch_shape_list_is_shared_between_dense_and_moe():
 
     assert "MARLIN_FOR_EACH_SHAPE_WITH_GB(DISPATCH_U4B8_FP16, GB)" in dense
     assert "MARLIN_FOR_EACH_SHAPE(DISPATCH_U4B8_FP16)" in moe
+
+
+def test_marlin_related_files_live_under_quantization_marlin():
+    assert (CSRC / "moe_align.cu").exists()
+    assert (CSRC / "eole_scalar_type.hpp").exists()
+
+
+def test_setup_sources_keep_bindings_at_csrc_root_and_marlin_under_quantization():
+    setup_py = (ROOT / "setup.py").read_text()
+    assert '"csrc/quantization/marlin/moe_align.cu"' in setup_py
+    assert '"csrc/quantization/marlin/marlin_repack.cu"' in setup_py
+    assert '"csrc/quantization/marlin/marlin_dense.cu"' in setup_py
+    assert '"csrc/quantization/marlin/marlin_moe_wna16.cu"' in setup_py
+    assert '"csrc/bindings.cpp"' in setup_py
