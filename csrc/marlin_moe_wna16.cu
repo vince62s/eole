@@ -51,11 +51,11 @@
 #include <mutex>
 #include <unordered_map>
 
-// Convenience aliases for ScalarTypeId values
-static constexpr vllm::ScalarTypeId FP16_ID  = vllm::kFloat16.id();
-static constexpr vllm::ScalarTypeId BF16_ID  = vllm::kBFloat16.id();
-static constexpr vllm::ScalarTypeId U4B8_ID  = vllm::kU4B8.id();
-static constexpr vllm::ScalarTypeId U8B128_ID = vllm::kU8B128.id();
+// ScalarTypeId convenience aliases defined once in eole_scalar_type.hpp.
+using vllm::FP16_ID;
+using vllm::BF16_ID;
+using vllm::U4B8_ID;
+using vllm::U8B128_ID;
 
 // Some headers define tile_size / min_thread_n / max_thread_n / min_thread_k /
 // default_threads / div_ceil inside MARLIN_NAMESPACE_NAME; pull them out here.

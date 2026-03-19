@@ -51,13 +51,14 @@ using MarlinFuncPtr = void (*)(MARLIN_DENSE_KERNEL_PARAMS);
 __global__ void MarlinDefault(MARLIN_DENSE_KERNEL_PARAMS) {}
 
 // ── ScalarTypeId constants ────────────────────────────────────────────────────
+// Defined once in eole_scalar_type.hpp (namespace vllm); imported here.
 
-static constexpr vllm::ScalarTypeId FP16_ID   = vllm::kFloat16.id();
-static constexpr vllm::ScalarTypeId BF16_ID   = vllm::kBFloat16.id();
-static constexpr vllm::ScalarTypeId U4B8_ID   = vllm::kU4B8.id();
-static constexpr vllm::ScalarTypeId U8B128_ID = vllm::kU8B128.id();
-static constexpr vllm::ScalarTypeId U4_ID     = vllm::kU4.id();
-static constexpr vllm::ScalarTypeId U8_ID     = vllm::kU8.id();
+using vllm::FP16_ID;
+using vllm::BF16_ID;
+using vllm::U4B8_ID;
+using vllm::U8B128_ID;
+using vllm::U4_ID;
+using vllm::U8_ID;
 
 // ── Thread / exec config ──────────────────────────────────────────────────────
 
