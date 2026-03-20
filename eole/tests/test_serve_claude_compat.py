@@ -314,6 +314,35 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         payload = response.model_dump()
         self.assertEqual(payload["content"][0]["text"], "line1\nline2")
 
+    def test_v1_messages_preserves_multipart_text_exactly(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["ok"]]))
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                messages=[
+                    self.serve.ClaudeMessage(
+                        role="user",
+                        content=[
+                            self.serve.ClaudeContentBlock(type="text", text="\n"),
+                            self.serve.ClaudeContentBlock(type="text", text="\n\n"),
+                            self.serve.ClaudeContentBlock(type="text", text="show me files"),
+                        ],
+                    )
+                ],
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        infer_kwargs = infer_mock.await_args.kwargs
+        self.assertEqual(infer_kwargs["inputs"][0], {"role": "user", "content": "\n\n\nshow me files"})
+
+    def test_content_to_text_handles_dict_content_blocks(self):
+        blocks = [{"type": "text", "text": "a"}, {"type": "tool_result", "content": [{"type": "text", "text": "b"}]}]
+        self.assertEqual(self.serve._content_to_text(blocks), "ab")
+
     def test_anthropic_path_model_not_found(self):
         app = self.serve.create_app(self.config_path)
         endpoint = app.routes[("POST", "/anthropic/v1/messages")]

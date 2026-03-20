@@ -347,8 +347,20 @@ def _content_to_text(content: Optional[Union[str, List[Any]]]) -> str:
     """
     if content is None:
         return ""
+    if hasattr(content, "text"):
+        return str(getattr(content, "text") or "")
+    if hasattr(content, "content"):
+        return _content_to_text(getattr(content, "content"))
+    if isinstance(content, dict):
+        # Claude/OpenAI multipart blocks commonly use {"type": "text", "text": "..."}
+        if "text" in content:
+            return str(content.get("text") or "")
+        # For tool results and nested block payloads, recurse into "content".
+        if "content" in content:
+            return _content_to_text(content.get("content"))
+        return ""
     if isinstance(content, list):
-        return " ".join(p.get("text", "") if isinstance(p, dict) else getattr(p, "text", str(p)) for p in content)
+        return "".join(_content_to_text(p) for p in content)
     return str(content)
 
 
