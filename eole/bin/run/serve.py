@@ -5,6 +5,7 @@ import time
 import gc
 import yaml
 import json
+import re
 import uuid
 from datetime import datetime
 from typing import Any, List, Union, Optional, Literal
@@ -277,8 +278,11 @@ class ClaudeUsage(BaseModel):
 
 
 class ClaudeResponseContent(BaseModel):
-    type: Literal["text"] = "text"
-    text: str
+    type: str = "text"
+    text: Optional[str] = None
+    id: Optional[str] = None
+    name: Optional[str] = None
+    input: Optional[dict] = None
 
 
 class ClaudeMessageResponse(BaseModel):
@@ -380,6 +384,59 @@ def _resolve_tool_choice(tools: Optional[List[dict]], tool_choice: Optional[Unio
     if tools:
         return "auto"
     return None
+
+
+def _parse_claude_response_content(text: str) -> List[dict]:
+    """
+    Parse model output into Claude content blocks.
+    Supports plain text and <tool_use ...>{json}</tool_use> blocks.
+    """
+    normalized = _normalize_generated_text(text or "")
+    if not normalized:
+        return [{"type": "text", "text": ""}]
+
+    pattern = re.compile(r"<tool_use(?P<attrs>[^>]*)>(?P<body>.*?)</tool_use>", re.DOTALL)
+    blocks: List[dict] = []
+    cursor = 0
+
+    def _append_text(value: str):
+        if value:
+            blocks.append({"type": "text", "text": value})
+
+    for match in pattern.finditer(normalized):
+        _append_text(normalized[cursor : match.start()])
+        cursor = match.end()
+
+        attrs = match.group("attrs") or ""
+        body = (match.group("body") or "").strip()
+        attrs_dict = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', attrs))
+
+        parsed_body = None
+        try:
+            parsed_body = json.loads(body)
+        except Exception:
+            parsed_body = None
+
+        tool_name = attrs_dict.get("name")
+        tool_id = attrs_dict.get("id") or f"toolu_{uuid.uuid4().hex[:8]}"
+        tool_input = {}
+        if isinstance(parsed_body, dict):
+            tool_name = parsed_body.get("name", tool_name)
+            tool_id = parsed_body.get("id", tool_id)
+            if isinstance(parsed_body.get("input"), dict):
+                tool_input = parsed_body.get("input") or {}
+            elif "input" in parsed_body:
+                tool_input = {"value": parsed_body.get("input")}
+            else:
+                tool_input = {k: v for k, v in parsed_body.items() if k not in {"name", "id"}}
+
+        if tool_name:
+            blocks.append({"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_input})
+        else:
+            _append_text(match.group(0))
+
+    _append_text(normalized[cursor:])
+    return blocks if blocks else [{"type": "text", "text": normalized}]
 
 
 def _resolve_model_id(server, requested_model_id: str):
@@ -1196,6 +1253,7 @@ def create_app(config_file):
                         yield f"event: content_block_delta\ndata: {json.dumps(delta_payload)}\n\n"
 
                     output_tokens = estimate_tokens(output_text)
+                    content_blocks = _parse_claude_response_content(output_text)
                     content_block_stop_payload = {"type": "content_block_stop", "index": 0}
                     yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop_payload)}\n\n"
                     message_delta_payload = {
@@ -1212,7 +1270,7 @@ def create_app(config_file):
                             "id": message_id,
                             "type": "message",
                             "role": "assistant",
-                            "content": [{"type": "text", "text": output_text}],
+                            "content": content_blocks,
                             "model": response_model_id,
                             "stop_reason": "end_turn",
                             "stop_sequence": None,
@@ -1234,15 +1292,15 @@ def create_app(config_file):
             )
 
             completion_text = preds[0][0] if preds and preds[0] else ""
-            completion_text = _normalize_generated_text(completion_text)
+            content_blocks = _parse_claude_response_content(completion_text)
             input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
-            output_tokens = estimate_tokens(completion_text)
+            output_tokens = estimate_tokens(_normalize_generated_text(completion_text))
 
             response = ClaudeMessageResponse(
                 id=f"msg_{uuid.uuid4().hex[:8]}",
                 type="message",
                 role="assistant",
-                content=[ClaudeResponseContent(type="text", text=completion_text)],
+                content=[ClaudeResponseContent(**block) for block in content_blocks],
                 model=response_model_id,
                 stop_reason="end_turn",
                 stop_sequence=None,

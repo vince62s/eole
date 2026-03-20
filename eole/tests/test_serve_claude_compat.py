@@ -371,6 +371,48 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         blocks = [{"type": "text", "text": "a"}, {"type": "tool_result", "content": [{"type": "text", "text": "b"}]}]
         self.assertEqual(self.serve._content_to_text(blocks), "ab")
 
+    def test_parse_claude_response_content_plain_text(self):
+        blocks = self.serve._parse_claude_response_content("hello")
+        self.assertEqual(blocks, [{"type": "text", "text": "hello"}])
+
+    def test_parse_claude_response_content_with_tool_use(self):
+        rendered = (
+            'before <tool_use id="toolu_123">{"name":"get_weather","input":{"city":"Paris"}}</tool_use> after'
+        )
+        blocks = self.serve._parse_claude_response_content(rendered)
+        self.assertEqual(blocks[0], {"type": "text", "text": "before "})
+        self.assertEqual(blocks[1]["type"], "tool_use")
+        self.assertEqual(blocks[1]["id"], "toolu_123")
+        self.assertEqual(blocks[1]["name"], "get_weather")
+        self.assertEqual(blocks[1]["input"], {"city": "Paris"})
+        self.assertEqual(blocks[2], {"type": "text", "text": " after"})
+
+    def test_v1_messages_non_streaming_parses_tool_use_block(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(
+            return_value=(
+                [[MOCK_SCORE]],
+                [[
+                    '<tool_use id="toolu_123">{"name":"get_weather","input":{"city":"Paris"}}</tool_use>'
+                ]],
+            )
+        )
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                stream=False,
+            )
+            response = asyncio.run(endpoint(request))
+
+        payload = response.model_dump()
+        self.assertEqual(payload["content"][0]["type"], "tool_use")
+        self.assertEqual(payload["content"][0]["id"], "toolu_123")
+        self.assertEqual(payload["content"][0]["name"], "get_weather")
+        self.assertEqual(payload["content"][0]["input"], {"city": "Paris"})
+
     def test_anthropic_path_model_not_found(self):
         app = self.serve.create_app(self.config_path)
         endpoint = app.routes[("POST", "/anthropic/v1/messages")]
