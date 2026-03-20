@@ -360,15 +360,20 @@ class TransformerDecoder(DecoderBase):
             self._compile_decoder()
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
-        self._forward_compile = torch.compile(
-            self._forward_eager,
-            fullgraph=True,
-            dynamic=False,
-            options={
-                "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
-                "triton.cudagraphs": EOLE_COMPILE_MODE == "0",
-            },
-        )
+        # Create the compiled wrapper only once.  Re-calling torch.compile()
+        # on every batch would throw away the previously-captured CUDA graph
+        # for each shape, forcing a new capture (from inside a background
+        # thread where the CUDA-graph TLS is not initialized -> AssertionError).
+        if not hasattr(self, "_forward_compile") or self._forward_compile is None:
+            self._forward_compile = torch.compile(
+                self._forward_eager,
+                fullgraph=True,
+                dynamic=False,
+                options={
+                    "guard_filter_fn": lambda guards: [g.guard_type == "TENSOR_MATCH" for g in guards],
+                    "triton.cudagraphs": EOLE_COMPILE_MODE == "0",
+                },
+            )
 
         if emb is not None and tgt_pad_mask is not None:
             B = self.cache_seqlens.size(0)

@@ -255,6 +255,16 @@ class InferenceEnginePY(InferenceEngine):
         self.transforms = make_transforms(self.config, self.transforms_cls, self.vocabs)
         self.transform_pipe = TransformPipe.build_from(self.transforms.values())
 
+        # Pre-capture CUDA graphs (EOLE_COMPILE_MODE="0") or warm Triton
+        # kernel cache (EOLE_COMPILE_MODE="1") from the main thread.
+        # infer_list_stream runs inference in a background daemon thread where
+        # PyTorch's CUDA-graph TLS is not initialised, which would cause
+        #   AssertionError: torch._C._is_key_in_tls("tree_manager_containers")
+        # on the first request.  Calling warmup_compile() here ensures the
+        # graph is already captured before any background thread is spawned.
+        if hasattr(self.predictor, "warmup_compile"):
+            self.predictor.warmup_compile()
+
     @torch.inference_mode()
     def _predict(
         self, infer_iter, settings: Optional[Dict[str, Any]] = None, streamer=None

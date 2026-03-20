@@ -102,7 +102,49 @@ class GeneratorLM(Inference):
             # at step 0.  No further slicing is needed here.
         return log_probs
 
-    def _predict_batch_with_strategy(self, batch, decode_strategy, streamer=None):
+    def warmup_compile(self):
+        """Pre-initialize CUDA graph infrastructure from the main thread.
+
+        When ``EOLE_COMPILE_MODE=="0"`` (CUDA graphs), the first call to the
+        compiled decoder triggers CUDA graph capture inside PyTorch's
+        ``cudagraph_trees`` module.  That code accesses C++ thread-local
+        storage (TLS) that is only valid in the thread where PyTorch
+        initialised it.  ``infer_list_stream`` runs inference in a daemon
+        background thread where the TLS does not exist, causing::
+
+            AssertionError: torch._C._is_key_in_tls("tree_manager_containers")
+
+        Calling this method during model initialisation (from the main thread)
+        pre-captures the CUDA graph for the single-token decode shape so that
+        background-thread requests find the graph already built and skip the
+        CUDA-graph initialisation entirely.
+
+        Also benefits ``EOLE_COMPILE_MODE=="1"`` by pre-warming the Triton
+        kernel compilation cache before the first real request.
+        """
+        if not EOLE_TORCH_COMPILE or EOLE_COMPILE_MODE not in ["0", "1"]:
+            return
+        if not hasattr(self.model, "decoder") or self.model.decoder is None:
+            return
+
+        decoder = self.model.decoder
+        device = self._dev
+        try:
+            dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            return
+
+        H = decoder.hidden_size
+        # Single sequence, single token — the shape used by the decode loop.
+        dummy_emb = torch.zeros(1, 1, H, device=device, dtype=dtype)
+        dummy_pad_mask = torch.zeros(1, 1, 1, dtype=torch.bool, device=device)
+        decoder.max_length = self.max_length
+        with torch.no_grad():
+            decoder._init_cache(dummy_emb, dummy_pad_mask)
+            decoder._compile_decoder(emb=dummy_emb, tgt_pad_mask=dummy_pad_mask)
+            decoder._disable_cache()
+
+
         """Predict a batch of sentences step by step using cache.
 
         Args:
