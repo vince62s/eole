@@ -596,6 +596,7 @@ class TestClaudeServeCompatibility(unittest.TestCase):
 
         logged_lines = [call.args[0] for call in info_mock.call_args_list]
         self.assertTrue(any(line.startswith("Claude request: ") for line in logged_lines))
+        self.assertTrue(any(line.startswith("Claude raw model response: ") for line in logged_lines))
         self.assertTrue(any(line.startswith("Claude response: ") for line in logged_lines))
 
     def test_claude_stream_logs_structured_start_and_final_response(self):
@@ -621,6 +622,7 @@ class TestClaudeServeCompatibility(unittest.TestCase):
 
         logged_lines = [call.args[0] for call in info_mock.call_args_list]
         self.assertTrue(any('"type": "message_start"' in line for line in logged_lines))
+        self.assertTrue(any(line.startswith("Claude raw model response: ") and '"text": "hello"' in line for line in logged_lines))
         self.assertTrue(any('"type": "message"' in line and '"text": "hello"' in line for line in logged_lines))
 
     def test_apply_chat_template_supports_generation_block(self):

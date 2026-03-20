@@ -1253,6 +1253,7 @@ def create_app(config_file):
                         yield f"event: content_block_delta\ndata: {json.dumps(delta_payload)}\n\n"
 
                     output_tokens = estimate_tokens(output_text)
+                    _log_json_payload("Claude raw model response", {"text": output_text})
                     content_blocks = _parse_claude_response_content(output_text)
                     content_block_stop_payload = {"type": "content_block_stop", "index": 0}
                     yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop_payload)}\n\n"
@@ -1292,6 +1293,7 @@ def create_app(config_file):
             )
 
             completion_text = preds[0][0] if preds and preds[0] else ""
+            _log_json_payload("Claude raw model response", {"text": completion_text})
             content_blocks = _parse_claude_response_content(completion_text)
             input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
             output_tokens = estimate_tokens(_normalize_generated_text(completion_text))
