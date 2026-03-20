@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import re
 import time
 import gc
 import yaml
@@ -219,6 +220,276 @@ class OpenAIStreamChunk(BaseModel):
     created: int
     model: str
     choices: List[OpenAIStreamChoice]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API models
+# ---------------------------------------------------------------------------
+
+
+class AnthropicTextBlock(BaseModel):
+    """Text content block used in Anthropic messages."""
+
+    type: Literal["text"] = "text"
+    text: str
+
+
+class AnthropicToolUseBlock(BaseModel):
+    """Tool use content block (assistant calling a tool)."""
+
+    type: Literal["tool_use"] = "tool_use"
+    id: str
+    name: str
+    input: dict = Field(default_factory=dict)
+
+
+class AnthropicToolResultBlock(BaseModel):
+    """Tool result content block (user providing tool output)."""
+
+    type: Literal["tool_result"] = "tool_result"
+    tool_use_id: str
+    content: Union[str, List[Any]] = ""
+
+
+class AnthropicTool(BaseModel):
+    """Tool definition for the Anthropic API."""
+
+    name: str
+    description: Optional[str] = None
+    input_schema: dict = Field(default_factory=dict)
+
+
+class AnthropicToolChoice(BaseModel):
+    """Tool choice specification for the Anthropic API."""
+
+    type: Literal["auto", "any", "tool"] = "auto"
+    name: Optional[str] = None  # required when type == "tool"
+
+
+class AnthropicInputMessage(BaseModel):
+    """A single message in an Anthropic Messages request."""
+
+    model_config = ConfigDict(extra="allow")
+
+    role: Literal["user", "assistant"]
+    content: Union[str, List[Any]]
+
+
+class AnthropicMessagesRequest(BaseModel):
+    """Anthropic Messages API request."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    messages: List[AnthropicInputMessage]
+    system: Optional[Union[str, List[Any]]] = None
+    max_tokens: int = 1024
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    stop_sequences: Optional[List[str]] = None
+    stream: Optional[bool] = False
+    tools: Optional[List[AnthropicTool]] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
+
+
+class AnthropicUsage(BaseModel):
+    """Token usage in Anthropic response format."""
+
+    input_tokens: int
+    output_tokens: int
+
+
+class AnthropicMessagesResponse(BaseModel):
+    """Anthropic Messages API response."""
+
+    id: str
+    type: Literal["message"] = "message"
+    role: Literal["assistant"] = "assistant"
+    content: List[Any]
+    model: str
+    stop_reason: Optional[str] = None
+    stop_sequence: Optional[str] = None
+    usage: AnthropicUsage
+
+
+# ---------------------------------------------------------------------------
+# Anthropic helper functions
+# ---------------------------------------------------------------------------
+
+_TOOL_USE_SPLIT_RE = re.compile(r"(<tool_use[^>]*>.*?</tool_use>)", re.DOTALL)
+_TOOL_USE_TAG_RE = re.compile(r"<tool_use([^>]*)>(.*?)</tool_use>", re.DOTALL)
+_ATTR_ID_RE = re.compile(r'\bid="([^"]*)"')
+_ATTR_NAME_RE = re.compile(r'\bname="([^"]*)"')
+
+
+def _parse_anthropic_response_content(text: str):
+    """
+    Parse model output text into a list of Anthropic content blocks.
+
+    Detects ``<tool_use id="…" name="…">{json}</tool_use>`` patterns (the
+    format used when a model is prompted via a tools-aware chat template) and
+    converts them to structured ``tool_use`` blocks.  Plain text around those
+    tags becomes ``text`` blocks.
+
+    Returns ``(content_blocks, stop_reason)`` where *stop_reason* is
+    ``"tool_use"`` when at least one tool call was found, otherwise
+    ``"end_turn"``.
+    """
+    blocks = []
+    stop_reason = "end_turn"
+
+    parts = _TOOL_USE_SPLIT_RE.split(text)
+    for part in parts:
+        if not part:
+            continue
+        tag_match = _TOOL_USE_TAG_RE.match(part)
+        if tag_match:
+            attrs, body = tag_match.group(1), tag_match.group(2).strip()
+            id_m = _ATTR_ID_RE.search(attrs)
+            name_m = _ATTR_NAME_RE.search(attrs)
+            tool_id = id_m.group(1) if id_m else f"toolu_{uuid.uuid4().hex[:8]}"
+            tool_name = name_m.group(1) if name_m else ""
+            try:
+                tool_input = json.loads(body)
+            except json.JSONDecodeError:
+                tool_input = {"raw": body}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tool_name,
+                    "input": tool_input,
+                }
+            )
+            stop_reason = "tool_use"
+        else:
+            stripped = part.strip()
+            if stripped:
+                blocks.append({"type": "text", "text": stripped})
+
+    if not blocks:
+        blocks = [{"type": "text", "text": text}]
+    return blocks, stop_reason
+
+
+def _anthropic_messages_to_openai(messages: list, system=None) -> list:
+    """
+    Convert a list of Anthropic-format messages to OpenAI-style messages
+    suitable for ``apply_chat_template``.
+
+    Anthropic content blocks are handled as follows:
+
+    * ``text``        → plain text (concatenated for the same turn)
+    * ``tool_use``    → serialised as ``<tool_use id="…" name="…">{json}</tool_use>``
+                        appended to the assistant turn text so that templates
+                        (and the response parser) can round-trip tool calls.
+    * ``tool_result`` → a separate ``{"role": "tool", …}`` message so that
+                        models with an OpenAI-style tool-result slot receive
+                        the data correctly.
+
+    A top-level *system* prompt (string or list of text blocks) is prepended
+    as a ``{"role": "system", …}`` message.
+    """
+    openai_messages: list = []
+
+    if system is not None:
+        if isinstance(system, str):
+            system_text = system
+        elif isinstance(system, list):
+            system_text = "\n".join(
+                (b.get("text", "") if isinstance(b, dict) else str(b)) for b in system
+            )
+        else:
+            system_text = str(system)
+        openai_messages.append({"role": "system", "content": system_text})
+
+    for msg in messages:
+        role = msg.role if hasattr(msg, "role") else msg.get("role", "user")
+        content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+
+        if isinstance(content, str):
+            openai_messages.append({"role": role, "content": content})
+            continue
+
+        # content is a list of blocks
+        text_parts: list = []
+        pending_tool_results: list = []
+
+        for block in content:
+            if isinstance(block, dict):
+                btype = block.get("type", "text")
+            elif hasattr(block, "type"):
+                btype = block.type
+                block = block.model_dump() if hasattr(block, "model_dump") else vars(block)
+            else:
+                btype = "text"
+                block = {"text": str(block)}
+
+            if btype == "text":
+                text_parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                tool_id = block.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
+                tool_name = block.get("name", "")
+                tool_input = block.get("input", {})
+                text_parts.append(
+                    f'<tool_use id="{tool_id}" name="{tool_name}">'
+                    f"{json.dumps(tool_input)}"
+                    f"</tool_use>"
+                )
+            elif btype == "tool_result":
+                tool_use_id = block.get("tool_use_id", "")
+                tool_content = block.get("content", "")
+                if isinstance(tool_content, list):
+                    tool_content = "\n".join(
+                        (b.get("text", "") if isinstance(b, dict) else str(b))
+                        for b in tool_content
+                    )
+                pending_tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": str(tool_content),
+                    }
+                )
+
+        if text_parts:
+            openai_messages.append({"role": role, "content": "\n".join(text_parts)})
+        openai_messages.extend(pending_tool_results)
+
+    return openai_messages
+
+
+def _anthropic_tools_to_openai(tools: List[AnthropicTool]) -> list:
+    """
+    Convert a list of Anthropic tool definitions to OpenAI function-tool
+    format for use with chat templates that understand OpenAI-style tools.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description or "",
+                "parameters": t.input_schema,
+            },
+        }
+        for t in tools
+    ]
+
+
+def _map_anthropic_to_eole_settings(request: AnthropicMessagesRequest) -> dict:
+    """Map Anthropic request parameters to Eole inference settings."""
+    settings: dict = {}
+    if request.temperature is not None:
+        settings["temperature"] = request.temperature
+    if request.top_p is not None:
+        settings["top_p"] = request.top_p
+    if request.max_tokens is not None:
+        settings["max_length"] = request.max_tokens
+    if request.stop_sequences:
+        settings["stop"] = request.stop_sequences
+    return settings
 
 
 def map_openai_to_eole_settings(openai_request: OpenAIChatRequest) -> dict:
@@ -510,10 +781,15 @@ class Model(object):
         self.loaded = False
         logger.info(f"Unloaded model {self.model_id}")
 
-    def apply_chat_template(self, inputs):
+    def apply_chat_template(self, inputs, tools=None, tool_choice=None):
         """
         Render the model input based on the model chat template
         and the request inputs.
+
+        Optional *tools* (list of OpenAI-style function tool dicts) and
+        *tool_choice* are forwarded as Jinja2 template variables so that
+        models whose templates understand them can emit the appropriate
+        prompting tokens.
         """
 
         def raise_exception(message):
@@ -565,13 +841,16 @@ class Model(object):
         jinja_env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
         jinja_env.globals["raise_exception"] = raise_exception
         template = jinja_env.from_string(chat_template)
-        rendered_output = template.render(
-            **{
-                "messages": inputs,
-                "bos_token": "",  # handled in numericalize
-                "add_generation_prompt": True,
-            }
-        )
+        render_kwargs: dict = {
+            "messages": inputs,
+            "bos_token": "",  # handled in numericalize
+            "add_generation_prompt": True,
+        }
+        if tools is not None:
+            render_kwargs["tools"] = tools
+        if tool_choice is not None:
+            render_kwargs["tool_choice"] = tool_choice
+        rendered_output = template.render(**render_kwargs)
         return rendered_output
 
     async def infer_async(self, inputs, settings={}, is_chat=False):
@@ -886,6 +1165,244 @@ def create_app(config_file):
             return JSONResponse(
                 status_code=500,
                 content={"error": {"message": str(e), "type": "internal_error", "code": "internal_error"}},
+            )
+
+    # -----------------------------------------------------------------------
+    # Anthropic Messages API endpoints
+    # -----------------------------------------------------------------------
+
+    @app.post("/v1/messages", response_model=AnthropicMessagesResponse)
+    @app.post("/anthropic/v1/messages", response_model=AnthropicMessagesResponse)
+    async def anthropic_messages(request: AnthropicMessagesRequest):
+        """
+        Anthropic Messages API compatible endpoint.
+
+        Accepts requests in the `Anthropic Messages API
+        <https://docs.anthropic.com/en/api/messages>`_ format and returns
+        responses in the same format.  Both non-streaming (JSON body) and
+        streaming (SSE) modes are supported.
+
+        Tool calling is handled by converting Anthropic tool definitions to
+        the OpenAI function-tool format understood by most chat templates,
+        and by parsing ``<tool_use id="…" name="…">{json}</tool_use>`` blocks
+        from the model output back into structured ``tool_use`` content blocks.
+        """
+        import concurrent.futures
+        from fastapi.responses import JSONResponse as _JSONResponse
+
+        try:
+            # ----------------------------------------------------------------
+            # Resolve model
+            # ----------------------------------------------------------------
+            model_id = request.model
+            if model_id not in server.models:
+                if server.models:
+                    # Accept any Claude / Anthropic alias and resolve to the
+                    # first configured server model, echoing the alias back in
+                    # the response (mirrors llama.cpp behaviour).
+                    resolved_id = next(iter(server.models))
+                else:
+                    return _JSONResponse(
+                        status_code=404,
+                        content={
+                            "type": "error",
+                            "error": {
+                                "type": "not_found_error",
+                                "message": f"Model '{model_id}' not found",
+                            },
+                        },
+                    )
+            else:
+                resolved_id = model_id
+
+            # ----------------------------------------------------------------
+            # Convert Anthropic messages to OpenAI-style for chat template
+            # ----------------------------------------------------------------
+            openai_messages = _anthropic_messages_to_openai(request.messages, request.system)
+
+            # ----------------------------------------------------------------
+            # Convert tools to OpenAI function-tool format (if provided)
+            # ----------------------------------------------------------------
+            template_tools = None
+            template_tool_choice = None
+            if request.tools:
+                template_tools = _anthropic_tools_to_openai(request.tools)
+                # Default to "auto" when tools are present
+                template_tool_choice = "auto"
+                if request.tool_choice:
+                    tc_type = request.tool_choice.type
+                    if tc_type == "any":
+                        template_tool_choice = "required"
+                    elif tc_type == "tool" and request.tool_choice.name:
+                        template_tool_choice = {
+                            "type": "function",
+                            "function": {"name": request.tool_choice.name},
+                        }
+                    else:
+                        template_tool_choice = tc_type
+
+            # ----------------------------------------------------------------
+            # Map Anthropic parameters to Eole settings
+            # ----------------------------------------------------------------
+            settings = _map_anthropic_to_eole_settings(request)
+
+            await server.maybe_load_model(resolved_id)
+            model_obj = server.models[resolved_id]
+            if not model_obj.loaded:
+                model_obj.load()
+
+            completion_id = f"msg_{uuid.uuid4().hex[:24]}"
+            created_ts = int(time.time())
+
+            # Apply chat template once (shared by both streaming and non-streaming)
+            chat_input = model_obj.apply_chat_template(
+                openai_messages,
+                tools=template_tools,
+                tool_choice=template_tool_choice,
+            )
+
+            # ----------------------------------------------------------------
+            # Streaming path
+            # ----------------------------------------------------------------
+            if request.stream:
+
+                async def _stream_anthropic_sse():
+                    """
+                    Yield Anthropic SSE events.
+
+                    Event sequence (mirrors the real Claude API):
+                      message_start → content_block_start → ping →
+                      content_block_delta* → content_block_stop →
+                      message_delta → message_stop
+                    """
+                    loop = asyncio.get_event_loop()
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    chunk_queue: asyncio.Queue = asyncio.Queue()
+
+                    def _produce():
+                        try:
+                            for chunk in model_obj.engine.infer_list_stream(chat_input, settings=settings):
+                                loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
+                        except Exception as exc:  # noqa: BLE001
+                            loop.call_soon_threadsafe(chunk_queue.put_nowait, exc)
+                        finally:
+                            loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
+
+                    executor.submit(_produce)
+
+                    # message_start
+                    msg_start = {
+                        "type": "message_start",
+                        "message": {
+                            "id": completion_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": model_id,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        },
+                    }
+                    yield f"event: message_start\ndata: {json.dumps(msg_start)}\n\n"
+
+                    # content_block_start (index 0, text block)
+                    cb_start = {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
+
+                    # keepalive ping
+                    yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+
+                    output_tokens = 0
+                    full_text = ""
+                    while True:
+                        item = await chunk_queue.get()
+                        if item is None:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        full_text += item
+                        output_tokens += estimate_tokens(item)
+                        delta = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": item},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+
+                    # content_block_stop
+                    yield (
+                        f"event: content_block_stop\n"
+                        f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                    )
+
+                    # Determine stop reason from accumulated text
+                    _, stop_reason = _parse_anthropic_response_content(full_text)
+
+                    # message_delta
+                    msg_delta = {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                        "usage": {"output_tokens": output_tokens},
+                    }
+                    yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
+
+                    # message_stop
+                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+                return StreamingResponse(
+                    _stream_anthropic_sse(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+
+            # ----------------------------------------------------------------
+            # Non-streaming path
+            # ----------------------------------------------------------------
+            loop = asyncio.get_event_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            scores, _, preds = await loop.run_in_executor(
+                executor,
+                lambda: model_obj.engine.infer_list([chat_input], settings=settings),
+            )
+            raw_text = preds[0][0] if preds and preds[0] else ""
+
+            content_blocks, stop_reason = _parse_anthropic_response_content(raw_text)
+
+            # Rough token estimation
+            prompt_text = " ".join(
+                (m.get("content", "") if isinstance(m, dict) else str(m.get("content", "")))
+                for m in openai_messages
+            )
+            input_tokens = estimate_tokens(prompt_text)
+            output_tokens = estimate_tokens(raw_text)
+
+            response = AnthropicMessagesResponse(
+                id=completion_id,
+                type="message",
+                role="assistant",
+                content=content_blocks,
+                model=model_id,
+                stop_reason=stop_reason,
+                stop_sequence=None,
+                usage=AnthropicUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+            )
+            return response
+
+        except Exception as e:
+            logger.error(f"Error in Anthropic messages endpoint: {e}")
+            from fastapi.responses import JSONResponse as _JSONResponse2
+
+            return _JSONResponse2(
+                status_code=500,
+                content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(e)},
+                },
             )
 
     return app
