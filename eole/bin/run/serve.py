@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import concurrent.futures
+import datetime
 import os
 import re
 import time
@@ -31,6 +33,27 @@ from eole.constants import DefaultTokens
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+_LOG_SEP = "=" * 72
+
+
+def _log_json_payload(label: str, payload) -> None:
+    """Log a labelled JSON payload to the server console.
+
+    *payload* may be a dict/list (serialised to pretty-printed JSON) or a
+    plain string (logged as-is).  The output is clearly delimited so it is
+    easy to find in the server window.
+    """
+    if isinstance(payload, (dict, list)):
+        body = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    else:
+        body = str(payload)
+    logger.info(f"\n{_LOG_SEP}\n{label}\n{_LOG_SEP}\n{body}\n{_LOG_SEP}")
 
 
 class TextRequest(DecodingConfig):
@@ -151,6 +174,8 @@ class OpenAIChatRequest(BaseModel):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict] = None
     user: Optional[str] = None
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
 
 
 class OpenAIUsage(BaseModel):
@@ -322,15 +347,50 @@ _TOOL_USE_TAG_RE = re.compile(r"<tool_use([^>]*)>(.*?)</tool_use>", re.DOTALL)
 _ATTR_ID_RE = re.compile(r'\bid="([^"]*)"')
 _ATTR_NAME_RE = re.compile(r'\bname="([^"]*)"')
 
+# <tool_call> format — used by Hermes/NousResearch and many open-source models
+_TOOL_CALL_SPLIT_RE = re.compile(r"(<tool_call>.*?</tool_call>)", re.DOTALL)
+_TOOL_CALL_BODY_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+
+def _parse_tool_call_block(body: str) -> tuple:
+    """Parse the JSON body of a ``<tool_call>`` block.
+
+    Returns ``(tool_id, tool_name, tool_input)`` where *tool_id* is a
+    generated ID, *tool_name* and *tool_input* are parsed from the JSON.
+    Models that use ``<tool_call>`` typically emit:
+    ``{"name": "fn_name", "arguments": {...}}``
+    """
+    body = body.strip()
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return f"toolu_{uuid.uuid4().hex[:8]}", "", {"raw": body}
+
+    tool_name = data.get("name", data.get("function", ""))
+    # Accept both "arguments" (OpenAI) and "parameters" (some models)
+    tool_input = data.get("arguments", data.get("parameters", data))
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            pass
+    tool_id = f"toolu_{uuid.uuid4().hex[:8]}"
+    return tool_id, tool_name, tool_input
+
 
 def _parse_anthropic_response_content(text: str):
     """
     Parse model output text into a list of Anthropic content blocks.
 
-    Detects ``<tool_use id="…" name="…">{json}</tool_use>`` patterns (the
-    format used when a model is prompted via a tools-aware chat template) and
-    converts them to structured ``tool_use`` blocks.  Plain text around those
-    tags becomes ``text`` blocks.
+    Handles two common tool-call formats emitted by open-source models:
+
+    1. ``<tool_use id="…" name="…">{json}</tool_use>`` — our round-trip
+       format when converting Anthropic → OpenAI messages for the template.
+    2. ``<tool_call>{"name": "…", "arguments": {…}}</tool_call>`` — the
+       standard format used by Hermes/NousResearch, Qwen, Command-R and many
+       other open-source fine-tuned models.
+
+    Plain text around the tags becomes ``text`` blocks.
 
     Returns ``(content_blocks, stop_reason)`` where *stop_reason* is
     ``"tool_use"`` when at least one tool call was found, otherwise
@@ -339,6 +399,37 @@ def _parse_anthropic_response_content(text: str):
     blocks = []
     stop_reason = "end_turn"
 
+    # ---------------------------------------------------------------
+    # Prefer <tool_call> if it appears in the text (most common for
+    # open-source tool-capable models).
+    # ---------------------------------------------------------------
+    if "<tool_call>" in text:
+        parts = _TOOL_CALL_SPLIT_RE.split(text)
+        for part in parts:
+            if not part:
+                continue
+            m = _TOOL_CALL_BODY_RE.match(part)
+            if m:
+                tool_id, tool_name, tool_input = _parse_tool_call_block(m.group(1))
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": tool_input,
+                    }
+                )
+                stop_reason = "tool_use"
+            else:
+                stripped = part.strip()
+                if stripped:
+                    blocks.append({"type": "text", "text": stripped})
+        if blocks:
+            return blocks, stop_reason
+
+    # ---------------------------------------------------------------
+    # Fall back to <tool_use …>…</tool_use> format.
+    # ---------------------------------------------------------------
     parts = _TOOL_USE_SPLIT_RE.split(text)
     for part in parts:
         if not part:
@@ -381,9 +472,9 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
     Anthropic content blocks are handled as follows:
 
     * ``text``        → plain text (concatenated for the same turn)
-    * ``tool_use``    → serialised as ``<tool_use id="…" name="…">{json}</tool_use>``
-                        appended to the assistant turn text so that templates
-                        (and the response parser) can round-trip tool calls.
+    * ``tool_use``    → collected into a ``tool_calls`` array on the assistant
+                        message, matching the OpenAI / HuggingFace chat-template
+                        standard so that tool-aware templates render correctly.
     * ``tool_result`` → a separate ``{"role": "tool", …}`` message so that
                         models with an OpenAI-style tool-result slot receive
                         the data correctly.
@@ -414,6 +505,7 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
 
         # content is a list of blocks
         text_parts: list = []
+        tool_calls: list = []
         pending_tool_results: list = []
 
         for block in content:
@@ -432,10 +524,17 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
                 tool_id = block.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
                 tool_name = block.get("name", "")
                 tool_input = block.get("input", {})
-                text_parts.append(
-                    f'<tool_use id="{tool_id}" name="{tool_name}">'
-                    f"{json.dumps(tool_input)}"
-                    f"</tool_use>"
+                # Use OpenAI tool_calls format so that HF chat templates that
+                # understand tool_calls render the assistant turn correctly.
+                tool_calls.append(
+                    {
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(tool_input, ensure_ascii=False),
+                        },
+                    }
                 )
             elif btype == "tool_result":
                 tool_use_id = block.get("tool_use_id", "")
@@ -453,8 +552,20 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
                     }
                 )
 
-        if text_parts:
+        # Build the message for this turn.  When the assistant made tool calls
+        # the content should be null (or the text prefix if any) and the
+        # tool_calls array should be set.
+        if tool_calls:
+            msg_out: dict = {"role": role}
+            # Include any preceding text as content (or null if none)
+            msg_out["content"] = "\n".join(text_parts) if text_parts else None
+            msg_out["tool_calls"] = tool_calls
+            openai_messages.append(msg_out)
+        elif text_parts:
             openai_messages.append({"role": role, "content": "\n".join(text_parts)})
+        # If only tool_result blocks were present (user turn), there is no
+        # assistant message to add — just the pending tool results below.
+
         openai_messages.extend(pending_tool_results)
 
     return openai_messages
@@ -790,6 +901,14 @@ class Model(object):
         *tool_choice* are forwarded as Jinja2 template variables so that
         models whose templates understand them can emit the appropriate
         prompting tokens.
+
+        HuggingFace template compatibility:
+        - ``strftime_now`` global is available for templates that embed the
+          current date/time (e.g. Llama 3.3).
+        - ``{% generation %}`` blocks are stripped before rendering; they mark
+          where generation starts in HF's ``apply_chat_template`` but are not
+          standard Jinja2 and are not needed for inference.
+        - ``tojson`` filter is provided for templates that serialise objects.
         """
 
         def raise_exception(message):
@@ -838,8 +957,18 @@ class Model(object):
                 "Check the model's config.json or chat_template.jinja file."
             )
 
+        # Strip HuggingFace {% generation %} markers — they are used by the
+        # HF tokenizer library to mark the generation boundary but are not
+        # valid Jinja2 tags and are not needed for inference rendering.
+        chat_template = chat_template.replace("{% generation %}", "")
+
         jinja_env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
         jinja_env.globals["raise_exception"] = raise_exception
+        # HF templates often call strftime_now() to embed the current date.
+        jinja_env.globals["strftime_now"] = datetime.datetime.now().strftime
+        # tojson is a common filter used in HF templates to serialise objects.
+        jinja_env.filters["tojson"] = lambda v, **kw: json.dumps(v, ensure_ascii=False, **kw)
+
         template = jinja_env.from_string(chat_template)
         render_kwargs: dict = {
             "messages": inputs,
@@ -851,6 +980,12 @@ class Model(object):
         if tool_choice is not None:
             render_kwargs["tool_choice"] = tool_choice
         rendered_output = template.render(**render_kwargs)
+
+        _log_json_payload(
+            f"RENDERED PROMPT [{self.model_id}]",
+            rendered_output,
+        )
+
         return rendered_output
 
     async def infer_async(self, inputs, settings={}, is_chat=False):
@@ -976,6 +1111,8 @@ def create_app(config_file):
         for OpenAI or other LLM APIs.
         """
         try:
+            _log_json_payload("INCOMING REQUEST [openai]", request.model_dump())
+
             # Check if n > 1 (multiple completions not supported in simple implementation)
             if request.n > 1:
                 from fastapi.responses import JSONResponse
@@ -1015,6 +1152,10 @@ def create_app(config_file):
 
             await server.maybe_load_model(model_id)
 
+            # Forward tools/tool_choice to the chat template if provided.
+            template_tools = request.tools or None
+            template_tool_choice = request.tool_choice or None
+
             # ----------------------------------------------------------------
             # Streaming path
             # ----------------------------------------------------------------
@@ -1023,17 +1164,17 @@ def create_app(config_file):
                 if not model_obj.loaded:
                     model_obj.load()
 
-                chat_input = model_obj.apply_chat_template(messages)
+                chat_input = model_obj.apply_chat_template(
+                    messages,
+                    tools=template_tools,
+                    tool_choice=template_tool_choice,
+                )
                 completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
                 created_ts = int(time.time())
 
                 async def _stream_sse():
                     """Async generator that yields SSE-formatted data lines."""
                     loop = asyncio.get_event_loop()
-
-                    # Run the synchronous streaming generator in a thread-pool
-                    # executor so it doesn't block the event loop.
-                    import concurrent.futures
 
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
@@ -1067,12 +1208,14 @@ def create_app(config_file):
                     )
                     yield f"data: {first_chunk.model_dump_json()}\n\n"
 
+                    full_text = ""
                     while True:
                         item = await chunk_queue.get()
                         if item is None:
                             break
                         if isinstance(item, Exception):
                             raise item
+                        full_text += item
                         content_chunk = OpenAIStreamChunk(
                             id=completion_id,
                             created=created_ts,
@@ -1085,6 +1228,8 @@ def create_app(config_file):
                             ],
                         )
                         yield f"data: {content_chunk.model_dump_json()}\n\n"
+
+                    _log_json_payload("MODEL RESPONSE [openai stream]", full_text)
 
                     # Final chunk with finish_reason
                     final_chunk = OpenAIStreamChunk(
@@ -1099,7 +1244,9 @@ def create_app(config_file):
                             )
                         ],
                     )
-                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                    final_data = f"data: {final_chunk.model_dump_json()}\n\n"
+                    _log_json_payload("SERVER RESPONSE [openai stream final chunk]", final_chunk.model_dump())
+                    yield final_data
                     yield "data: [DONE]\n\n"
 
                 return StreamingResponse(
@@ -1136,6 +1283,8 @@ def create_app(config_file):
             completion_text = preds[0][0] if preds and preds[0] else ""
             completion_tokens = estimate_tokens(completion_text)
 
+            _log_json_payload("MODEL RESPONSE [openai]", completion_text)
+
             # Build OpenAI-compatible response
             response = OpenAIChatResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -1156,6 +1305,7 @@ def create_app(config_file):
                 ),
             )
 
+            _log_json_payload("SERVER RESPONSE [openai]", response.model_dump())
             return response
 
         except Exception as e:
@@ -1184,13 +1334,14 @@ def create_app(config_file):
 
         Tool calling is handled by converting Anthropic tool definitions to
         the OpenAI function-tool format understood by most chat templates,
-        and by parsing ``<tool_use id="…" name="…">{json}</tool_use>`` blocks
-        from the model output back into structured ``tool_use`` content blocks.
+        and by parsing tool-call blocks from the model output back into
+        structured ``tool_use`` content blocks.
         """
-        import concurrent.futures
         from fastapi.responses import JSONResponse as _JSONResponse
 
         try:
+            _log_json_payload("INCOMING REQUEST [anthropic]", request.model_dump())
+
             # ----------------------------------------------------------------
             # Resolve model
             # ----------------------------------------------------------------
@@ -1219,6 +1370,7 @@ def create_app(config_file):
             # Convert Anthropic messages to OpenAI-style for chat template
             # ----------------------------------------------------------------
             openai_messages = _anthropic_messages_to_openai(request.messages, request.system)
+            _log_json_payload("CONVERTED MESSAGES [anthropic→openai]", openai_messages)
 
             # ----------------------------------------------------------------
             # Convert tools to OpenAI function-tool format (if provided)
@@ -1304,6 +1456,7 @@ def create_app(config_file):
                             "usage": {"input_tokens": 0, "output_tokens": 0},
                         },
                     }
+                    _log_json_payload("SERVER RESPONSE [anthropic stream start]", msg_start)
                     yield f"event: message_start\ndata: {json.dumps(msg_start)}\n\n"
 
                     # content_block_start (index 0, text block)
@@ -1334,6 +1487,8 @@ def create_app(config_file):
                         }
                         yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
 
+                    _log_json_payload("MODEL RESPONSE [anthropic stream]", full_text)
+
                     # content_block_stop
                     yield (
                         f"event: content_block_stop\n"
@@ -1349,6 +1504,7 @@ def create_app(config_file):
                         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                         "usage": {"output_tokens": output_tokens},
                     }
+                    _log_json_payload("SERVER RESPONSE [anthropic stream final]", msg_delta)
                     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
 
                     # message_stop
@@ -1371,6 +1527,8 @@ def create_app(config_file):
             )
             raw_text = preds[0][0] if preds and preds[0] else ""
 
+            _log_json_payload("MODEL RESPONSE [anthropic]", raw_text)
+
             content_blocks, stop_reason = _parse_anthropic_response_content(raw_text)
 
             # Rough token estimation
@@ -1391,6 +1549,7 @@ def create_app(config_file):
                 stop_sequence=None,
                 usage=AnthropicUsage(input_tokens=input_tokens, output_tokens=output_tokens),
             )
+            _log_json_payload("SERVER RESPONSE [anthropic]", response.model_dump())
             return response
 
         except Exception as e:

@@ -228,7 +228,7 @@ class TestAnthropicMessagesToOpenai(unittest.TestCase):
         # Multiple text blocks are joined with '\n' as the separator.
         self.assertEqual(result[0]["content"], "Hello\n world")
 
-    def test_tool_use_block_serialised_in_assistant_message(self):
+    def test_tool_use_block_becomes_tool_calls_on_assistant_message(self):
         content = [
             {"type": "text", "text": "Calling tool."},
             {
@@ -241,9 +241,33 @@ class TestAnthropicMessagesToOpenai(unittest.TestCase):
         msgs = [self._make_msg("assistant", content)]
         result = _anthropic_messages_to_openai(msgs)
         self.assertEqual(len(result), 1)
-        msg_content = result[0]["content"]
-        self.assertIn('<tool_use id="toolu_1" name="my_tool">', msg_content)
-        self.assertIn('"key": "val"', msg_content)
+        msg = result[0]
+        # Text prefix preserved as content
+        self.assertEqual(msg["content"], "Calling tool.")
+        # Tool call in proper OpenAI tool_calls format
+        self.assertIn("tool_calls", msg)
+        tc = msg["tool_calls"][0]
+        self.assertEqual(tc["id"], "toolu_1")
+        self.assertEqual(tc["type"], "function")
+        self.assertEqual(tc["function"]["name"], "my_tool")
+        self.assertEqual(json.loads(tc["function"]["arguments"]), {"key": "val"})
+
+    def test_tool_use_only_assistant_message_content_is_none(self):
+        content = [
+            {
+                "type": "tool_use",
+                "id": "toolu_2",
+                "name": "search",
+                "input": {"q": "python"},
+            },
+        ]
+        msgs = [self._make_msg("assistant", content)]
+        result = _anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(result), 1)
+        msg = result[0]
+        # No text blocks → content should be None
+        self.assertIsNone(msg["content"])
+        self.assertEqual(len(msg["tool_calls"]), 1)
 
     def test_tool_result_becomes_tool_role_message(self):
         content = [
@@ -492,11 +516,15 @@ class TestRoundTripToolCall(unittest.TestCase):
         self.assertEqual(openai_msgs[1]["role"], "user")
         self.assertEqual(openai_msgs[1]["content"], "What's the weather in London?")
 
-        # Assistant turn should have serialised tool_use
+        # Assistant turn: text preserved, tool call in tool_calls array
         asst_msg = openai_msgs[2]
         self.assertEqual(asst_msg["role"], "assistant")
-        self.assertIn("Let me look that up.", asst_msg["content"])
-        self.assertIn('<tool_use id="toolu_abc123" name="get_weather">', asst_msg["content"])
+        self.assertEqual(asst_msg["content"], "Let me look that up.")
+        self.assertIn("tool_calls", asst_msg)
+        tc = asst_msg["tool_calls"][0]
+        self.assertEqual(tc["id"], "toolu_abc123")
+        self.assertEqual(tc["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(tc["function"]["arguments"]), {"location": "London"})
 
         # Tool result message
         tool_msg = openai_msgs[3]
@@ -504,16 +532,159 @@ class TestRoundTripToolCall(unittest.TestCase):
         self.assertEqual(tool_msg["tool_call_id"], "toolu_abc123")
         self.assertEqual(tool_msg["content"], "15°C, partly cloudy")
 
-        # Step 5: parse model output that contains a tool call
-        model_output = (
+        # Step 5: parse model output that uses <tool_call> format (most common
+        # for open-source tool-capable models like Hermes/Qwen/etc.)
+        model_output_tool_call = (
             "Sure!\n"
-            '<tool_use id="toolu_xyz" name="get_weather">{"location": "Paris"}</tool_use>'
+            "<tool_call>\n"
+            '{"name": "get_weather", "arguments": {"location": "Paris"}}\n'
+            "</tool_call>"
         )
-        blocks, stop_reason = _parse_anthropic_response_content(model_output)
+        blocks, stop_reason = _parse_anthropic_response_content(model_output_tool_call)
         self.assertEqual(stop_reason, "tool_use")
         tool_block = next(b for b in blocks if b["type"] == "tool_use")
         self.assertEqual(tool_block["name"], "get_weather")
         self.assertEqual(tool_block["input"]["location"], "Paris")
+
+        # Also verify the <tool_use id="…" name="…"> format still works —
+        # this is the round-trip format we emit when serialising prior Anthropic
+        # tool_use turns back into the conversation history for the next request.
+        model_output_tool_use = (
+            "Sure!\n"
+            '<tool_use id="toolu_xyz" name="get_weather">{"location": "Paris"}</tool_use>'
+        )
+        blocks2, stop_reason2 = _parse_anthropic_response_content(model_output_tool_use)
+        self.assertEqual(stop_reason2, "tool_use")
+        tool_block2 = next(b for b in blocks2 if b["type"] == "tool_use")
+        self.assertEqual(tool_block2["name"], "get_weather")
+        self.assertEqual(tool_block2["input"]["location"], "Paris")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _parse_anthropic_response_content: <tool_call> format
+# ---------------------------------------------------------------------------
+
+
+class TestParseToolCallFormat(unittest.TestCase):
+    """Test parsing of <tool_call> tags used by Hermes/NousResearch models."""
+
+    def test_single_tool_call_block(self):
+        text = '<tool_call>\n{"name": "search", "arguments": {"q": "test"}}\n</tool_call>'
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        self.assertEqual(len(blocks), 1)
+        b = blocks[0]
+        self.assertEqual(b["type"], "tool_use")
+        self.assertEqual(b["name"], "search")
+        self.assertEqual(b["input"]["q"], "test")
+
+    def test_tool_call_with_parameters_key(self):
+        text = '<tool_call>{"name": "fn", "parameters": {"x": 1}}</tool_call>'
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        b = blocks[0]
+        self.assertEqual(b["name"], "fn")
+        self.assertEqual(b["input"]["x"], 1)
+
+    def test_tool_call_with_string_arguments(self):
+        text = '<tool_call>{"name": "fn", "arguments": "{\\"k\\": \\"v\\"}"}</tool_call>'
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        self.assertEqual(blocks[0]["input"]["k"], "v")
+
+    def test_text_before_tool_call(self):
+        text = "I will call the tool.\n<tool_call>{\"name\": \"fn\", \"arguments\": {}}</tool_call>"
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        types = [b["type"] for b in blocks]
+        self.assertIn("text", types)
+        self.assertIn("tool_use", types)
+
+    def test_multiple_tool_call_blocks(self):
+        text = (
+            '<tool_call>{"name": "a", "arguments": {}}</tool_call>'
+            '<tool_call>{"name": "b", "arguments": {}}</tool_call>'
+        )
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        tool_blocks = [b for b in blocks if b["type"] == "tool_use"]
+        self.assertEqual(len(tool_blocks), 2)
+        self.assertEqual(tool_blocks[0]["name"], "a")
+        self.assertEqual(tool_blocks[1]["name"], "b")
+
+    def test_malformed_json_in_tool_call_stored_as_raw(self):
+        text = "<tool_call>not json</tool_call>"
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        b = blocks[0]
+        self.assertEqual(b["name"], "")
+        self.assertIn("raw", b["input"])
+
+    def test_tool_call_takes_precedence_over_tool_use_when_both_present(self):
+        # When <tool_call> is present, the <tool_call> parser is used.
+        text = '<tool_call>{"name": "fn1", "arguments": {}}</tool_call>'
+        blocks, _ = _parse_anthropic_response_content(text)
+        self.assertEqual(blocks[0]["name"], "fn1")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _log_json_payload
+# ---------------------------------------------------------------------------
+
+
+class TestLogJsonPayload(unittest.TestCase):
+    def test_dict_payload_logged_without_error(self):
+        captured = []
+
+        class _FakeLogger:
+            def info(self, msg):
+                captured.append(msg)
+
+        # Monkey-patch the logger on the module
+        original = _serve.logger
+        _serve.logger = _FakeLogger()
+        try:
+            _serve._log_json_payload("TEST LABEL", {"key": "value"})
+        finally:
+            _serve.logger = original
+
+        self.assertEqual(len(captured), 1)
+        self.assertIn("TEST LABEL", captured[0])
+        self.assertIn('"key"', captured[0])
+
+    def test_string_payload_logged_without_error(self):
+        captured = []
+
+        class _FakeLogger:
+            def info(self, msg):
+                captured.append(msg)
+
+        original = _serve.logger
+        _serve.logger = _FakeLogger()
+        try:
+            _serve._log_json_payload("PROMPT", "Hello world prompt text")
+        finally:
+            _serve.logger = original
+
+        self.assertEqual(len(captured), 1)
+        self.assertIn("PROMPT", captured[0])
+        self.assertIn("Hello world prompt text", captured[0])
+
+    def test_list_payload_logged(self):
+        captured = []
+
+        class _FakeLogger:
+            def info(self, msg):
+                captured.append(msg)
+
+        original = _serve.logger
+        _serve.logger = _FakeLogger()
+        try:
+            _serve._log_json_payload("LIST", [1, 2, 3])
+        finally:
+            _serve.logger = original
+
+        self.assertIn("[", captured[0])
 
 
 if __name__ == "__main__":
