@@ -122,7 +122,16 @@ class GeneratorLM(Inference):
         Also benefits ``EOLE_COMPILE_MODE=="1"`` by pre-warming the Triton
         kernel compilation cache before the first real request.
         """
-        if not EOLE_TORCH_COMPILE or EOLE_COMPILE_MODE not in ["0", "1"]:
+        if not EOLE_TORCH_COMPILE or EOLE_COMPILE_MODE != "1":
+            # Mode "0" (CUDA graphs): pre-capturing the graph with dummy tensors
+            # binds it to addresses that are freed immediately afterwards.
+            # When the real request arrives the KV-cache is at different
+            # addresses, forcing a re-capture from the background thread which
+            # still lacks CUDA-graph TLS.  Leave mode "0" to the per-request
+            # warmup in _compile_decoder() (which runs after _init_cache() has
+            # allocated the real tensors), and let the background-thread TLS
+            # initialisation in infer_list_stream handle the recording.
+            # Modes "2"/"3": use per-layer compilation; not handled here.
             return
         if not hasattr(self.model, "decoder") or self.model.decoder is None:
             return
@@ -144,7 +153,7 @@ class GeneratorLM(Inference):
             decoder._compile_decoder(emb=dummy_emb, tgt_pad_mask=dummy_pad_mask)
             decoder._disable_cache()
 
-
+    def _predict_batch_with_strategy(self, batch, decode_strategy, streamer=None):
         """Predict a batch of sentences step by step using cache.
 
         Args:

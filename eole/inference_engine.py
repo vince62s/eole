@@ -338,6 +338,22 @@ class InferenceEnginePY(InferenceEngine):
         exception_holder = []
 
         def _run_inference():
+            # When EOLE_COMPILE_MODE is "0" or "2" (CUDA-graph modes),
+            # PyTorch's cudagraph_trees stores per-device containers in C++
+            # thread-local storage (TLS) under the key
+            # "tree_manager_containers".  The key is only present in the
+            # thread where the CUDA-graph infrastructure was first initialised
+            # (the main thread).  This background thread doesn't have it, so
+            # any attempt to record a new CUDA graph here raises:
+            #   AssertionError: torch._C._is_key_in_tls(
+            #       "tree_manager_containers")
+            # Seeding the TLS with an empty dict lets this thread record graph
+            # nodes on demand, exactly as the main thread would.
+            try:
+                if not torch._C._is_key_in_tls("tree_manager_containers"):
+                    torch._C._set_obj_in_tls("tree_manager_containers", {})
+            except AttributeError:
+                pass  # PyTorch build without _is_key_in_tls / _set_obj_in_tls
             try:
                 infer_iter = self._build_inference_iterator(src=[src])
                 self._predict(infer_iter, settings=settings, streamer=streamer)
