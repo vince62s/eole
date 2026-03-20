@@ -478,6 +478,44 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         self.assertEqual(infer_kwargs["chat_template_kwargs"]["tools"], tools)
         self.assertEqual(infer_kwargs["chat_template_kwargs"]["tool_choice"], tool_choice)
 
+    def test_claude_tools_default_tool_choice_auto_when_missing(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello with tools"]]))
+        tools = [{"name": "Agent", "description": "Run agent", "input_schema": {"type": "object"}}]
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                tools=tools,
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        infer_kwargs = infer_mock.await_args.kwargs
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tools"], tools)
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tool_choice"], "auto")
+
+    def test_openai_tools_default_tool_choice_auto_when_missing(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/chat/completions")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["Hello with tools"]]))
+        tools = [{"type": "function", "function": {"name": "Agent", "parameters": {"type": "object"}}}]
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.OpenAIChatRequest(
+                model="test-model",
+                messages=[self.serve.OpenAIMessage(role="user", content="Hi")],
+                tools=tools,
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        infer_kwargs = infer_mock.await_args.kwargs
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tools"], tools)
+        self.assertEqual(infer_kwargs["chat_template_kwargs"]["tool_choice"], "auto")
+
     def test_openai_logs_request_and_response_payloads(self):
         app = self.serve.create_app(self.config_path)
         endpoint = app.routes[("POST", "/v1/chat/completions")]

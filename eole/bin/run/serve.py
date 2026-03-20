@@ -371,6 +371,17 @@ def _normalize_generated_text(text: str) -> str:
     return text.replace(DefaultTokens.SEP, "\n")
 
 
+def _resolve_tool_choice(tools: Optional[List[dict]], tool_choice: Optional[Union[str, dict]]):
+    """
+    Resolve tool choice defaults for chat templates.
+    """
+    if tool_choice is not None:
+        return tool_choice
+    if tools:
+        return "auto"
+    return None
+
+
 def _resolve_model_id(server, requested_model_id: str):
     """
     Resolve an incoming model id to a configured model id.
@@ -893,7 +904,10 @@ def create_app(config_file):
 
             # Convert OpenAI messages to the format expected by your engine
             messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-            chat_template_kwargs = {"tools": request.tools, "tool_choice": request.tool_choice}
+            chat_template_kwargs = {
+                "tools": request.tools,
+                "tool_choice": _resolve_tool_choice(request.tools, request.tool_choice),
+            }
 
             # Map OpenAI parameters to Eole settings
             settings = map_openai_to_eole_settings(request)
@@ -1103,7 +1117,10 @@ def create_app(config_file):
             messages = [{"role": msg.role, "content": _content_to_text(msg.content)} for msg in request.messages]
             if request.system is not None:
                 messages = [{"role": "system", "content": _content_to_text(request.system)}] + messages
-            chat_template_kwargs = {"tools": request.tools, "tool_choice": request.tool_choice}
+            chat_template_kwargs = {
+                "tools": request.tools,
+                "tool_choice": _resolve_tool_choice(request.tools, request.tool_choice),
+            }
 
             settings = map_claude_to_eole_settings(request)
             await server.maybe_load_model(resolved_model_id)
