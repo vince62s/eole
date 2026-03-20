@@ -360,10 +360,11 @@ class TransformerDecoder(DecoderBase):
             self._compile_decoder()
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
-        # Create the compiled wrapper only once.  Re-calling torch.compile()
-        # on every batch would throw away the previously-captured CUDA graph
-        # for each shape, forcing a new capture (from inside a background
-        # thread where the CUDA-graph TLS is not initialized -> AssertionError).
+        # Create the compiled wrapper when it doesn't exist (model init) or
+        # after _disable_cache() intentionally reset it to None (between
+        # requests) so that the CUDA graph is re-recorded against the newly
+        # allocated KV-cache tensors rather than the freed ones from the
+        # previous request.
         if not hasattr(self, "_forward_compile") or self._forward_compile is None:
             self._forward_compile = torch.compile(
                 self._forward_eager,
@@ -723,3 +724,18 @@ class TransformerDecoder(DecoderBase):
                 layer.self_attn.cache_leftpad = None
                 if layer.context_attn:
                     layer.context_attn.kcache, layer.context_attn.vcache = None, None
+            # Mode 2: per-layer CUDA graphs capture kcache/vcache addresses.
+            # After freeing the cache tensors above, the next _init_cache()
+            # allocates new tensors at different addresses.  Drop the compiled
+            # function so it is recreated—and the CUDA graph re-recorded
+            # against the new addresses—on the next request.
+            if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE == "2":
+                layer._compile_decoder()  # recreates _forward_compile, no warmup
+                layer.compiled_shapes.clear()
+
+        # Mode 0: decoder-level CUDA graphs have the same address-staleness
+        # problem.  Reset _forward_compile so _compile_decoder() creates a
+        # fresh torch.compile wrapper (and a fresh CUDA graph) next request.
+        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE == "0":
+            self._forward_compile = None
+            self.compiled_shapes.clear()
