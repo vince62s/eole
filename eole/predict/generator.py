@@ -97,7 +97,9 @@ class GeneratorLM(Inference):
         if fn_tile is not None:
             log_probs = fn_tile(log_probs)
             self.model.decoder.map_state(fn_tile)
-            log_probs = log_probs[:, -1, :]
+            # log_probs is already [B, vocab_size] because _decode_and_generate
+            # slices dec_out to the last position before the generator forward
+            # at step 0.  No further slicing is needed here.
         return log_probs
 
     def _predict_batch_with_strategy(self, batch, decode_strategy, streamer=None):

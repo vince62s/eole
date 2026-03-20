@@ -592,10 +592,23 @@ class Inference(object):
             attn = dec_attn["std"]
         else:
             attn = None
+
+        # At generation prefill (step=0) the decoder processes the full input
+        # sequence and returns dec_out of shape [B, T, H].  Only the last
+        # position is needed to predict the next token; projecting the full
+        # sequence to vocabulary size would allocate [B, T, vocab_size], which
+        # for a long context (e.g. a 40K-token Claude Code prompt with a 128K-
+        # vocab model in fp16) requires ~10 GiB — triggering OOM before any
+        # token is generated.  Slicing here keeps the intermediate tensor at
+        # [B, 1, H] so that scores and log_probs are always [B, vocab_size].
+        # For scoring (step=None) the full sequence output is intentionally kept
+        # because _score_target gathers log-probs at every target position.
+        if step == 0 and dec_out.dim() == 3 and dec_out.size(1) > 1:
+            dec_out = dec_out[:, -1:, :]
+
         scores = self.model.generator(dec_out.squeeze(1))
         log_probs = log_softmax(scores, dim=-1)  # we keep float16 if FP16
-        # returns [(batch_size x beam_size) , vocab ] when 1 step
-        # or [batch_size, tgt_len, vocab ] when full sentence
+        # returns [(batch_size x beam_size), vocab_size]
         return log_probs, attn
 
     def predict_batch(self, batch, attn_debug, streamer=None):
