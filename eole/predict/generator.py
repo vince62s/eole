@@ -207,6 +207,16 @@ class GeneratorLM(Inference):
         )
         prefill_length = max(src_len.tolist())
 
+        # Ensure the KV cache is large enough for the full prefill AND all new
+        # tokens that will be generated.  _init_cache (called at decode step 0)
+        # sizes the static-shape cache as max(prefill_len, decoder.max_length).
+        # If the prefill already exceeds the configured max_length the cache is
+        # only prefill-sized, leaving no room for generated tokens.  Updating
+        # decoder.max_length here guarantees the upcoming _init_cache call
+        # allocates at least prefill_len + new_tokens slots.
+        required_cache_len = prefill_length + decode_strategy.max_length
+        self.model.decoder.max_length = max(required_cache_len, self.model.decoder.max_length)
+
         # (4) warmup for Torch compile
         # use the current batch to generate the decode graph (B, 1)
         # we need proper set up to run the forward pass of the decoder or decoder layer
@@ -218,7 +228,7 @@ class GeneratorLM(Inference):
             else:
                 emb = self.model.tgt_emb(src, step=0)
             tgt_pad_mask = src.eq(self._tgt_pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
-            self.model.decoder.max_length = self.max_length
+            # decoder.max_length already updated above to cover prefill + new tokens.
             self.model.decoder._init_cache(emb, tgt_pad_mask)
             self.model.decoder.map_state(fn_tile)
             if EOLE_COMPILE_MODE in ["0", "1"]:
