@@ -15,6 +15,11 @@ import yaml
 MOCK_SCORE = -0.1
 
 
+async def _drain_async_generator(gen):
+    async for _ in gen:
+        pass
+
+
 def _install_stub_modules():
     """Install lightweight module stubs required to import serve.py."""
     previous_modules = {}
@@ -339,6 +344,29 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         infer_kwargs = infer_mock.await_args.kwargs
         self.assertEqual(infer_kwargs["inputs"][0], {"role": "user", "content": "\n\n\nshow me files"})
 
+    def test_v1_messages_preserves_system_blocks_exactly(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+        infer_mock = AsyncMock(return_value=([[MOCK_SCORE]], [["ok"]]))
+
+        with patch.object(self.serve.Model, "infer_async", infer_mock):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                system=[
+                    self.serve.ClaudeContentBlock(type="text", text="You are Claude."),
+                    self.serve.ClaudeContentBlock(type="text", text="\nFollow instructions."),
+                ],
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                stream=False,
+            )
+            asyncio.run(endpoint(request))
+
+        infer_kwargs = infer_mock.await_args.kwargs
+        self.assertEqual(
+            infer_kwargs["inputs"][0],
+            {"role": "system", "content": "You are Claude.\nFollow instructions."},
+        )
+
     def test_content_to_text_handles_dict_content_blocks(self):
         blocks = [{"type": "text", "text": "a"}, {"type": "tool_result", "content": [{"type": "text", "text": "b"}]}]
         self.assertEqual(self.serve._content_to_text(blocks), "ab")
@@ -489,6 +517,31 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         logged_lines = [call.args[0] for call in info_mock.call_args_list]
         self.assertTrue(any(line.startswith("Claude request: ") for line in logged_lines))
         self.assertTrue(any(line.startswith("Claude response: ") for line in logged_lines))
+
+    def test_claude_stream_logs_structured_start_and_final_response(self):
+        app = self.serve.create_app(self.config_path)
+        endpoint = app.routes[("POST", "/v1/messages")]
+
+        def fake_load(model_self):
+            model_self.loaded = True
+            model_self.config = type("Cfg", (), {"chat_template": "{{ messages[0]['content'] }}"})()
+            model_self.engine = types.SimpleNamespace(infer_list_stream=lambda _chat_input, settings=None: iter(["hello"]))
+
+        with (
+            patch.object(self.serve.Model, "load", fake_load),
+            patch.object(self.serve.logger, "info") as info_mock,
+        ):
+            request = self.serve.ClaudeMessagesRequest(
+                model="test-model",
+                messages=[self.serve.ClaudeMessage(role="user", content="Hi")],
+                stream=True,
+            )
+            response = asyncio.run(endpoint(request))
+            asyncio.run(_drain_async_generator(response.content))
+
+        logged_lines = [call.args[0] for call in info_mock.call_args_list]
+        self.assertTrue(any('"type": "message_start"' in line for line in logged_lines))
+        self.assertTrue(any('"type": "message"' in line and '"text": "hello"' in line for line in logged_lines))
 
     def test_apply_chat_template_supports_generation_block(self):
         model = self.serve.Model(

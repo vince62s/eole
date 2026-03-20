@@ -1116,10 +1116,6 @@ def create_app(config_file):
                 chat_input = model_obj.apply_chat_template(messages, **chat_template_kwargs)
                 message_id = f"msg_{uuid.uuid4().hex[:8]}"
                 input_tokens = estimate_tokens(" ".join(_content_to_text(m["content"]) for m in messages))
-                _log_json_payload(
-                    "Claude response",
-                    {"id": message_id, "type": "message_start", "model": response_model_id, "stream": True},
-                )
 
                 async def _stream_sse():
                     loop = asyncio.get_event_loop()
@@ -1153,11 +1149,14 @@ def create_app(config_file):
                             "usage": {"input_tokens": input_tokens, "output_tokens": 0},
                         },
                     }
+                    _log_json_payload("Claude response", start_payload)
                     yield f"event: message_start\ndata: {json.dumps(start_payload)}\n\n"
-                    yield (
-                        "event: content_block_start\n"
-                        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
-                    )
+                    content_block_start_payload = {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(content_block_start_payload)}\n\n"
 
                     output_text = ""
                     while True:
@@ -1176,14 +1175,29 @@ def create_app(config_file):
                         yield f"event: content_block_delta\ndata: {json.dumps(delta_payload)}\n\n"
 
                     output_tokens = estimate_tokens(output_text)
-                    yield 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                    content_block_stop_payload = {"type": "content_block_stop", "index": 0}
+                    yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop_payload)}\n\n"
                     message_delta_payload = {
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
                         "usage": {"output_tokens": output_tokens},
                     }
                     yield f"event: message_delta\ndata: {json.dumps(message_delta_payload)}\n\n"
-                    yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                    message_stop_payload = {"type": "message_stop"}
+                    yield f"event: message_stop\ndata: {json.dumps(message_stop_payload)}\n\n"
+                    _log_json_payload(
+                        "Claude response",
+                        {
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": output_text}],
+                            "model": response_model_id,
+                            "stop_reason": "end_turn",
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                        },
+                    )
 
                 return StreamingResponse(
                     _stream_sse(),
