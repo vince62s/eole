@@ -72,15 +72,34 @@ def _post_process_model_output(text: str) -> str:
        i.e. ``DefaultTokens.SEP``) with actual ``\\n`` characters so that
        the text is readable in log output and in the API response.
     2. Strip ``<think>…</think>`` blocks emitted by Qwen3 and other models
-       that run explicit chain-of-thought reasoning.  These blocks contain
-       internal reasoning that is not part of the model's final answer and
-       must not be forwarded to the API client.
+       that run explicit chain-of-thought reasoning.  The reasoning content
+       must not be forwarded to the API client, **but** any ``<tool_call>``
+       or ``<tool_use>`` blocks nested inside a ``<think>`` block are
+       *rescued* first so that tool calls are never silently discarded.
+       Some thinking-mode models (e.g. Qwen3) place the tool call inside
+       the ``<think>`` block rather than after it.
     """
     # Replace internal newline sentinel with real newline
     text = text.replace(DefaultTokens.SEP, "\n")
-    # Strip chain-of-thought thinking blocks
-    text = _THINK_BLOCK_RE.sub("", text)
-    return text.strip()
+
+    # Strip <think>…</think> blocks, but rescue any embedded tool calls so
+    # they are appended to the output after the reasoning is removed.
+    rescued: list = []
+
+    def _strip_think(m: re.Match) -> str:
+        inner = m.group(0)
+        for tc in _TOOL_CALL_SPLIT_RE.findall(inner):
+            rescued.append(tc)
+        for tu in _TOOL_USE_SPLIT_RE.findall(inner):
+            rescued.append(tu)
+        return ""
+
+    text = _THINK_BLOCK_RE.sub(_strip_think, text)
+    text = text.strip()
+    if rescued:
+        extra = "\n".join(rescued)
+        text = f"{text}\n{extra}".strip() if text else extra
+    return text
 
 
 class TextRequest(DecodingConfig):
@@ -1496,7 +1515,9 @@ def create_app(config_file):
                             raise item
                         raw_chunks.append(item)
 
-                    full_text = _post_process_model_output("".join(raw_chunks))
+                    raw_text = "".join(raw_chunks)
+                    _log_json_payload("MODEL RESPONSE [anthropic stream raw]", raw_text)
+                    full_text = _post_process_model_output(raw_text)
                     _log_json_payload("MODEL RESPONSE [anthropic stream]", full_text)
 
                     content_blocks, stop_reason = _parse_anthropic_response_content(full_text)
@@ -1595,7 +1616,9 @@ def create_app(config_file):
                 executor,
                 lambda: model_obj.engine.infer_list([chat_input], settings=settings),
             )
-            raw_text = _post_process_model_output(preds[0][0] if preds and preds[0] else "")
+            raw_text = preds[0][0] if preds and preds[0] else ""
+            _log_json_payload("MODEL RESPONSE [anthropic raw]", raw_text)
+            raw_text = _post_process_model_output(raw_text)
 
             _log_json_payload("MODEL RESPONSE [anthropic]", raw_text)
 

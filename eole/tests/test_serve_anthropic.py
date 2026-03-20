@@ -156,6 +156,59 @@ class TestPostProcessModelOutput(unittest.TestCase):
         self.assertNotIn("<think>", result)
         self.assertIn("<tool_call>", result)
 
+    def test_tool_call_inside_think_block_rescued(self):
+        """Tool call nested inside <think> must be rescued, not discarded."""
+        text = '<think><tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call></think>'
+        result = _post_process_model_output(text)
+        self.assertNotIn("<think>", result)
+        self.assertIn("<tool_call>", result)
+        self.assertIn('"bash"', result)
+
+    def test_tool_call_inside_think_block_with_reasoning(self):
+        """Reasoning text inside <think> is stripped; only tool call survives."""
+        text = (
+            "<think>I need to list the files.\n"
+            '<tool_call>{"name": "bash", "arguments": {"command": "ls -la"}}</tool_call>\n'
+            "</think>"
+        )
+        result = _post_process_model_output(text)
+        self.assertNotIn("<think>", result)
+        self.assertNotIn("I need to list", result)
+        self.assertIn("<tool_call>", result)
+        self.assertIn("ls -la", result)
+
+    def test_tool_use_inside_think_block_rescued(self):
+        """<tool_use> nested inside <think> must also be rescued."""
+        text = '<think><tool_use id="toolu_1" name="fn">{"key": "val"}</tool_use></think>'
+        result = _post_process_model_output(text)
+        self.assertNotIn("<think>", result)
+        self.assertIn("<tool_use", result)
+        self.assertIn('id="toolu_1"', result)
+
+    def test_tool_call_after_think_block_preserved(self):
+        """Tool call that appears after (outside) <think> is preserved normally."""
+        text = (
+            "<think>Let me think.</think>"
+            '<tool_call>{"name": "list_dir", "arguments": {}}</tool_call>'
+        )
+        result = _post_process_model_output(text)
+        self.assertNotIn("<think>", result)
+        self.assertIn("<tool_call>", result)
+
+    def test_text_after_think_combined_with_rescued_tool_call(self):
+        """Text outside think + tool call inside think both appear in result."""
+        text = (
+            "<think>Plan: call bash.</think>"
+            "I will execute:\n"
+            "<think>"
+            '<tool_call>{"name": "bash", "arguments": {"command": "pwd"}}</tool_call>'
+            "</think>"
+        )
+        result = _post_process_model_output(text)
+        self.assertIn("I will execute:", result)
+        self.assertIn("<tool_call>", result)
+        self.assertNotIn("<think>", result)
+
     def test_newline_and_think_combined(self):
         text = "<think>reasoning｟newline｠more</think>answer｟newline｠done"
         result = _post_process_model_output(text)
