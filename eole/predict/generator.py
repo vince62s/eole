@@ -34,7 +34,16 @@ class GeneratorLM(Inference):
                 token-by-token output streaming.
         """
         batch_size = batch["srclen"].size(0)
-        max_length = 0 if scoring else self.max_length - batch["srclen"].max()
+        if scoring:
+            max_length = 0
+        elif self.max_new_tokens > 0:
+            # max_new_tokens explicitly caps new-token generation; it is set
+            # by the serve API when the client passes ``max_tokens`` (which
+            # always means "new tokens" in the Anthropic / OpenAI semantics,
+            # as opposed to eole's ``max_length`` which is total length).
+            max_length = self.max_new_tokens
+        else:
+            max_length = self.max_length - batch["srclen"].max()
         with torch.no_grad():
             if self.top_k != 0 or self.top_p != 0:
                 decode_strategy = GreedySearchLM(

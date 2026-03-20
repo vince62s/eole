@@ -722,7 +722,7 @@ def _map_anthropic_to_eole_settings(request: AnthropicMessagesRequest) -> dict:
     if request.top_p is not None:
         settings["top_p"] = request.top_p
     if request.max_tokens is not None:
-        settings["max_length"] = request.max_tokens
+        settings["max_new_tokens"] = request.max_tokens
     if request.stop_sequences:
         settings["stop"] = request.stop_sequences
     return settings
@@ -741,7 +741,7 @@ def map_openai_to_eole_settings(openai_request: OpenAIChatRequest) -> dict:
         settings["top_p"] = openai_request.top_p
 
     if openai_request.max_tokens is not None:
-        settings["max_length"] = openai_request.max_tokens
+        settings["max_new_tokens"] = openai_request.max_tokens
 
     if openai_request.stop is not None:
         if isinstance(openai_request.stop, str):

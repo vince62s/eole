@@ -94,6 +94,11 @@ class Inference(object):
         self.n_best = config.n_best
         self.max_length = config.max_length
         self.max_length_ratio = config.max_length_ratio
+        # When > 0, limits generation to this many new tokens regardless of
+        # the prefill length.  Used by the serve API to honor the Anthropic /
+        # OpenAI ``max_tokens`` parameter, which always means "new tokens"
+        # while eole's ``max_length`` means "total tokens (prefill + new)".
+        self.max_new_tokens = 0
 
         self.beam_size = config.beam_size
         self.temperature = config.temperature

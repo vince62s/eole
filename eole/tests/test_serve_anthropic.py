@@ -601,10 +601,11 @@ class TestMapAnthropicToEoleSettings(unittest.TestCase):
         s = _map_anthropic_to_eole_settings(req)
         self.assertAlmostEqual(s["top_p"], 0.9)
 
-    def test_max_tokens_mapped_to_max_length(self):
+    def test_max_tokens_mapped_to_max_new_tokens(self):
         req = self._make_req(max_tokens=256)
         s = _map_anthropic_to_eole_settings(req)
-        self.assertEqual(s["max_length"], 256)
+        self.assertEqual(s["max_new_tokens"], 256)
+        self.assertNotIn("max_length", s)
 
     def test_stop_sequences_mapped(self):
         req = self._make_req(stop_sequences=["<|end|>"])
