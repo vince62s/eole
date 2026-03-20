@@ -107,6 +107,7 @@ def _load_serve_module():
 _serve = _load_serve_module()
 
 _parse_anthropic_response_content = _serve._parse_anthropic_response_content
+_parse_function_xml_format = _serve._parse_function_xml_format
 _post_process_model_output = _serve._post_process_model_output
 _anthropic_messages_to_openai = _serve._anthropic_messages_to_openai
 _anthropic_tools_to_openai = _serve._anthropic_tools_to_openai
@@ -288,6 +289,148 @@ class TestParseAnthropicResponseContent(unittest.TestCase):
         self.assertEqual(stop_reason, "tool_use")
         b = next(b for b in blocks if b["type"] == "tool_use")
         self.assertEqual(b["input"].get("raw"), "not valid json")
+
+    # ----------------------------------------------------------------
+    # <function=NAME> XML format — named closing tags (</function=bash>)
+    # ----------------------------------------------------------------
+
+    def test_function_xml_named_tags_single_param(self):
+        """<tool_call><function=NAME><parameter=K>V</parameter=K></function=NAME></tool_call>"""
+        text = (
+            "<tool_call>"
+            "<function=bash>"
+            "<parameter=command>ls -la</parameter=command>"
+            "</function=bash>"
+            "</tool_call>"
+        )
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        self.assertEqual(len(blocks), 1)
+        b = blocks[0]
+        self.assertEqual(b["type"], "tool_use")
+        self.assertEqual(b["name"], "bash")
+        self.assertEqual(b["input"], {"command": "ls -la"})
+
+    def test_function_xml_named_tags_multiple_params(self):
+        """Multiple sibling <parameter> blocks with named closing tags."""
+        text = (
+            "<tool_call>"
+            "<function=read_file>"
+            "<parameter=path>/etc/hosts</parameter=path>"
+            "<parameter=encoding>utf-8</parameter=encoding>"
+            "</function=read_file>"
+            "</tool_call>"
+        )
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        b = blocks[0]
+        self.assertEqual(b["name"], "read_file")
+        self.assertEqual(b["input"]["path"], "/etc/hosts")
+        self.assertEqual(b["input"]["encoding"], "utf-8")
+
+    def test_function_xml_named_tags_nested_malformed_params(self):
+        """Model mis-nests description inside command — both should still be extracted."""
+        text = (
+            "<tool_call>\n"
+            "<function=bash>\n"
+            "<parameter=command>\n"
+            "ls -la\n"
+            "\n"
+            "<parameter=description>\n"
+            "List all files in current directory\n"
+            "\n"
+            "</parameter=description></parameter=command></function=bash></tool_call>"
+        )
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        b = blocks[0]
+        self.assertEqual(b["name"], "bash")
+        # command value must be only "ls -la", not include the description tag
+        self.assertEqual(b["input"]["command"], "ls -la")
+        # description should also be captured even though it was nested
+        self.assertIn("description", b["input"])
+        self.assertIn("List all files", b["input"]["description"])
+
+    # ----------------------------------------------------------------
+    # <function=NAME> XML format — UNNAMED closing tags (</parameter>, </function>)
+    # This is what Claude Code system prompts instruct the model to emit.
+    # ----------------------------------------------------------------
+
+    def test_function_xml_unnamed_tags_single_param(self):
+        """<tool_call><function=Bash><parameter=command>V</parameter></function></tool_call>"""
+        text = (
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>\n"
+            "ls -la\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        self.assertEqual(len(blocks), 1)
+        b = blocks[0]
+        self.assertEqual(b["type"], "tool_use")
+        self.assertEqual(b["name"], "Bash")
+        self.assertEqual(b["input"]["command"], "ls -la")
+
+    def test_function_xml_unnamed_tags_multiple_params(self):
+        """Multiple parameters with unnamed closing tags — exact Claude Code format."""
+        text = (
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>\n"
+            "ls -la\n"
+            "</parameter>\n"
+            "<parameter=description>\n"
+            "List all files in current directory\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        blocks, stop_reason = _parse_anthropic_response_content(text)
+        self.assertEqual(stop_reason, "tool_use")
+        b = blocks[0]
+        self.assertEqual(b["name"], "Bash")
+        self.assertEqual(b["input"]["command"], "ls -la")
+        self.assertIn("description", b["input"])
+        self.assertIn("List all files", b["input"]["description"])
+
+    def test_function_xml_format_returns_none_for_plain_text(self):
+        """_parse_function_xml_format returns None for bodies without <function=."""
+        result = _parse_function_xml_format("not xml at all")
+        self.assertIsNone(result)
+
+    def test_function_xml_format_direct_call_named_tags(self):
+        """Direct unit test of _parse_function_xml_format — named closing tags."""
+        body = (
+            "<function=bash>"
+            "<parameter=command>echo hello</parameter=command>"
+            "</function=bash>"
+        )
+        result = _parse_function_xml_format(body)
+        self.assertIsNotNone(result)
+        tool_id, tool_name, tool_input = result
+        self.assertTrue(tool_id.startswith("toolu_"))
+        self.assertEqual(tool_name, "bash")
+        self.assertEqual(tool_input, {"command": "echo hello"})
+
+    def test_function_xml_format_direct_call_unnamed_tags(self):
+        """Direct unit test of _parse_function_xml_format — unnamed closing tags."""
+        body = (
+            "<function=Bash>\n"
+            "<parameter=command>\nls -la\n</parameter>\n"
+            "<parameter=description>\nList files\n</parameter>\n"
+            "</function>"
+        )
+        result = _parse_function_xml_format(body)
+        self.assertIsNotNone(result)
+        tool_id, tool_name, tool_input = result
+        self.assertTrue(tool_id.startswith("toolu_"))
+        self.assertEqual(tool_name, "Bash")
+        self.assertEqual(tool_input["command"], "ls -la")
+        self.assertEqual(tool_input["description"], "List files")
 
 
 # ---------------------------------------------------------------------------
