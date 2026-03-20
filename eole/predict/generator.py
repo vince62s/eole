@@ -182,46 +182,53 @@ class GeneratorLM(Inference):
                 torch.cuda.synchronize()
                 beg_time = time()
 
-            for step in range(decode_strategy.max_length):
-                decoder_input = src if step == 0 else decode_strategy.current_predictions.view(-1, 1)
+            try:
+                for step in range(decode_strategy.max_length):
+                    decoder_input = src if step == 0 else decode_strategy.current_predictions.view(-1, 1)
 
-                log_probs, attn = self._decode_and_generate(
-                    decoder_input,
-                    None,
-                    src_len=decode_strategy.src_len,
-                    step=step if step == 0 else step + prefill_length - 1,
-                    images=batch.get("images", None) if step == 0 else None,
-                )
+                    log_probs, attn = self._decode_and_generate(
+                        decoder_input,
+                        None,
+                        src_len=decode_strategy.src_len,
+                        step=step if step == 0 else step + prefill_length - 1,
+                        images=batch.get("images", None) if step == 0 else None,
+                    )
 
-                if step == 0:
-                    log_probs = self.tile_to_beam_size_after_initial_step(fn_tile, log_probs)
+                    if step == 0:
+                        log_probs = self.tile_to_beam_size_after_initial_step(fn_tile, log_probs)
 
-                decode_strategy.advance(log_probs, attn)
-                any_finished = any([any(sublist) for sublist in decode_strategy.is_finished_list])
+                    decode_strategy.advance(log_probs, attn)
+                    any_finished = any([any(sublist) for sublist in decode_strategy.is_finished_list])
 
-                if streamer is not None:
-                    # Push the newly generated token for the first sequence.
-                    # current_predictions has shape (batch_size * beam_size,).
-                    streamer.put(decode_strategy.current_predictions[:1])
+                    if streamer is not None:
+                        # Push the newly generated token for the first sequence.
+                        # current_predictions has shape (batch_size * beam_size,).
+                        streamer.put(decode_strategy.current_predictions[:1])
 
-                if any_finished:
-                    decode_strategy.update_finished()
-                    if decode_strategy.done:
-                        break
+                    if any_finished:
+                        decode_strategy.update_finished()
+                        if decode_strategy.done:
+                            break
 
-                if parallel_paths > 1 or (any_finished and not decode_strategy.static_batch_size):
-                    # select indexes in model state/cache
-                    self.model.decoder.map_state(lambda state: state[decode_strategy.select_indices])
+                    if parallel_paths > 1 or (any_finished and not decode_strategy.static_batch_size):
+                        # select indexes in model state/cache
+                        self.model.decoder.map_state(lambda state: state[decode_strategy.select_indices])
 
-                if self.report_time and step == 0:
-                    torch.cuda.synchronize()
-                    self.step0_time.append(time() - beg_time)
+                    if self.report_time and step == 0:
+                        torch.cuda.synchronize()
+                        self.step0_time.append(time() - beg_time)
 
-                self.model.decoder._extend_cache()  # noop when dynamic_shape is False
-
-            self.model.decoder._disable_cache()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                    self.model.decoder._extend_cache()  # noop when dynamic_shape is False
+            finally:
+                # Always release the KV cache, even when an exception (e.g. a
+                # CUDA OOM) aborts the loop early.  Without this guarantee the
+                # cache tensors remain attached to every layer's self_attn
+                # object; the next request then calls _init_cache which tries
+                # to allocate NEW cache tensors while the old ones are still
+                # live, causing a double-allocation OOM on the second request.
+                self.model.decoder._disable_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if streamer is not None:
                 streamer.end()

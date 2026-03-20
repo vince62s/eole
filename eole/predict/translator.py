@@ -244,39 +244,46 @@ class Translator(Inference):
             self._log(f"Warmup lasted: {time() - start_wu:.1f} sec")
 
         # (5) We start the Decoding loop
-        for step in range(decode_strategy.max_length):
-            decoder_input = decode_strategy.current_predictions.view(-1, 1)
-            log_probs, attn = self._decode_and_generate(
-                decoder_input,
-                enc_out,
-                src_len=decode_strategy.src_len,
-                step=step,
-                return_attn=decode_strategy.return_attention,
-            )
-            decode_strategy.advance(log_probs, attn)
-            any_finished = any([any(sublist) for sublist in decode_strategy.is_finished_list])
-            if any_finished:
-                decode_strategy.update_finished()
-                if decode_strategy.done:
-                    break
+        try:
+            for step in range(decode_strategy.max_length):
+                decoder_input = decode_strategy.current_predictions.view(-1, 1)
+                log_probs, attn = self._decode_and_generate(
+                    decoder_input,
+                    enc_out,
+                    src_len=decode_strategy.src_len,
+                    step=step,
+                    return_attn=decode_strategy.return_attention,
+                )
+                decode_strategy.advance(log_probs, attn)
+                any_finished = any([any(sublist) for sublist in decode_strategy.is_finished_list])
+                if any_finished:
+                    decode_strategy.update_finished()
+                    if decode_strategy.done:
+                        break
 
-            select_indices = decode_strategy.select_indices
+                select_indices = decode_strategy.select_indices
 
-            if any_finished and not decode_strategy.static_batch_size:
-                # Reorder states.
-                if isinstance(enc_out, tuple):
-                    enc_out = tuple(x[select_indices] for x in enc_out)
-                else:
-                    enc_out = enc_out[select_indices]
+                if any_finished and not decode_strategy.static_batch_size:
+                    # Reorder states.
+                    if isinstance(enc_out, tuple):
+                        enc_out = tuple(x[select_indices] for x in enc_out)
+                    else:
+                        enc_out = enc_out[select_indices]
 
-            if parallel_paths > 1 or (any_finished and not decode_strategy.static_batch_size):
-                self.model.decoder.map_state(lambda state: state[select_indices])
+                if parallel_paths > 1 or (any_finished and not decode_strategy.static_batch_size):
+                    self.model.decoder.map_state(lambda state: state[select_indices])
 
-            self.model.decoder._extend_cache()  # noop when dynamic_shapes is False
-
-        self.model.decoder._disable_cache()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                self.model.decoder._extend_cache()  # noop when dynamic_shapes is False
+        finally:
+            # Always release the KV cache, even when an exception (e.g. a
+            # CUDA OOM) aborts the loop early.  Without this guarantee the
+            # cache tensors remain attached to every layer's self_attn
+            # object; the next request then calls _init_cache which tries
+            # to allocate NEW cache tensors while the old ones are still
+            # live, causing a double-allocation OOM on the second request.
+            self.model.decoder._disable_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if self.add_estimator:
             dec_in = [item for sublist in decode_strategy.predictions for item in sublist]
