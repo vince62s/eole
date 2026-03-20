@@ -1523,6 +1523,14 @@ def create_app(config_file):
                     content_blocks, stop_reason = _parse_anthropic_response_content(full_text)
                     output_tokens = estimate_tokens(full_text)
 
+                    # Log the parsed content blocks so the user can see exactly
+                    # what will be streamed to the client (tool_use id/name/input
+                    # and whether the tool_call → tool_use conversion worked).
+                    _log_json_payload(
+                        "SERVER RESPONSE [anthropic stream content]",
+                        {"stop_reason": stop_reason, "content_blocks": content_blocks},
+                    )
+
                     # message_start
                     msg_start = {
                         "type": "message_start",
