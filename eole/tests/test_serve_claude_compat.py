@@ -608,6 +608,24 @@ class TestClaudeServeCompatibility(unittest.TestCase):
         self.assertEqual(len(rendered), 4)
         self.assertTrue(rendered.isdigit())
 
+    def test_apply_chat_template_logs_rendered_prompt(self):
+        model = self.serve.Model(
+            model_id="test-model",
+            model_path="dummy/path",
+            preload=False,
+            models_root=".",
+            pre_config={},
+        )
+        model.config = type("Cfg", (), {"chat_template": "{{ messages[0]['content'] }}"})()
+        model.local_path = "."
+
+        with patch.object(self.serve.logger, "info") as info_mock:
+            rendered = model.apply_chat_template([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(rendered, "hello")
+        logged_lines = [call.args[0] for call in info_mock.call_args_list]
+        self.assertTrue(any(line.startswith("Rendered chat prompt: ") and '"prompt": "hello"' in line for line in logged_lines))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -752,6 +752,10 @@ class Model(object):
                 "add_generation_prompt": True,
             }
         )
+        _log_json_payload(
+            "Rendered chat prompt",
+            {"model": self.model_id, "prompt": rendered_output},
+        )
         return rendered_output
 
     async def infer_async(self, inputs, settings={}, is_chat=False, chat_template_kwargs=None):
