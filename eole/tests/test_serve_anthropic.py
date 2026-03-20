@@ -56,7 +56,7 @@ def _load_serve_module():
     constants_stub = sys.modules["eole.constants"]
 
     class _DefaultTokens:
-        SEP = "<sep>"
+        SEP = "｟newline｠"
 
     constants_stub.DefaultTokens = _DefaultTokens
 
@@ -107,6 +107,7 @@ def _load_serve_module():
 _serve = _load_serve_module()
 
 _parse_anthropic_response_content = _serve._parse_anthropic_response_content
+_post_process_model_output = _serve._post_process_model_output
 _anthropic_messages_to_openai = _serve._anthropic_messages_to_openai
 _anthropic_tools_to_openai = _serve._anthropic_tools_to_openai
 _map_anthropic_to_eole_settings = _serve._map_anthropic_to_eole_settings
@@ -116,6 +117,54 @@ AnthropicToolChoice = _serve.AnthropicToolChoice
 AnthropicInputMessage = _serve.AnthropicInputMessage
 AnthropicUsage = _serve.AnthropicUsage
 AnthropicMessagesResponse = _serve.AnthropicMessagesResponse
+
+
+# ---------------------------------------------------------------------------
+# Tests for _post_process_model_output
+# ---------------------------------------------------------------------------
+
+
+class TestPostProcessModelOutput(unittest.TestCase):
+    """Tests for _post_process_model_output."""
+
+    def test_newline_sentinel_replaced(self):
+        text = "line1｟newline｠line2｟newline｠line3"
+        result = _post_process_model_output(text)
+        self.assertEqual(result, "line1\nline2\nline3")
+
+    def test_no_sentinel_unchanged(self):
+        text = "Hello world"
+        result = _post_process_model_output(text)
+        self.assertEqual(result, "Hello world")
+
+    def test_think_block_stripped(self):
+        text = "<think>Let me think about this.</think>The answer is 42."
+        result = _post_process_model_output(text)
+        self.assertEqual(result, "The answer is 42.")
+
+    def test_multiline_think_block_stripped(self):
+        text = "<think>\nStep 1\nStep 2\n</think>\nActual response."
+        result = _post_process_model_output(text)
+        self.assertEqual(result, "Actual response.")
+
+    def test_think_block_before_tool_call_stripped(self):
+        text = (
+            "<think>I should call the tool.</think>\n"
+            '<tool_call>{"name": "list_dir", "arguments": {}}</tool_call>'
+        )
+        result = _post_process_model_output(text)
+        self.assertNotIn("<think>", result)
+        self.assertIn("<tool_call>", result)
+
+    def test_newline_and_think_combined(self):
+        text = "<think>reasoning｟newline｠more</think>answer｟newline｠done"
+        result = _post_process_model_output(text)
+        self.assertEqual(result, "answer\ndone")
+
+    def test_leading_trailing_whitespace_stripped(self):
+        text = "  \n  Hello world  \n  "
+        result = _post_process_model_output(text)
+        self.assertEqual(result, "Hello world")
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +274,8 @@ class TestAnthropicMessagesToOpenai(unittest.TestCase):
         ]
         msgs = [self._make_msg("user", content)]
         result = _anthropic_messages_to_openai(msgs)
-        # Multiple text blocks are joined with '\n' as the separator.
+        # Multiple text blocks are joined with '\n'; individual block content
+        # (including any leading/trailing spaces) is preserved as-is.
         self.assertEqual(result[0]["content"], "Hello\n world")
 
     def test_tool_use_block_becomes_tool_calls_on_assistant_message(self):

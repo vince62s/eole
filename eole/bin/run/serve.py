@@ -56,6 +56,33 @@ def _log_json_payload(label: str, payload) -> None:
     logger.info(f"\n{_LOG_SEP}\n{label}\n{_LOG_SEP}\n{body}\n{_LOG_SEP}")
 
 
+# ---------------------------------------------------------------------------
+# Model-output post-processing
+# ---------------------------------------------------------------------------
+
+# Compiled regex to strip <think>…</think> blocks that Qwen3 and similar
+# "thinking" models produce when chain-of-thought reasoning is enabled.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _post_process_model_output(text: str) -> str:
+    """Normalise raw model output before returning it to clients.
+
+    1. Replace the eole internal newline sentinel (``｟newline｠``,
+       i.e. ``DefaultTokens.SEP``) with actual ``\\n`` characters so that
+       the text is readable in log output and in the API response.
+    2. Strip ``<think>…</think>`` blocks emitted by Qwen3 and other models
+       that run explicit chain-of-thought reasoning.  These blocks contain
+       internal reasoning that is not part of the model's final answer and
+       must not be forwarded to the API client.
+    """
+    # Replace internal newline sentinel with real newline
+    text = text.replace(DefaultTokens.SEP, "\n")
+    # Strip chain-of-thought thinking blocks
+    text = _THINK_BLOCK_RE.sub("", text)
+    return text.strip()
+
+
 class TextRequest(DecodingConfig):
     """
     Standard text "completion" request
@@ -973,7 +1000,13 @@ class Model(object):
         render_kwargs: dict = {
             "messages": inputs,
             "bos_token": "",  # handled in numericalize
+            "eos_token": "",  # handled by stop conditions; use literal tokens in template
             "add_generation_prompt": True,
+            # Many Qwen3 / "thinking" model templates gate on enable_thinking.
+            # Default to False so the model uses direct tool-call output rather
+            # than wrapping everything in <think>…</think> blocks (we strip
+            # those blocks anyway, but avoiding them keeps the output cleaner).
+            "enable_thinking": False,
         }
         if tools is not None:
             render_kwargs["tools"] = tools
@@ -1208,28 +1241,31 @@ def create_app(config_file):
                     )
                     yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-                    full_text = ""
+                    raw_chunks: list = []
                     while True:
                         item = await chunk_queue.get()
                         if item is None:
                             break
                         if isinstance(item, Exception):
                             raise item
-                        full_text += item
-                        content_chunk = OpenAIStreamChunk(
-                            id=completion_id,
-                            created=created_ts,
-                            model=model_id,
-                            choices=[
-                                OpenAIStreamChoice(
-                                    index=0,
-                                    delta=OpenAIStreamDelta(content=item),
-                                )
-                            ],
-                        )
-                        yield f"data: {content_chunk.model_dump_json()}\n\n"
+                        raw_chunks.append(item)
 
+                    full_text = _post_process_model_output("".join(raw_chunks))
                     _log_json_payload("MODEL RESPONSE [openai stream]", full_text)
+
+                    # Stream cleaned text as a single delta (model is done by now)
+                    content_chunk = OpenAIStreamChunk(
+                        id=completion_id,
+                        created=created_ts,
+                        model=model_id,
+                        choices=[
+                            OpenAIStreamChoice(
+                                index=0,
+                                delta=OpenAIStreamDelta(content=full_text),
+                            )
+                        ],
+                    )
+                    yield f"data: {content_chunk.model_dump_json()}\n\n"
 
                     # Final chunk with finish_reason
                     final_chunk = OpenAIStreamChunk(
@@ -1281,6 +1317,7 @@ def create_app(config_file):
             prompt_text = " ".join([_content_as_str(msg.content) for msg in request.messages])
             prompt_tokens = estimate_tokens(prompt_text)
             completion_text = preds[0][0] if preds and preds[0] else ""
+            completion_text = _post_process_model_output(completion_text)
             completion_tokens = estimate_tokens(completion_text)
 
             _log_json_payload("MODEL RESPONSE [openai]", completion_text)
@@ -1426,6 +1463,12 @@ def create_app(config_file):
                       message_start → content_block_start → ping →
                       content_block_delta* → content_block_stop →
                       message_delta → message_stop
+
+                    The model output is buffered in full before emitting any
+                    SSE events so that we can determine the correct content
+                    block type (``text`` vs ``tool_use``) and emit properly
+                    typed events.  This is required for Claude Code and other
+                    Anthropic-API clients that rely on block-type semantics.
                     """
                     loop = asyncio.get_event_loop()
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -1441,6 +1484,23 @@ def create_app(config_file):
                             loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
 
                     executor.submit(_produce)
+
+                    # Buffer all model output so we can classify the response
+                    # type before emitting SSE events.
+                    raw_chunks: list = []
+                    while True:
+                        item = await chunk_queue.get()
+                        if item is None:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        raw_chunks.append(item)
+
+                    full_text = _post_process_model_output("".join(raw_chunks))
+                    _log_json_payload("MODEL RESPONSE [anthropic stream]", full_text)
+
+                    content_blocks, stop_reason = _parse_anthropic_response_content(full_text)
+                    output_tokens = estimate_tokens(full_text)
 
                     # message_start
                     msg_start = {
@@ -1459,44 +1519,54 @@ def create_app(config_file):
                     _log_json_payload("SERVER RESPONSE [anthropic stream start]", msg_start)
                     yield f"event: message_start\ndata: {json.dumps(msg_start)}\n\n"
 
-                    # content_block_start (index 0, text block)
-                    cb_start = {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                    yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
-
                     # keepalive ping
                     yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
 
-                    output_tokens = 0
-                    full_text = ""
-                    while True:
-                        item = await chunk_queue.get()
-                        if item is None:
-                            break
-                        if isinstance(item, Exception):
-                            raise item
-                        full_text += item
-                        output_tokens += estimate_tokens(item)
-                        delta = {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": item},
-                        }
-                        yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                    # Emit one content block per parsed block, with correct types.
+                    # For tool calls the Anthropic spec requires:
+                    #   content_block_start: {type: "tool_use", id, name, input:{}}
+                    #   content_block_delta: {type: "input_json_delta", partial_json: "…"}
+                    # For plain text:
+                    #   content_block_start: {type: "text", text: ""}
+                    #   content_block_delta: {type: "text_delta", text: "…"}
+                    for idx, block in enumerate(content_blocks):
+                        if block["type"] == "tool_use":
+                            cb_start = {
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": block["id"],
+                                    "name": block["name"],
+                                    "input": {},
+                                },
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
+                            input_json = json.dumps(block["input"], ensure_ascii=False)
+                            delta = {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "input_json_delta", "partial_json": input_json},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                        else:
+                            cb_start = {
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {"type": "text", "text": ""},
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
+                            delta = {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "text_delta", "text": block.get("text", "")},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
 
-                    _log_json_payload("MODEL RESPONSE [anthropic stream]", full_text)
-
-                    # content_block_stop
-                    yield (
-                        f"event: content_block_stop\n"
-                        f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                    )
-
-                    # Determine stop reason from accumulated text
-                    _, stop_reason = _parse_anthropic_response_content(full_text)
+                        yield (
+                            f"event: content_block_stop\n"
+                            f"data: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+                        )
 
                     # message_delta
                     msg_delta = {
@@ -1525,7 +1595,7 @@ def create_app(config_file):
                 executor,
                 lambda: model_obj.engine.infer_list([chat_input], settings=settings),
             )
-            raw_text = preds[0][0] if preds and preds[0] else ""
+            raw_text = _post_process_model_output(preds[0][0] if preds and preds[0] else "")
 
             _log_json_payload("MODEL RESPONSE [anthropic]", raw_text)
 
