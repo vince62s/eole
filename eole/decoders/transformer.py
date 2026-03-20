@@ -651,7 +651,15 @@ class TransformerDecoder(DecoderBase):
         if self.dynamic_shapes:
             self.cache_len_tgt = l  # kv cache starts at target length and grows
         else:
-            self.cache_len_tgt = self.max_length  # kv cache is set to max and remains static
+            # Static-shape mode: the cache must be at least large enough to
+            # hold the full prefill (l tokens).  If the prompt is longer than
+            # max_length the prefill would attempt to write a key tensor of
+            # shape (B, l, H, D) into a cache of (B, max_length, H, D),
+            # triggering the flash_attn error:
+            #   "If key is supplied, it must have seqlen <= the seqlen of the KV cache"
+            # Use max(l, max_length) so the cache always accommodates the
+            # prefill while still providing max_length slots for generation.
+            self.cache_len_tgt = max(l, self.max_length)
 
         # We find the index of the first non-pad token (the first '0' or 'False')
         # If the first token is NOT a pad, this returns 0.
