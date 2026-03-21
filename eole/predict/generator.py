@@ -125,7 +125,7 @@ class GeneratorLM(Inference):
         # Single sequence, single token — the shape used by the decode loop.
         dummy_emb = torch.zeros(1, 1, H, device=device, dtype=dtype)
         dummy_pad_mask = torch.zeros(1, 1, 1, dtype=torch.bool, device=device)
-        decoder.max_length = self.context_length if self.context_length else self.max_new_tokens
+        decoder.max_length = self.context_length if self.context_length > 0 else self.max_new_tokens
         print("[WARMUP COMPILE]: ", self.max_new_tokens)
         with torch.no_grad():
             decoder._init_cache(dummy_emb, dummy_pad_mask)
@@ -188,7 +188,7 @@ class GeneratorLM(Inference):
             else:
                 emb = self.model.tgt_emb(src, step=0)
             tgt_pad_mask = src.eq(self._tgt_pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
-            self.model.decoder.max_length = self.context_length if self.context_length else prefill_length + self.max_new_tokens
+            self.model.decoder.max_length = self.context_length if self.context_length > 0 else prefill_length + self.max_new_tokens
             self.model.decoder._init_cache(emb, tgt_pad_mask)
             self.model.decoder.map_state(fn_tile)
             if EOLE_COMPILE_MODE in ["0", "1"]:
