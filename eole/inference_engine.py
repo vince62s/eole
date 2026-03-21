@@ -255,15 +255,57 @@ class InferenceEnginePY(InferenceEngine):
         self.transforms = make_transforms(self.config, self.transforms_cls, self.vocabs)
         self.transform_pipe = TransformPipe.build_from(self.transforms.values())
 
-        # Pre-capture CUDA graphs (EOLE_COMPILE_MODE="0") or warm Triton
-        # kernel cache (EOLE_COMPILE_MODE="1") from the main thread.
-        # infer_list_stream runs inference in a background daemon thread where
-        # PyTorch's CUDA-graph TLS is not initialised, which would cause
-        #   AssertionError: torch._C._is_key_in_tls("tree_manager_containers")
-        # on the first request.  Calling warmup_compile() here ensures the
-        # graph is already captured before any background thread is spawned.
-        if hasattr(self.predictor, "warmup_compile"):
+        # Pre-capture CUDA graphs or warm Triton kernel cache from the main
+        # thread (mode "1" only — mode "0" needs to capture in the worker
+        # thread where inference actually runs; see _make_thread_pool).
+        if hasattr(self.predictor, "warmup_compile") and EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE == "1":
             self.predictor.warmup_compile()
+
+        # Create a persistent thread pool whose workers are pre-initialised
+        # with CUDA graph infrastructure.  Using a long-lived pool (rather
+        # than a fresh thread per request) ensures that the TLS initialised
+        # during warmup persists for every subsequent request.
+        self._thread_pool = self._make_thread_pool()
+
+    def _make_thread_pool(self):
+        """Create a ``ThreadPoolExecutor`` with per-thread CUDA graph warmup.
+
+        Using a persistent pool (rather than spawning a fresh thread per
+        request) means the CUDA-graph TLS and Triton kernel cache that the
+        initializer sets up survive across requests.  A pool size of 1
+        serialises inference, which is required because the KV cache belongs
+        to a single model instance.
+
+        The initializer runs ``warmup_compile()`` inside each worker thread so
+        that:
+
+        * **Mode "0"** (CUDA graphs): a dummy graph is captured in the thread,
+          causing PyTorch to store its ``tree_manager_containers`` TLS key
+          there.  Subsequent per-request graph re-captures (after
+          ``_disable_cache`` resets ``_forward_compile``) succeed because the
+          key already exists.
+        * **Mode "1"** (Triton): Triton kernels are compiled on first use in
+          the thread that calls them, so running warmup here pre-warms the
+          compilation cache for the worker thread.
+        """
+        import concurrent.futures
+        from eole import EOLE_TORCH_COMPILE
+
+        predictor = self.predictor
+
+        def _thread_init():
+            # Run warmup_compile inside this worker thread.  For mode "0"
+            # this captures a dummy CUDA graph, initialising PyTorch's C++
+            # CUDA-graph TLS for the thread.  For mode "1" it pre-warms
+            # Triton kernel compilation.
+            if hasattr(predictor, "warmup_compile"):
+                predictor.warmup_compile()
+
+        return concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="eole-infer",
+            initializer=_thread_init,
+        )
 
     @torch.inference_mode()
     def _predict(
@@ -296,9 +338,17 @@ class InferenceEnginePY(InferenceEngine):
     def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None):
         """Stream inference results for a single input string.
 
-        Runs inference in a background thread and yields decoded text
-        chunks as they are produced token by token. This is the
+        Runs inference in a persistent thread-pool worker and yields decoded
+        text chunks as they are produced token by token.  This is the
         recommended API for interactive / chatbot-style use cases.
+
+        The pool (see ``_make_thread_pool``) uses ``max_workers=1`` so
+        requests are serialised, which is required because the KV cache
+        belongs to a single model instance.  Each worker thread is
+        pre-initialised (via the pool's ``initializer``) by calling
+        ``warmup_compile()``, which captures a dummy CUDA graph in the thread
+        so that PyTorch's CUDA-graph C++ TLS is set up before any real
+        inference work arrives.
 
         Only supported for single-process mode (``world_size <= 1``) and
         decoder-only (LM) models. Encoder-decoder models are not supported
@@ -322,7 +372,6 @@ class InferenceEnginePY(InferenceEngine):
                 print(chunk, end="", flush=True)
             print()
         """
-        import threading
         from eole.predict.streamer import GenerationStreamer
 
         if self.config.world_size > 1:
@@ -338,22 +387,6 @@ class InferenceEnginePY(InferenceEngine):
         exception_holder = []
 
         def _run_inference():
-            # When EOLE_COMPILE_MODE is "0" or "2" (CUDA-graph modes),
-            # PyTorch's cudagraph_trees stores per-device containers in C++
-            # thread-local storage (TLS) under the key
-            # "tree_manager_containers".  The key is only present in the
-            # thread where the CUDA-graph infrastructure was first initialised
-            # (the main thread).  This background thread doesn't have it, so
-            # any attempt to record a new CUDA graph here raises:
-            #   AssertionError: torch._C._is_key_in_tls(
-            #       "tree_manager_containers")
-            # Seeding the TLS with an empty dict lets this thread record graph
-            # nodes on demand, exactly as the main thread would.
-            try:
-                if not torch._C._is_key_in_tls("tree_manager_containers"):
-                    torch._C._set_obj_in_tls("tree_manager_containers", {})
-            except AttributeError:
-                pass  # PyTorch build without _is_key_in_tls / _set_obj_in_tls
             try:
                 infer_iter = self._build_inference_iterator(src=[src])
                 self._predict(infer_iter, settings=settings, streamer=streamer)
@@ -362,12 +395,11 @@ class InferenceEnginePY(InferenceEngine):
                 exception_holder.append(exc)
                 streamer.end()
 
-        thread = threading.Thread(target=_run_inference, daemon=True)
-        thread.start()
+        future = self._thread_pool.submit(_run_inference)
 
         yield from streamer
 
-        thread.join()
+        future.result()  # propagate unexpected worker exceptions
 
         if exception_holder:
             raise exception_holder[0]
@@ -480,7 +512,10 @@ class InferenceEnginePY(InferenceEngine):
         return self._aggregate_inference_results(scores, estims, preds)
 
     def terminate(self):
-        """Terminate all worker processes."""
+        """Terminate all worker processes and the inference thread pool."""
+        if hasattr(self, "_thread_pool"):
+            self._thread_pool.shutdown(wait=False)
+
         if self.config.world_size <= 1:
             return
 

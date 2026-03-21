@@ -112,35 +112,27 @@ class GeneratorLM(Inference):
         return log_probs
 
     def warmup_compile(self):
-        """Pre-initialize CUDA graph infrastructure from the main thread.
+        """Pre-initialize CUDA graph infrastructure in the calling thread.
 
-        When ``EOLE_COMPILE_MODE=="0"`` (CUDA graphs), the first call to the
-        compiled decoder triggers CUDA graph capture inside PyTorch's
-        ``cudagraph_trees`` module.  That code accesses C++ thread-local
-        storage (TLS) that is only valid in the thread where PyTorch
-        initialised it.  ``infer_list_stream`` runs inference in a daemon
-        background thread where the TLS does not exist, causing::
+        Must be called from the thread that will later run inference so that
+        PyTorch's CUDA-graph C++ thread-local storage (TLS) is initialized
+        there.  ``infer_list_stream`` uses a ``ThreadPoolExecutor`` whose
+        ``initializer`` calls this method, ensuring every worker thread has
+        its TLS set up before it accepts any inference work.
 
-            AssertionError: torch._C._is_key_in_tls("tree_manager_containers")
+        * ``EOLE_COMPILE_MODE=="0"`` (CUDA graphs with triton.cudagraphs):
+          Captures a dummy CUDA graph in the calling thread, which causes
+          PyTorch to initialize its ``tree_manager_containers`` TLS key.
+          The dummy cache is freed afterwards so real requests always
+          re-capture with their own live KV-cache tensors, but the TLS key
+          persists for the lifetime of the thread.
 
-        Calling this method during model initialisation (from the main thread)
-        pre-captures the CUDA graph for the single-token decode shape so that
-        background-thread requests find the graph already built and skip the
-        CUDA-graph initialisation entirely.
+        * ``EOLE_COMPILE_MODE=="1"`` (Triton kernels, no CUDA graphs):
+          Pre-warms the Triton kernel compilation cache.
 
-        Also benefits ``EOLE_COMPILE_MODE=="1"`` by pre-warming the Triton
-        kernel compilation cache before the first real request.
+        Modes "2"/"3" (per-layer CUDA graphs) are not handled here.
         """
-        if not EOLE_TORCH_COMPILE or EOLE_COMPILE_MODE != "1":
-            # Mode "0" (CUDA graphs): pre-capturing the graph with dummy tensors
-            # binds it to addresses that are freed immediately afterwards.
-            # When the real request arrives the KV-cache is at different
-            # addresses, forcing a re-capture from the background thread which
-            # still lacks CUDA-graph TLS.  Leave mode "0" to the per-request
-            # warmup in _compile_decoder() (which runs after _init_cache() has
-            # allocated the real tensors), and let the background-thread TLS
-            # initialisation in infer_list_stream handle the recording.
-            # Modes "2"/"3": use per-layer compilation; not handled here.
+        if not EOLE_TORCH_COMPILE or EOLE_COMPILE_MODE not in ("0", "1"):
             return
         if not hasattr(self.model, "decoder") or self.model.decoder is None:
             return
