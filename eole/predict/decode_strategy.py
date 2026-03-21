@@ -178,6 +178,10 @@ class DecodeStrategy(object):
         return self.alive_seq.shape[1]
 
     def ensure_min_length(self, log_probs):
+        # len(self) = 1 (BOS) + _prefix_len (forced prefix) + n_free (freely generated).
+        # Called BEFORE appending the current token, so n_free = len(self) - 1 - _prefix_len.
+        # Subtracting _prefix_len (not 1+_prefix_len) gives: len - _prefix_len = 1 + n_free.
+        # The <= check naturally encodes the BOS offset: block EOS while n_free < min_new_tokens.
         if len(self) - self._prefix_len <= self.min_new_tokens:
             for eos in self.eos:
                 log_probs[:, eos] = -65504  # -1e20
@@ -187,8 +191,9 @@ class DecodeStrategy(object):
             log_probs[:, self.unk] = -65504  # -1e20
 
     def ensure_max_length(self):
-        # Subtract 1 for BOS and _prefix_len for forced prefix tokens so the
-        # check is against freely generated tokens only.
+        # len(self) = 1 (BOS) + _prefix_len (forced prefix) + n_free (freely generated).
+        # Called AFTER appending the current token, so n_free = len(self) - 1 - _prefix_len.
+        # Both BOS and prefix must be subtracted explicitly for the equality check.
         if len(self) - 1 - self._prefix_len == self.max_new_tokens:
             # print("max new tokens reached", self.max_new_tokens)  # for debug
             self.is_finished_list = [
