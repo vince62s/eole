@@ -39,8 +39,8 @@ class DecodingConfig(Config):
         default=False,
         description="Apply coverage penalty at every decoding step. Helpful for summary penalty.",
     )
-    min_new_tokens: int = Field(default=0, description="Minimum number of new tokens to generate (not counting BOS or any forced prefix tokens).", ge=0)
-    max_new_tokens: int = Field(default=250, description="Maximum number of new tokens to generate (not counting BOS or any forced prefix tokens).")
+    min_new_tokens: int = Field(default=0, description="Minimum number of freely generated tokens (not counting BOS or forced prefix tokens).", ge=0)
+    max_new_tokens: int = Field(default=250, description="Maximum number of new tokens to generate (not counting BOS; includes any forced prefix tokens from batching).")
     context_length: int = Field(
         default=0,
         description="Maximum context length (prefill + generated tokens). "

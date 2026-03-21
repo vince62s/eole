@@ -214,7 +214,7 @@ class GeneratorLM(Inference):
                 torch.cuda.synchronize()
                 beg_time = time()
 
-            for step in range(decode_strategy._prefix_len + decode_strategy.max_new_tokens):
+            for step in range(decode_strategy.max_new_tokens):
                 decoder_input = src if step == 0 else decode_strategy.current_predictions.view(-1, 1)
 
                 log_probs, attn = self._decode_and_generate(

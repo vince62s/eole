@@ -192,9 +192,9 @@ class DecodeStrategy(object):
 
     def ensure_max_length(self):
         # len(self) = 1 (BOS) + _prefix_len (forced prefix) + n_free (freely generated).
-        # Called AFTER appending the current token, so n_free = len(self) - 1 - _prefix_len.
-        # Both BOS and prefix must be subtracted explicitly for the equality check.
-        if len(self) - 1 - self._prefix_len == self.max_new_tokens:
+        # The decode loop runs exactly max_new_tokens steps, so forced prefix and free tokens
+        # together must not exceed max_new_tokens (1+k+f == max_new_tokens+1).
+        if len(self) == self.max_new_tokens + 1:
             # print("max new tokens reached", self.max_new_tokens)  # for debug
             self.is_finished_list = [
                 [True for _ in range(self.parallel_paths)] for _ in range(len(self.is_finished_list))
