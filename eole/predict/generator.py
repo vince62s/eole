@@ -214,8 +214,14 @@ class GeneratorLM(Inference):
         # only prefill-sized, leaving no room for generated tokens.  Updating
         # decoder.max_length here guarantees the upcoming _init_cache call
         # allocates at least prefill_len + new_tokens slots.
-        required_cache_len = prefill_length + decode_strategy.max_length
-        self.model.decoder.max_length = max(required_cache_len, self.model.decoder.max_length)
+        # NOTE: Only do this outside of torch.compile mode.  In torch.compile
+        # mode the CUDA graphs are captured at a fixed cache size; bumping
+        # max_length per-request would force a new CUDA-graph capture from a
+        # background thread that lacks the CUDA-graph TLS, triggering:
+        #   AssertionError: torch._C._is_key_in_tls("tree_manager_containers")
+        if not EOLE_TORCH_COMPILE:
+            required_cache_len = prefill_length + decode_strategy.max_length
+            self.model.decoder.max_length = max(required_cache_len, self.model.decoder.max_length)
 
         # (4) warmup for Torch compile
         # use the current batch to generate the decode graph (B, 1)
@@ -228,7 +234,6 @@ class GeneratorLM(Inference):
             else:
                 emb = self.model.tgt_emb(src, step=0)
             tgt_pad_mask = src.eq(self._tgt_pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
-            # decoder.max_length already updated above to cover prefill + new tokens.
             self.model.decoder._init_cache(emb, tgt_pad_mask)
             self.model.decoder.map_state(fn_tile)
             if EOLE_COMPILE_MODE in ["0", "1"]:
