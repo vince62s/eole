@@ -5,7 +5,7 @@
 data_type: audio
 beam_size: 5
 length_penalty: none
-max_length: 448
+max_new_tokens: 448
 batch_type: sents
 batch_size: 1
 gpu_ranks: [0]

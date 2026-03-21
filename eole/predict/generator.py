@@ -34,7 +34,7 @@ class GeneratorLM(Inference):
                 token-by-token output streaming.
         """
         batch_size = batch["srclen"].size(0)
-        max_length = 0 if scoring else self.max_length - batch["srclen"].max()
+        max_new_tokens = 0 if scoring else self.max_new_tokens
         with torch.no_grad():
             if self.top_k != 0 or self.top_p != 0:
                 decode_strategy = GreedySearchLM(
@@ -46,8 +46,8 @@ class GeneratorLM(Inference):
                     n_best=self.n_best,
                     batch_size=batch_size,
                     global_scorer=self.global_scorer,
-                    min_length=self.min_length,
-                    max_length=max_length,
+                    min_new_tokens=self.min_new_tokens,
+                    max_new_tokens=max_new_tokens,
                     block_ngram_repeat=self.block_ngram_repeat,
                     exclusion_tokens=self._exclusion_idxs,
                     return_attention=attn_debug or self.replace_unk,
@@ -71,8 +71,8 @@ class GeneratorLM(Inference):
                     start=self._tgt_start_with,
                     n_best=self.n_best,
                     global_scorer=self.global_scorer,
-                    min_length=self.min_length,
-                    max_length=max_length,
+                    min_new_tokens=self.min_new_tokens,
+                    max_new_tokens=max_new_tokens,
                     return_attention=attn_debug or self.replace_unk,
                     block_ngram_repeat=self.block_ngram_repeat,
                     exclusion_tokens=self._exclusion_idxs,
@@ -125,8 +125,8 @@ class GeneratorLM(Inference):
         # Single sequence, single token — the shape used by the decode loop.
         dummy_emb = torch.zeros(1, 1, H, device=device, dtype=dtype)
         dummy_pad_mask = torch.zeros(1, 1, 1, dtype=torch.bool, device=device)
-        decoder.max_length = self.max_length
-        print("[WARMUP COMPILE]: ", self.max_length)
+        decoder.max_length = self.context_length if self.context_length else self.max_new_tokens
+        print("[WARMUP COMPILE]: ", self.max_new_tokens)
         with torch.no_grad():
             decoder._init_cache(dummy_emb, dummy_pad_mask)
             decoder._compile_decoder(emb=dummy_emb, tgt_pad_mask=dummy_pad_mask)
@@ -188,7 +188,7 @@ class GeneratorLM(Inference):
             else:
                 emb = self.model.tgt_emb(src, step=0)
             tgt_pad_mask = src.eq(self._tgt_pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
-            self.model.decoder.max_length = self.max_length
+            self.model.decoder.max_length = self.context_length if self.context_length else prefill_length + self.max_new_tokens
             self.model.decoder._init_cache(emb, tgt_pad_mask)
             self.model.decoder.map_state(fn_tile)
             if EOLE_COMPILE_MODE in ["0", "1"]:
@@ -214,7 +214,7 @@ class GeneratorLM(Inference):
                 torch.cuda.synchronize()
                 beg_time = time()
 
-            for step in range(decode_strategy.max_length):
+            for step in range(decode_strategy.max_new_tokens):
                 decoder_input = src if step == 0 else decode_strategy.current_predictions.view(-1, 1)
 
                 log_probs, attn = self._decode_and_generate(

@@ -245,7 +245,7 @@ class RunMMLU(BaseBin):
                 "top_k": 0,
                 "beam_size": 1,
                 "n_best": 1,
-                "max_length": 1,
+                "max_new_tokens": 1,
                 "src": "dummy",
             }
         )

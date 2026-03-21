@@ -9,7 +9,7 @@ src: ./audio_files.txt
 output: ./transcription.txt
 beam_size: 5
 length_penalty: none
-max_length: 448
+max_new_tokens: 448
 gpu_ranks: [0]
 batch_type: sents
 batch_size: 1

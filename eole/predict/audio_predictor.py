@@ -145,7 +145,7 @@ class AudioPredictor(Translator):
 
         self.condition_on_previous_text = getattr(config, "condition_on_previous_text", False)
         self._startofprev_id = self._tgt_vocab.lookup_token("<|startofprev|>")
-        self._max_prompt_length = self.max_length // 2 - 1
+        self._max_prompt_length = self.max_new_tokens // 2 - 1
         self._initial_prompt_tokens = []
         if initial_prompt and self._tokenizer:
             self._initial_prompt_tokens = list(self._tokenizer.encode(initial_prompt).ids)

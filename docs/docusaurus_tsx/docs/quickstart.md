@@ -143,7 +143,7 @@ model_path: "/path_to/llama-3.1-8b-instruct"
 
 # Inference
 seed: 42
-max_length: 256
+max_new_tokens: 256
 gpu: 0
 batch_type: sents
 batch_size: 1
@@ -164,7 +164,7 @@ For MMLU-style single-token scoring:
 model_path: "/path_to/my-model"
 
 seed: 42
-max_length: 1
+max_new_tokens: 1
 gpu: 0
 batch_type: sents
 batch_size: 1

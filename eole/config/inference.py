@@ -1,3 +1,4 @@
+import warnings
 import torch
 from typing import List, Literal
 from pydantic import Field, model_validator, field_validator, computed_field
@@ -38,8 +39,14 @@ class DecodingConfig(Config):
         default=False,
         description="Apply coverage penalty at every decoding step. Helpful for summary penalty.",
     )
-    min_length: int = Field(default=0, description="Minimum prediction length.", ge=0)
-    max_length: int = Field(default=250, description="Maximum prediction length.")
+    min_new_tokens: int = Field(default=0, description="Minimum number of tokens to generate (not counting prompt).", ge=0)
+    max_new_tokens: int = Field(default=250, description="Maximum number of new tokens to generate (not counting prompt).")
+    context_length: int = Field(
+        default=0,
+        description="Maximum context length (prefill + generated tokens). "
+        "Used for KV cache sizing. Set to 0 to auto-compute from max_new_tokens and actual prefill length.",
+        ge=0,
+    )
     max_length_ratio: float = Field(
         default=2,
         description="Maximum prediction length ratio. For European languages, "
@@ -129,6 +136,28 @@ class DecodingConfig(Config):
     estim_only: bool = Field(default=False, description="Process the input to estimator only (no decoder).")
     attn_debug: bool = Field(default=False, description="Print best attn for each word.")
     align_debug: bool = Field(default=False, description="Print best align for each word.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_legacy_length_fields(cls, data):
+        """Backward compatibility: map deprecated min_length/max_length to min_new_tokens/max_new_tokens."""
+        if isinstance(data, dict):
+            data = dict(data)
+            if "min_length" in data and "min_new_tokens" not in data:
+                warnings.warn(
+                    "'min_length' is deprecated, use 'min_new_tokens' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                data["min_new_tokens"] = data.pop("min_length")
+            if "max_length" in data and "max_new_tokens" not in data:
+                warnings.warn(
+                    "'max_length' is deprecated, use 'max_new_tokens' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                data["max_new_tokens"] = data.pop("max_length")
+        return data
 
 
 # in legacy opts, decoding config is separated (probably to be used elsewhere)

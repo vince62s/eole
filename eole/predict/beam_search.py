@@ -23,8 +23,8 @@ class BeamSearchBase(DecodeStrategy):
         n_best (int): Don't stop until at least this many beams have
             reached EOS.
         global_scorer (eole.predict.GNMTGlobalScorer): Scorer instance.
-        min_length (int): See base.
-        max_length (int): See base.
+        min_new_tokens (int): See base.
+        max_new_tokens (int): See base.
         return_attention (bool): See base.
         block_ngram_repeat (int): See base.
         exclusion_tokens (set[int]): See base.
@@ -65,8 +65,8 @@ class BeamSearchBase(DecodeStrategy):
         start,
         n_best,
         global_scorer,
-        min_length,
-        max_length,
+        min_new_tokens,
+        max_new_tokens,
         return_attention,
         block_ngram_repeat,
         exclusion_tokens,
@@ -84,11 +84,11 @@ class BeamSearchBase(DecodeStrategy):
             batch_size,
             beam_size,
             global_scorer,
-            min_length,
+            min_new_tokens,
             block_ngram_repeat,
             exclusion_tokens,
             return_attention,
-            max_length,
+            max_new_tokens,
             ban_unk_token,
             add_estimator,
         )
@@ -304,7 +304,7 @@ class BeamSearchBase(DecodeStrategy):
                 _B, self.beam_size
             )
 
-        # force the output to be longer than self.min_length
+        # force the output to be longer than self.min_new_tokens
         step = len(self)
         self.ensure_min_length(log_probs)
         self.ensure_unk_removed(log_probs)

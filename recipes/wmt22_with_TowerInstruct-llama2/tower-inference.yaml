@@ -3,7 +3,7 @@ model_path: ["${EOLE_MODEL_DIR}/TowerInstruct-7b-v0.2"]
 
 # Inference
 seed: 42
-max_length: 512
+max_new_tokens: 512
 batch_type: tokens
 batch_size: 8192
 world_size: 1

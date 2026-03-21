@@ -15,6 +15,6 @@ seed: 42
 self_attn_backend: "pytorch"
 compute_dtype: fp32
 
-max_length: 30
+max_new_tokens: 30
 
 verbose: true

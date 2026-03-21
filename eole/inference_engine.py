@@ -118,7 +118,7 @@ class InferenceEngine:
         Args:
             src (str): Single input string to run inference on.
             settings (dict, optional): Override inference settings
-                (e.g. ``temperature``, ``max_length``).
+                (e.g. ``temperature``, ``max_new_tokens``).
 
         Yields:
             str: Decoded text chunks, one per generated token (or
@@ -329,7 +329,7 @@ class InferenceEnginePY(InferenceEngine):
         Args:
             src (str): A single input string.
             settings (dict, optional): Override inference settings such as
-                ``temperature``, ``max_length``, ``top_k``, ``top_p``.
+                ``temperature``, ``max_new_tokens``, ``top_k``, ``top_p``.
 
         Yields:
             str: Decoded text chunks produced by the model.
@@ -683,7 +683,7 @@ class InferenceEngineCT2(InferenceEngine):
     def _predict_decoder(self, input_tokens: List[List[str]], config) -> Tuple:
         """Run prediction for decoder-only models."""
         params = self._get_generation_params(config)
-        params["max_length"] = config.max_length
+        params["max_length"] = config.max_new_tokens
         params["include_prompt_in_result"] = False
 
         predicted_batch = self.predictor.generate_batch(start_tokens=input_tokens, **params)
@@ -696,7 +696,7 @@ class InferenceEngineCT2(InferenceEngine):
     def _predict_encoder_decoder(self, input_tokens: List[List[str]], config) -> Tuple:
         """Run prediction for encoder-decoder models."""
         params = self._get_generation_params(config)
-        params["max_decoding_length"] = config.max_length
+        params["max_decoding_length"] = config.max_new_tokens
 
         predicted_batch = self.predictor.translate_batch(input_tokens, **params)
 

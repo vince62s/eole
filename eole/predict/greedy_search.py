@@ -89,7 +89,7 @@ class GreedySearch(DecodeStrategy):
 
     The ``scores`` attribute's lists are the score, after applying temperature,
     of the final prediction (either EOS or the final token in the event
-    that ``max_length`` is reached)
+    that ``max_new_tokens`` is reached)
 
     Args:
         pad (int): See base.
@@ -101,13 +101,13 @@ class GreedySearch(DecodeStrategy):
             reached EOS.
         batch_size (int): See base.
         global_scorer (eole.predict.GNMTGlobalScorer): Scorer instance.
-        min_length (int): See base.
-        max_length (int): See base.
+        min_new_tokens (int): See base.
+        max_new_tokens (int): See base.
         ban_unk_token (Boolean): See base.
         block_ngram_repeat (int): See base.
         exclusion_tokens (set[int]): See base.
         return_attention (bool): See base.
-        max_length (int): See base.
+        max_new_tokens (int): See base.
         temperature (float): See
             :func:`~eole.predict.greedy_search.sample_with_temperature()`.
         top_k (int): See
@@ -127,11 +127,11 @@ class GreedySearch(DecodeStrategy):
         n_best,
         batch_size,
         global_scorer,
-        min_length,
+        min_new_tokens,
         block_ngram_repeat,
         exclusion_tokens,
         return_attention,
-        max_length,
+        max_new_tokens,
         temperature,
         top_k,
         top_p,
@@ -148,11 +148,11 @@ class GreedySearch(DecodeStrategy):
             batch_size,
             beam_size,
             global_scorer,
-            min_length,
+            min_new_tokens,
             block_ngram_repeat,
             exclusion_tokens,
             return_attention,
-            max_length,
+            max_new_tokens,
             ban_unk_token,
             add_estimator,
         )

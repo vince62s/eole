@@ -74,7 +74,7 @@ class ScoringPreparator:
         )
 
         if self.config.inference is not None:
-            for field in ("language", "task", "max_length", "beam_size", "length_penalty", "seed"):
+            for field in ("language", "task", "max_new_tokens", "beam_size", "length_penalty", "seed"):
                 value = getattr(self.config.inference, field, None)
                 if value is not None:
                     predict_kwargs[field] = value

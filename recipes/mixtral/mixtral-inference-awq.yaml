@@ -9,7 +9,7 @@ model_path: "${EOLE_MODEL_DIR}/mixtral-8x7b-instruct-v0.1-awq"
 
 # Inference
 seed: 42
-max_length: 256
+max_new_tokens: 256
 batch_type: sents
 batch_size: 1
 world_size: 2

@@ -81,7 +81,7 @@ class LoadTester:
         payload = {
             "model": self.model_id,
             "inputs": inputs if num_inputs > 1 else inputs[0],  # Single string if only 1 input
-            "max_length": 50,
+            "max_new_tokens": 50,
             "temperature": 0.7,
         }
 
@@ -123,7 +123,7 @@ class LoadTester:
             },
         ]
 
-        payload = {"model": self.model_id, "messages": messages, "max_length": 50, "temperature": 0.7}
+        payload = {"model": self.model_id, "messages": messages, "max_new_tokens": 50, "temperature": 0.7}
 
         start_time = time.time()
         try:

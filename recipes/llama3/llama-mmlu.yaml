@@ -3,8 +3,8 @@ model_path: "${EOLE_MODEL_DIR}/llama3-8b-instruct/model.pt"
 
 # Inference
 seed: 42
-# max_length: 256
-max_length: 1
+# max_new_tokens: 256
+max_new_tokens: 1
 batch_type: sents
 batch_size: 1
 world_size: 1

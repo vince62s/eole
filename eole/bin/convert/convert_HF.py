@@ -826,8 +826,11 @@ def check_generation_config(hf):
         return {}
     generation_config_dict = {}
     # we probably need a better mapping at some point
-    keys = ["top_k", "top_p", "temperature", "max_length"]
+    keys = ["top_k", "top_p", "temperature", "max_new_tokens"]
     generation_config_dict = {key: hf.generation_config[key] for key in keys if key in hf.generation_config}
+    # Also handle legacy 'max_length' from HF generation configs
+    if "max_new_tokens" not in generation_config_dict and "max_length" in hf.generation_config:
+        generation_config_dict["max_new_tokens"] = hf.generation_config["max_length"]
     return generation_config_dict
 
 

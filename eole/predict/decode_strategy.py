@@ -17,11 +17,11 @@ class DecodeStrategy(object):
       parallel_paths (int): Decoding strategies like beam search
         use parallel paths. Each batch is repeated ``parallel_paths``
         times in relevant state tensors.
-      min_length (int): Shortest acceptable generation, not counting
-        begin-of-sentence or end-of-sentence.
-      max_length (int): Longest acceptable sequence, not counting
-        begin-of-sentence (presumably there has been no EOS
-        yet if max_length is used as a cutoff).
+      min_new_tokens (int): Minimum number of new tokens to generate,
+        not counting begin-of-sentence or end-of-sentence.
+      max_new_tokens (int): Maximum number of new tokens to generate,
+        not counting begin-of-sentence (presumably there has been no EOS
+        yet if max_new_tokens is used as a cutoff).
       ban_unk_token (Boolean): Whether unk token is forbidden
       block_ngram_repeat (int): Block beams where
         ``block_ngram_repeat``-grams repeat.
@@ -56,8 +56,8 @@ class DecodeStrategy(object):
       target_prefix (LongTensor or NoneType): If tensor, shape is
         ``(B x parallel_paths, prefix_seq_len)``, where ``prefix_seq_len``
         is the (max) length of the pre-fixed prediction.
-      min_length (int): See above.
-      max_length (int): See above.
+      min_new_tokens (int): See above.
+      max_new_tokens (int): See above.
       ban_unk_token (Boolean): See above.
       block_ngram_repeat (int): See above.
       exclusion_tokens (set[int]): See above.
@@ -74,11 +74,11 @@ class DecodeStrategy(object):
         batch_size,
         parallel_paths,
         global_scorer,
-        min_length,
+        min_new_tokens,
         block_ngram_repeat,
         exclusion_tokens,
         return_attention,
-        max_length,
+        max_new_tokens,
         ban_unk_token,
         add_estimator,
     ):
@@ -106,8 +106,8 @@ class DecodeStrategy(object):
 
         self.alive_attn = None
 
-        self.min_length = min_length
-        self.max_length = max_length
+        self.min_new_tokens = min_new_tokens
+        self.max_new_tokens = max_new_tokens
         self.ban_unk_token = ban_unk_token
 
         self.block_ngram_repeat = block_ngram_repeat
@@ -172,7 +172,7 @@ class DecodeStrategy(object):
 
             # fix length constraint and remove eos from count
             prefix_non_pad = target_prefix.ne(self.pad).sum(dim=-1).tolist()
-            self.min_length += min(prefix_non_pad) - 1
+            self.min_new_tokens += min(prefix_non_pad) - 1
 
         self.target_prefix = target_prefix  # NOTE: forced prefix words
         self._prefix_len = self.target_prefix.size(1) if self.target_prefix is not None else 0
@@ -182,7 +182,7 @@ class DecodeStrategy(object):
         return self.alive_seq.shape[1]
 
     def ensure_min_length(self, log_probs):
-        if len(self) <= self.min_length:
+        if len(self) <= self.min_new_tokens:
             for eos in self.eos:
                 log_probs[:, eos] = -65504  # -1e20
 
@@ -193,8 +193,8 @@ class DecodeStrategy(object):
     def ensure_max_length(self):
         # add one to account for BOS. Don't account for EOS because hitting
         # this implies it hasn't been found.
-        if len(self) == self.max_length + 1:
-            # print("max length reached", self.max_length)  # for debug
+        if len(self) == self.max_new_tokens + 1:
+            # print("max new tokens reached", self.max_new_tokens)  # for debug
             self.is_finished_list = [
                 [True for _ in range(self.parallel_paths)] for _ in range(len(self.is_finished_list))
             ]

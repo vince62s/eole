@@ -192,7 +192,7 @@ The script normalises text using `EnglishTextNormalizer` from the `whisper-norma
 | `output` | str  | required | Output file path                                                |
 | `beam_size` | int  | 5        | Beam search width                                               |
 | `length_penalty` | str  | "avg"    | Length penalty strategy. Use `none` for Whisper models           |
-| `max_length` | int  | 250      | Maximum output tokens                                           |
+| `max_new_tokens` | int  | 250      | Maximum new tokens to generate                                           |
 | `batch_size` | int  | 1        | Batch size (use 1 for audio)                                    |
 | `gpu_ranks` | list | []       | GPU device IDs                                                  |
 | `seed` | int  | -1       | Random seed. Set to 0+ for deterministic fallback sampling      |

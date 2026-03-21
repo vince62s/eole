@@ -14,9 +14,9 @@ class Encoder(Inference):
     def predict_batch(self, batch, attn_debug, streamer=None):
         """Predict a batch of sentences."""
         if self.max_length_ratio > 0:
-            max_length = int(min(self.max_length, batch["src"].size(1) * self.max_length_ratio + 5))
+            max_new_tokens = int(min(self.max_new_tokens, batch["src"].size(1) * self.max_length_ratio + 5))
         else:
-            max_length = self.max_length
+            max_new_tokens = self.max_new_tokens
         with torch.no_grad():
             if self.top_k != 0 or self.top_p != 0:
                 decode_strategy = GreedySearch(
@@ -28,8 +28,8 @@ class Encoder(Inference):
                     n_best=self.n_best,
                     batch_size=len(batch["srclen"]),
                     global_scorer=self.global_scorer,
-                    min_length=self.min_length,
-                    max_length=max_length,
+                    min_new_tokens=self.min_new_tokens,
+                    max_new_tokens=max_new_tokens,
                     block_ngram_repeat=self.block_ngram_repeat,
                     exclusion_tokens=self._exclusion_idxs,
                     return_attention=attn_debug or self.replace_unk,
@@ -53,8 +53,8 @@ class Encoder(Inference):
                     start=self._tgt_start_with,
                     n_best=self.n_best,
                     global_scorer=self.global_scorer,
-                    min_length=self.min_length,
-                    max_length=max_length,
+                    min_new_tokens=self.min_new_tokens,
+                    max_new_tokens=max_new_tokens,
                     return_attention=attn_debug or self.replace_unk,
                     block_ngram_repeat=self.block_ngram_repeat,
                     exclusion_tokens=self._exclusion_idxs,

@@ -35,4 +35,4 @@ We decided to implement 4 modes:
 The main reason is that currently Eole reduce the batch size when sequences are finished and eliminated fomr the batch. We could adopt another strategy and keep the batch size constant.
 
 * We also changed the way the KV cache is set up. We used to handle a dynamically growing cache which is a bit cumbersome with torch.compile
-* Selecting the `max_length` upfront is key and now counts for both the prefill and decoded tokens. (cf benchmark scripts or recipes)
+* Selecting the `context_length` upfront is key and counts for both the prefill and decoded tokens (prefill + max_new_tokens). (cf benchmark scripts or recipes)

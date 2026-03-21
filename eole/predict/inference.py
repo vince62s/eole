@@ -92,16 +92,16 @@ class Inference(object):
         self.dynamic_shapes = config.dynamic_shapes
 
         self.n_best = config.n_best
-        self.max_length = config.max_length
+        self.max_new_tokens = config.max_new_tokens
         self.max_length_ratio = config.max_length_ratio
-        self.max_new_tokens = 0
+        self.context_length = config.context_length
 
         self.beam_size = config.beam_size
         self.temperature = config.temperature
         self.top_k = config.top_k
         self.top_p = config.top_p
 
-        self.min_length = config.min_length
+        self.min_new_tokens = config.min_new_tokens
         self.ban_unk_token = config.ban_unk_token
         self.ratio = config.ratio
         self.stepwise_penalty = config.stepwise_penalty
