@@ -170,10 +170,6 @@ class DecodeStrategy(object):
             ), "forced target_prefix should've extend to same number of path!"
             target_prefix = target_prefix[:, 1:]  # remove bos
 
-            # fix length constraint and remove eos from count
-            prefix_non_pad = target_prefix.ne(self.pad).sum(dim=-1).tolist()
-            self.min_new_tokens += min(prefix_non_pad) - 1
-
         self.target_prefix = target_prefix  # NOTE: forced prefix words
         self._prefix_len = self.target_prefix.size(1) if self.target_prefix is not None else 0
         return None
@@ -182,7 +178,7 @@ class DecodeStrategy(object):
         return self.alive_seq.shape[1]
 
     def ensure_min_length(self, log_probs):
-        if len(self) <= self.min_new_tokens:
+        if len(self) - self._prefix_len <= self.min_new_tokens:
             for eos in self.eos:
                 log_probs[:, eos] = -65504  # -1e20
 
@@ -191,9 +187,9 @@ class DecodeStrategy(object):
             log_probs[:, self.unk] = -65504  # -1e20
 
     def ensure_max_length(self):
-        # add one to account for BOS. Don't account for EOS because hitting
-        # this implies it hasn't been found.
-        if len(self) == self.max_new_tokens + 1:
+        # Subtract 1 for BOS and _prefix_len for forced prefix tokens so the
+        # check is against freely generated tokens only.
+        if len(self) - 1 - self._prefix_len == self.max_new_tokens:
             # print("max new tokens reached", self.max_new_tokens)  # for debug
             self.is_finished_list = [
                 [True for _ in range(self.parallel_paths)] for _ in range(len(self.is_finished_list))
