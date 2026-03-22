@@ -340,6 +340,7 @@ def build_config_dict(hf):
     # For Qwen3.5 MoE: use shared_expert_intermediate_size as shared expert FF size
     # (overrides the default moe_transformer_ff * num_shared_experts calculation in MoE.__init__)
     if config.get("shared_expert_intermediate_size") and arch in [
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
     ]:
         model_config["moe_transformer_ff"] = config["moe_intermediate_size"]
@@ -561,8 +562,10 @@ def build_config_dict(hf):
         mrope_section = rope_params.get("mrope_section", None)
         if mrope_section is not None:
             model_config["rope_config"]["xdrope_section"] = mrope_section
-        if rope_params.get("mrope_interleaved", False):
-            model_config["rope_config"]["rotary_interleave"] = True
+        # Note: mrope_interleaved controls how T/H/W frequency sections are assembled
+        # (interleaved vs. chunked layout in frequency space), NOT the within-head rotation
+        # style (GPT-J vs GPT-NeoX). HF Qwen3.5 always uses rotate_half (GPT-NeoX style,
+        # non-interleaved) for the actual Q/K rotation, so rotary_interleave stays False.
 
     # Validate required fields
     required_fields = {

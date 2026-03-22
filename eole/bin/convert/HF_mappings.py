@@ -56,6 +56,29 @@ MODEL_OVERRIDES = {
             }
         },
     },
+    # Qwen3.5 text-only (dense) model — same hybrid architecture as the VL decoder
+    "Qwen3_5TextForCausalLM": {
+        "decoder": {
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            ".linear_attn.in_proj_qkv.": ".linear_attn.in_proj_qkv.",
+            ".linear_attn.in_proj_z.": ".linear_attn.in_proj_z.",
+            ".linear_attn.in_proj_b.": ".linear_attn.in_proj_b.",
+            ".linear_attn.in_proj_a.": ".linear_attn.in_proj_a.",
+            ".linear_attn.conv1d.": ".linear_attn.conv1d.",
+            ".linear_attn.dt_bias": ".linear_attn.dt_bias",
+            ".linear_attn.A_log": ".linear_attn.A_log",
+            ".linear_attn.norm.": ".linear_attn.norm.",
+            ".linear_attn.out_proj.": ".linear_attn.out_proj.",
+        },
+        "config": {
+            "decoder": {
+                "query_norm": True,
+                "key_norm": True,
+                "q_gating": True,
+            }
+        },
+    },
     "Qwen3MoeForCausalLM": {
         "decoder": {
             ".self_attn.q_norm.": ".self_attn.q_norm.",
@@ -69,6 +92,55 @@ MODEL_OVERRIDES = {
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
+            }
+        },
+    },
+    # Qwen3.5 MoE text-only (causal LM) — same hybrid decoder as Qwen3_5MoeForConditionalGeneration
+    # but uses the standard model.layers.* weight prefix (no separate language_model sub-model).
+    "Qwen3_5MoeForCausalLM": {
+        "decoder": {
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            ".linear_attn.in_proj_qkv.": ".linear_attn.in_proj_qkv.",
+            ".linear_attn.in_proj_z.": ".linear_attn.in_proj_z.",
+            ".linear_attn.in_proj_b.": ".linear_attn.in_proj_b.",
+            ".linear_attn.in_proj_a.": ".linear_attn.in_proj_a.",
+            ".linear_attn.conv1d.": ".linear_attn.conv1d.",
+            ".linear_attn.dt_bias": ".linear_attn.dt_bias",
+            ".linear_attn.A_log": ".linear_attn.A_log",
+            ".linear_attn.norm.": ".linear_attn.norm.",
+            ".linear_attn.out_proj.": ".linear_attn.out_proj.",
+            ".mlp.gate.weight": ".mlp.gate.weight",
+            **{
+                f".mlp.experts.{j}.gate_up_proj.weight": (
+                    ".mlp.experts.gate_up_proj",
+                    f"[{j}, :moe_transformer_ff, :]",
+                )
+                for j in range(256)
+            },
+            **{
+                f".mlp.experts.{j}.up_proj.weight": (
+                    ".mlp.experts.gate_up_proj",
+                    f"[{j}, moe_transformer_ff:, :]",
+                )
+                for j in range(256)
+            },
+            **{f".mlp.experts.{j}.down_proj.weight": (".mlp.experts.down_proj", f"[{j}]") for j in range(256)},
+            **{f".mlp.experts.{j}.gate_up_proj.": f".mlp.experts.{j}.gate_proj." for j in range(256)},
+            **{f".mlp.experts.{j}.up_proj.": f".mlp.experts.{j}.up_proj." for j in range(256)},
+            **{f".mlp.experts.{j}.down_proj.": f".mlp.experts.{j}.down_proj." for j in range(256)},
+            ".mlp.shared_experts.gate_up_proj.": ".mlp.shared_expert.gate_proj.",
+            ".mlp.shared_experts.up_proj.": ".mlp.shared_expert.up_proj.",
+            ".mlp.shared_experts.down_proj.": ".mlp.shared_expert.down_proj.",
+            ".mlp.shared_expert_gate.weight": ".mlp.shared_expert_gate.weight",
+        },
+        "config": {
+            "decoder": {
+                "query_norm": True,
+                "key_norm": True,
+                "q_gating": True,
+                "shared_expert_gate": True,
+                "moe_renormalize": True,
             }
         },
     },
@@ -796,6 +868,8 @@ LN_TABLE = defaultdict(
         "M2M100ForConditionalGeneration": "standard",
         "WhisperForConditionalGeneration": "standard",
         "Gemma3ForConditionalGeneration": "gemma-rms",
+        "Qwen3_5TextForCausalLM": "gemma-rms",
+        "Qwen3_5MoeForCausalLM": "gemma-rms",
         "Qwen3_5ForConditionalGeneration": "gemma-rms",
         "Qwen3_5MoeForConditionalGeneration": "gemma-rms",
     },
