@@ -265,14 +265,19 @@ except ImportError:
         def forward(self, x, z=None, prenorm=False):
             input_dtype = x.dtype
             if z is not None and prenorm:
+                # fp16/bf16 * fp32 → fp32 (PyTorch type-promotion), so x becomes fp32 here.
                 x = x * F.silu(z.to(torch.float32))
                 z = None  # already applied; skip post-norm multiply
             x = x.to(torch.float32)
             variance = x.pow(2).mean(-1, keepdim=True)
             x = x * torch.rsqrt(variance + self.variance_epsilon)
+            # self.weight is fp32; x.to(input_dtype) is fp16/bf16.
+            # fp32 * fp16 → fp32 via PyTorch type-promotion, so x stays fp32.
+            # This matches HF: `self.weight * hidden_states.to(input_dtype)`.
             x = self.weight * x.to(input_dtype)
             if z is not None and not prenorm:
                 # Apply the silu gate in fp32 (HF: `hidden_states * F.silu(gate.to(float32))`).
+                # x is already fp32 (see above); fp32 * fp32 → fp32.
                 # Do NOT cast silu(z) back to input_dtype before the multiply — that rounds the
                 # gate to fp16/bf16 and introduces numerical error that compounds across layers.
                 x = x * F.silu(z.to(torch.float32))
