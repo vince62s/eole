@@ -958,6 +958,142 @@ class _StreamingTensorStore:
         os.remove(self._tmp_path)
 
 
+def _collect_all_source_keys(hf):
+    """Collect all tensor keys present in the source HuggingFace checkpoint(s).
+
+    For sharded models (with a weight-map index file) the key names are read
+    directly from the already-loaded JSON index so no additional file I/O is
+    required.  For single-file checkpoints the file is opened once to obtain
+    its key listing.
+
+    Args:
+        hf (HuggingfaceFiles): Source model files dataclass.
+
+    Returns:
+        set: All tensor key names found across every source checkpoint file.
+    """
+    if hf.wmap_path is not None:
+        # The weight-map already contains every tensor key as a dict key.
+        return set(hf.wmap["weight_map"].keys())
+    else:
+        ckpt = hf.get_load_ckpt(*os.path.split(hf.model_path))
+        if isinstance(ckpt, dict):
+            return set(ckpt.keys())
+        else:
+            with safetensors.safe_open(ckpt, framework="pt", device="cpu") as f:
+                return set(f.keys())
+
+
+def check_conversion_completeness(all_src_keys, consumed_src_keys):
+    """Check that every source checkpoint tensor was accounted for during conversion.
+
+    Tensors that exist in the source checkpoints but were never read and stored
+    in any output shard are printed as warnings.
+
+    Args:
+        all_src_keys (set): All tensor keys from the source checkpoint(s).
+        consumed_src_keys (set): Source keys that contributed to at least one
+            output tensor.
+
+    Returns:
+        set: Source keys that were not converted (empty when everything matched).
+    """
+    unconverted = all_src_keys - consumed_src_keys
+    if unconverted:
+        print(
+            "\nWARNING: %d source tensor(s) were not converted:" % len(unconverted)
+        )
+        for key in sorted(unconverted):
+            print("  - %s" % key)
+    else:
+        print("\nAll source tensors were successfully converted.")
+    return unconverted
+
+
+def check_conversion_equality(hf, conversion_details, target_dtype):
+    """Verify that every converted tensor in the output matches its source.
+
+    For each entry in *conversion_details* the corresponding source tensor is
+    reloaded from disk, the same transformation that was applied during
+    conversion is re-applied, and the result is compared element-wise with the
+    tensor that was written to the output shard.  Any mismatch is reported.
+
+    Args:
+        hf (HuggingfaceFiles): Source model files dataclass (used to reload
+            source tensors).
+        conversion_details (list[dict]): One dict per written output tensor,
+            each containing:
+            - ``shard_path``  – path of the output safetensors shard file
+            - ``eole_key``    – tensor key inside that shard
+            - ``srckey``      – full tensor key in the source checkpoint
+            - ``srcmap``      – optional eval-string transformation (or None)
+            - ``context``     – variable bindings for the eval string
+            - ``special``     – optional post-transform tag (e.g. "unsqueeze(0)")
+        target_dtype: Target torch dtype applied during conversion, or None.
+
+    Returns:
+        list[tuple]: ``(eole_key, reason)`` pairs for every mismatch found.
+            Empty when all tensors matched.
+    """
+    mismatches = []
+    print("\nVerifying converted tensor equality (%d tensors)..." % len(conversion_details))
+    for detail in conversion_details:
+        shard_path = detail["shard_path"]
+        eole_key = detail["eole_key"]
+        srckey = detail["srckey"]
+        srcmap = detail["srcmap"]
+        context = detail["context"]
+        special = detail["special"]
+
+        # Reload the source tensor from the appropriate checkpoint file.
+        if hf.wmap_path is not None:
+            ckpt_name = hf.wmap["weight_map"].get(srckey)
+            if ckpt_name is None:
+                mismatches.append((eole_key, "source key '%s' not found in weight map" % srckey))
+                continue
+            ckpt = hf.get_load_ckpt(hf.base_dir, ckpt_name)
+        else:
+            ckpt = hf.get_load_ckpt(*os.path.split(hf.model_path))
+
+        src = get_weight(ckpt, srckey)
+        if src is None:
+            mismatches.append((eole_key, "source tensor '%s' could not be loaded" % srckey))
+            continue
+
+        # Re-apply the same transformation used during conversion.
+        if srcmap is not None:
+            src = eval("w" + srcmap, {"w": src, **context}).contiguous()
+
+        # Re-apply any special post-transform.
+        if special == "unsqueeze(0)":
+            src = src.unsqueeze(0)
+
+        # Cast to the same dtype that was applied during conversion.
+        if target_dtype is not None:
+            src = src.to(target_dtype)
+
+        # Load the corresponding tensor from the saved output shard.
+        with safetensors.safe_open(shard_path, framework="pt", device="cpu") as f:
+            if eole_key not in f.keys():
+                mismatches.append((eole_key, "key not found in output shard '%s'" % shard_path))
+                continue
+            tgt = f.get_tensor(eole_key)
+
+        # Element-wise comparison.
+        if not torch.equal(src, tgt):
+            mismatches.append((eole_key, "values differ between source (after transform) and output"))
+
+    if mismatches:
+        print(
+            "\nERROR: %d converted tensor(s) do not match their source:" % len(mismatches)
+        )
+        for key, reason in mismatches:
+            print("  - %s: %s" % (key, reason))
+    else:
+        print("All %d converted tensors match their source." % len(conversion_details))
+    return mismatches
+
+
 def build_shards(model_config, hf, args, params):
     """
     Build sharded model files from HuggingFace checkpoint.
@@ -971,9 +1107,22 @@ def build_shards(model_config, hf, args, params):
     The function splits the model into shards and saves them as safetensor files.
     Layer parameters are distributed across shards based on the sharding configuration.
     The first shard contains embeddings and model-level parameters on top of its layer split.
+
+    Returns:
+        tuple:
+            - all_src_keys (set): Every tensor key present in the source checkpoint(s).
+            - consumed_src_keys (set): Source keys that contributed to at least one
+              output tensor.
+            - conversion_details (list[dict]): Metadata for each written output tensor,
+              used by :func:`check_conversion_equality`.
     """
     shard_checkpoints, shard_layer_ranges = get_shards_map(model_config, hf, args.nshards)
     target_dtype = TORCH_DTYPES[args.dtype] if args.dtype is not None else None
+
+    # Collect every tensor key present in the source checkpoint(s) upfront.
+    all_src_keys = _collect_all_source_keys(hf)
+    consumed_src_keys = set()
+    conversion_details = []
 
     for shard in range(args.nshards):
 
@@ -1004,21 +1153,34 @@ def build_shards(model_config, hf, args, params):
                     continue
                 w = get_weight(checkpoint, srckey)
                 if w is not None:
+                    consumed_src_keys.add(srckey)
+                    context = {
+                        "hidden_size": model_config["hidden_size"],
+                        "transformer_ff": model_config["transformer_ff"],
+                    }
                     if srcmap is not None:
                         w = eval(
                             "w" + srcmap,
-                            {
-                                "w": w,
-                                "hidden_size": model_config["hidden_size"],
-                                "transformer_ff": model_config["transformer_ff"],
-                            },
+                            {"w": w, **context},
                         ).contiguous()
                     if target_dtype is not None:
                         w = w.to(target_dtype)
+                    special = None
                     if target == "encoder.class_embedding.weight":
                         eole_safetensor[target] = w.unsqueeze(0)
+                        special = "unsqueeze(0)"
                     else:
                         eole_safetensor[target] = w
+                    conversion_details.append(
+                        {
+                            "shard_path": output_path,
+                            "eole_key": target,
+                            "srckey": srckey,
+                            "srcmap": srcmap,
+                            "context": context,
+                            "special": special,
+                        }
+                    )
             return eole_safetensor
 
         if shard == 0:
@@ -1070,24 +1232,27 @@ def build_shards(model_config, hf, args, params):
                             w = _layer_tensor_cache[full_srckey]
 
                             if w is not None:
+                                consumed_src_keys.add(full_srckey)
                                 if srcmap is not None:
                                     hidden_size = (
                                         model_config["hidden_size"]
                                         if section.startswith("decoder")
                                         else model_config["encoder"]["hidden_size"]
                                     )
+                                    context = {
+                                        "hidden_size": hidden_size,
+                                        "transformer_ff": model_config["transformer_ff"],
+                                        "moe_transformer_ff": model_config.get("decoder", {}).get(
+                                            "moe_transformer_ff",
+                                            model_config.get("moe_transformer_ff", 0),
+                                        ),
+                                    }
                                     w = eval(
                                         "w" + srcmap,
-                                        {
-                                            "w": w,
-                                            "hidden_size": hidden_size,
-                                            "transformer_ff": model_config["transformer_ff"],
-                                            "moe_transformer_ff": model_config.get("decoder", {}).get(
-                                                "moe_transformer_ff",
-                                                model_config.get("moe_transformer_ff", 0),
-                                            ),
-                                        },
+                                        {"w": w, **context},
                                     ).contiguous()
+                                else:
+                                    context = {}
                                 if target_dtype is not None:
                                     w = w.to(target_dtype)
                                 target1 = target
@@ -1096,10 +1261,22 @@ def build_shards(model_config, hf, args, params):
                                 eole_key = eole_prefix + str(i) + target1
                                 if eole_key not in eole_safetensor.keys():
                                     eole_safetensor[eole_key] = w
+                                    conversion_details.append(
+                                        {
+                                            "shard_path": output_path,
+                                            "eole_key": eole_key,
+                                            "srckey": full_srckey,
+                                            "srcmap": srcmap,
+                                            "context": context,
+                                            "special": None,
+                                        }
+                                    )
                 _layer_tensor_cache.clear()
 
         print("Saving output model shard: %d" % shard)
         eole_safetensor.save(output_path)
+
+    return all_src_keys, consumed_src_keys, conversion_details
 
 
 def check_sentencepiece_tokenizer(hf):
@@ -1307,7 +1484,14 @@ class LlamaHFConverter(BaseBin):
         save_vocab(vocabs, src_vocab, args.output)
 
         # Build shards
-        build_shards(model_config, hf, args, params)
+        all_src_keys, consumed_src_keys, conversion_details = build_shards(
+            model_config, hf, args, params
+        )
+
+        # Post-conversion validation
+        target_dtype = TORCH_DTYPES[args.dtype] if args.dtype is not None else None
+        check_conversion_completeness(all_src_keys, consumed_src_keys)
+        check_conversion_equality(hf, conversion_details, target_dtype)
 
         # Build eole config and save to output model directory
         config = TrainConfig(
