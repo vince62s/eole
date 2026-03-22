@@ -265,15 +265,18 @@ except ImportError:
         def forward(self, x, z=None, prenorm=False):
             input_dtype = x.dtype
             if z is not None and prenorm:
-                x = x * F.silu(z.to(torch.float32)).to(input_dtype)
+                x = x * F.silu(z.to(torch.float32))
                 z = None  # already applied; skip post-norm multiply
             x = x.to(torch.float32)
             variance = x.pow(2).mean(-1, keepdim=True)
             x = x * torch.rsqrt(variance + self.variance_epsilon)
             x = self.weight * x.to(input_dtype)
             if z is not None and not prenorm:
-                x = x * F.silu(z.to(torch.float32)).to(input_dtype)
-            return x
+                # Apply the silu gate in fp32 (HF: `hidden_states * F.silu(gate.to(float32))`).
+                # Do NOT cast silu(z) back to input_dtype before the multiply — that rounds the
+                # gate to fp16/bf16 and introduces numerical error that compounds across layers.
+                x = x * F.silu(z.to(torch.float32))
+            return x.to(input_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -430,10 +433,12 @@ class GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(n_rep, dim=2)
             key = key.repeat_interleave(n_rep, dim=2)
 
-        # Discretise decay / gate
-        dt = F.softplus(a + self.dt_bias)  # (B, S, num_v_heads)
+        # Discretise decay / gate.
+        # HF reference casts `a` to float32 before softplus to avoid fp16 precision loss
+        # (see Qwen3_5GatedDeltaNet.forward: g = -A_log.float().exp() * softplus(a.float() + dt_bias)).
+        # We match that here so the computed g values are numerically identical to HF.
         A = -torch.exp(self.A_log.float())  # (num_v_heads,)
-        g = dt * A.view(1, 1, -1)  # (B, S, num_v_heads)
+        g = A.view(1, 1, -1) * F.softplus(a.float() + self.dt_bias.float())  # (B, S, num_v_heads) in fp32
         beta = torch.sigmoid(b)  # (B, S, num_v_heads)
 
         # At padding positions, q/k/v are already zeroed (hidden_states was zeroed above).

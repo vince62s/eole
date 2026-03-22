@@ -562,10 +562,8 @@ def build_config_dict(hf):
         mrope_section = rope_params.get("mrope_section", None)
         if mrope_section is not None:
             model_config["rope_config"]["xdrope_section"] = mrope_section
-        # Note: mrope_interleaved controls how T/H/W frequency sections are assembled
-        # (interleaved vs. chunked layout in frequency space), NOT the within-head rotation
-        # style (GPT-J vs GPT-NeoX). HF Qwen3.5 always uses rotate_half (GPT-NeoX style,
-        # non-interleaved) for the actual Q/K rotation, so rotary_interleave stays False.
+        if rope_params.get("mrope_interleaved", False):
+            model_config["rope_config"]["rotary_interleave"] = True
 
     # Validate required fields
     required_fields = {
