@@ -283,6 +283,8 @@ class TransformerDecoderLayer(nn.Module):
         if self.full_context_alignment:
             # return _, (B, Q_len, K_len)
             _, attns = self.forward(layer_in, **kwargs)
+        if attns is None:
+            return None
         if self.alignment_heads > 0:
             attns = attns[:, : self.alignment_heads, :, :].contiguous()
         # layer average attention across heads, get ``(B, Q, K)``
@@ -303,11 +305,11 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class TransformerDecoder(DecoderBase):
-    """The Transformer encoder from "Attention is All You Need"
+    """The Transformer decoder from "Attention is All You Need"
     :cite:`DBLP:journals/corr/VaswaniSPUJGKP17`
 
     Args:
-        decoder_config (eole.config.TransformerEncoderConfig): full encoder config
+        decoder_config (eole.config.TransformerDecoderConfig): full decoder config
         running_config (TrainingConfig / InferenceConfig)
     """
 
@@ -950,7 +952,7 @@ class TransformerDecoder(DecoderBase):
             attn_mask = None
             cache_slice = None  # triggers flash decoding
             if S > 1 and self.has_linear_attn:
-                lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
+                lin_attn_mask = ~tgt_pad_mask[:, 0, :]
             else:
                 lin_attn_mask = None
 
@@ -997,7 +999,7 @@ class TransformerDecoder(DecoderBase):
         # we take the first head
         top_attn = None if attn is None else attn[:, 0, :, :].contiguous()
         attns = {"std": top_attn}
-        if with_align:
+        if with_align and self.alignment_layer < len(attn_aligns):
             attns["align"] = attn_aligns[self.alignment_layer]  # `(B, Q, K)`
         if all_cross_attns is not None:
             attns["cross_attns"] = all_cross_attns
