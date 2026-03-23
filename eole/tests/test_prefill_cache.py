@@ -4,9 +4,12 @@ Tests the PrefillCache class directly and the integration with
 TransformerDecoder's chunked prefill path, verifying that:
 
   - Rolling hash keys distinguish different prefixes.
-  - Cache hits restore the correct embeddings and KV slices.
+  - Cache hits restore the correct embeddings and layer states.
   - LRU eviction works correctly.
-  - Caching is skipped when batch_size > 1 or image tokens are present.
+  - Caching works correctly for batch_size > 1 (per-sequence keys).
+  - Caching works correctly for hybrid linear-attention models
+    (recurrent states are cached and restored alongside KV slices).
+  - Caching is skipped only when image tokens are present.
   - prefill_chunk_size triggers chunked prefill independently of sliding_window.
 """
 
@@ -86,18 +89,18 @@ class TestPrefillCacheBasics(unittest.TestCase):
         emb = torch.randn(4, 8)  # (chunk_len, hidden)
         k_slice = torch.randn(4, 2, 16)  # (chunk_len, heads_kv, dph)
         v_slice = torch.randn(4, 2, 16)
-        kv_slices = [(k_slice, v_slice)]
+        layer_states = [(k_slice, v_slice)]
 
         key = self.Cache.compute_key(torch.arange(4))
-        cache.put(key, emb, kv_slices)
+        cache.put(key, emb, layer_states)
 
         result = cache.get(key)
         self.assertIsNotNone(result)
-        emb_out, kv_out = result
+        emb_out, states_out = result
         # Tensors are stored on CPU
         self.assertEqual(emb_out.device, torch.device("cpu"))
         torch.testing.assert_close(emb_out, emb.cpu())
-        k_out, v_out = kv_out[0]
+        k_out, v_out = states_out[0]
         torch.testing.assert_close(k_out, k_slice.cpu())
         torch.testing.assert_close(v_out, v_slice.cpu())
 
@@ -145,20 +148,20 @@ class TestPrefillCacheBasics(unittest.TestCase):
         cache.clear()
         self.assertEqual(len(cache), 0)
 
-    def test_none_kv_slice_for_linear_attention(self):
-        """None entries in kv_slices (linear-attention layers) are preserved."""
+    def test_linear_attn_state_roundtrip(self):
+        """Linear-attention (conv_state, recurrent_state) pairs survive a put/get cycle."""
         cache = self.Cache(max_entries=10)
-        k_slice = torch.randn(4, 2, 8)
-        v_slice = torch.randn(4, 2, 8)
-        kv_slices = [None, (k_slice, v_slice), None]  # layers 0, 2 are linear
+        conv = torch.randn(8, 3)      # (conv_dim, kernel_size) - no batch dim
+        rec = torch.randn(4, 16, 8)   # (num_heads, head_k_dim, head_v_dim)
+        layer_states = [(conv, rec)]  # same pair format as standard attention
 
         key = self.Cache.compute_key(torch.arange(4))
-        cache.put(key, torch.zeros(4, 16), kv_slices)
+        cache.put(key, torch.zeros(4, 16), layer_states)
 
-        _, kv_out = cache.get(key)
-        self.assertIsNone(kv_out[0])
-        self.assertIsNotNone(kv_out[1])
-        self.assertIsNone(kv_out[2])
+        _, states_out = cache.get(key)
+        conv_out, rec_out = states_out[0]
+        torch.testing.assert_close(conv_out, conv.cpu())
+        torch.testing.assert_close(rec_out, rec.cpu())
 
 
 @unittest.skipUnless(HAS_TORCH, "torch not available")
@@ -170,56 +173,76 @@ class TestChunkedPrefillWithCache(unittest.TestCase):
       - Cache miss: _forward_eager is called and result is stored.
       - Cache hit: _forward_eager is NOT called; cached values are restored.
       - cache_seqlens is correctly updated for both paths.
+      - Batch size > 1: per-sequence keys; all-hit skips forward.
+      - Hybrid linear-attention: recurrent states are cached and restored.
     """
 
-    def _make_mock_decoder(self, S, chunk_size, num_layers=2, hidden=8, cache_size=16):
+    def _make_mock_decoder(self, S, chunk_size, B=1, has_linear_attn=False, cache_size=32):
         """Build a SimpleNamespace that mimics the parts of TransformerDecoder
-        used by _forward_chunked_prefill."""
+        used by _forward_chunked_prefill.
+
+        Layer layout (2 layers total):
+        - If has_linear_attn: layer 0 = linear_attention, layer 1 = full_attention
+        - Otherwise: both layers are full_attention
+        """
         import types
         from eole.modules.prefill_cache import PrefillCache
 
-        # Allocate KV cache buffers (batch=1, cache_len, heads_kv=1, dph=4)
-        cache_len = S  # exact fit for simplicity
+        cache_len = S
         heads_kv = 1
         dph = 4
+        conv_dim, kernel_size = 8, 3
+        num_v_heads, head_k_dim, head_v_dim = 4, 16, 8
 
         layers = []
-        for _ in range(num_layers):
-            layer = types.SimpleNamespace(
-                layer_type="full_attention",
-                self_attn=types.SimpleNamespace(
-                    kcache=torch.zeros(1, cache_len, heads_kv, dph),
-                    vcache=torch.zeros(1, cache_len, heads_kv, dph),
-                ),
-            )
+        num_layers = 2
+        for i in range(num_layers):
+            if has_linear_attn and i == 0:
+                layer = types.SimpleNamespace(
+                    layer_type="linear_attention",
+                    linear_attn=types.SimpleNamespace(
+                        conv_state=torch.zeros(B, conv_dim, kernel_size),
+                        recurrent_state=torch.zeros(B, num_v_heads, head_k_dim, head_v_dim),
+                    ),
+                )
+            else:
+                layer = types.SimpleNamespace(
+                    layer_type="full_attention",
+                    self_attn=types.SimpleNamespace(
+                        kcache=torch.zeros(B, cache_len, heads_kv, dph),
+                        vcache=torch.zeros(B, cache_len, heads_kv, dph),
+                    ),
+                )
             layers.append(layer)
 
-        call_count = [0]  # mutable counter
+        call_count = [0]
 
         def stub_forward_eager(emb_chunk, **kw):
-            """Write a deterministic pattern to the KV cache and return emb."""
-            chunk_len = emb_chunk.size(1)
-            start = kw.get("_chunk_start", 0)
-            for layer in layers:
-                # Fill the slice with a recognizable pattern
-                layer.self_attn.kcache[0, start : start + chunk_len] = float(
-                    layers.index(layer) + 1
-                )
-                layer.self_attn.vcache[0, start : start + chunk_len] = float(
-                    layers.index(layer) + 1
-                ) * 2.0
+            """Write a deterministic pattern into KV/recurrent-state and return emb."""
+            B_actual, chunk_len, _ = emb_chunk.shape
+            # Derive current start position from cache_seqlens before add_.
+            cur_start = mock.cache_seqlens[0].item()
+            for li, layer in enumerate(layers):
+                val = float(li + 1)
+                if layer.layer_type == "linear_attention":
+                    for b in range(B_actual):
+                        layer.linear_attn.conv_state[b] = val * 0.1
+                        layer.linear_attn.recurrent_state[b] = val * 0.2
+                else:
+                    for b in range(B_actual):
+                        layer.self_attn.kcache[b, cur_start : cur_start + chunk_len] = val
+                        layer.self_attn.vcache[b, cur_start : cur_start + chunk_len] = val * 2.0
             call_count[0] += 1
             mock.cache_seqlens.add_(chunk_len)
-            out = emb_chunk * 2.0  # deterministic transform
-            return out, {"std": None}
+            return emb_chunk * 2.0, {"std": None}
 
         mock = types.SimpleNamespace(
             sliding_window=0,
             prefill_chunk_size=chunk_size,
-            has_linear_attn=False,
+            has_linear_attn=has_linear_attn,
             transformer_layers=layers,
             _prefill_cache=PrefillCache(max_entries=cache_size),
-            cache_seqlens=torch.zeros(1, dtype=torch.int32),
+            cache_seqlens=torch.zeros(B, dtype=torch.int32),
             cache_len_tgt=cache_len,
             _forward_eager=stub_forward_eager,
             _call_count=call_count,
@@ -228,11 +251,13 @@ class TestChunkedPrefillWithCache(unittest.TestCase):
 
     def _run_chunked_prefill(self, mock, emb, src_ids, **kwargs):
         """Invoke _forward_chunked_prefill on the mock via the real implementation."""
-        import types
         from eole.decoders.transformer import TransformerDecoder
 
-        # Bind the unbound method to our mock
         return TransformerDecoder._forward_chunked_prefill(mock, emb, src_ids=src_ids, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Basic miss / hit / key-mismatch tests (B=1, standard attention)
+    # ------------------------------------------------------------------
 
     def test_cache_miss_stores_result(self):
         """First call: _forward_eager runs and result is stored in cache."""
@@ -244,10 +269,8 @@ class TestChunkedPrefillWithCache(unittest.TestCase):
 
         self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask)
 
-        # _forward_eager was called once per chunk
         n_chunks = (S + chunk_size - 1) // chunk_size
         self.assertEqual(mock._call_count[0], n_chunks)
-        # cache now contains n_chunks entries
         self.assertEqual(len(mock._prefill_cache), n_chunks)
 
     def test_cache_hit_skips_forward(self):
@@ -259,27 +282,18 @@ class TestChunkedPrefillWithCache(unittest.TestCase):
         tgt_pad_mask = torch.zeros(1, 1, S, dtype=torch.bool)
 
         # First request: fills the cache
-        out1, _ = self._run_chunked_prefill(
-            mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone()
-        )
+        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
         count_after_first = mock._call_count[0]
 
-        # Reset cache_seqlens to simulate a new request
         mock.cache_seqlens.zero_()
 
-        # Second request with the same src_ids: all chunks should be cache hits
-        out2, _ = self._run_chunked_prefill(
-            mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone()
-        )
-        count_after_second = mock._call_count[0]
-
-        # No additional _forward_eager calls
-        self.assertEqual(count_after_second, count_after_first)
-        # cache_seqlens should have been incremented by S
+        # Second request: all chunks should be cache hits
+        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
+        self.assertEqual(mock._call_count[0], count_after_first)
         self.assertEqual(mock.cache_seqlens[0].item(), S)
 
     def test_different_src_ids_cause_cache_miss(self):
-        """Different token IDs produce a different cache key (miss)."""
+        """Different token IDs produce different cache keys (cache miss)."""
         S, chunk_size, hidden = 4, 4, 8
         mock = self._make_mock_decoder(S, chunk_size)
         emb = torch.randn(1, S, hidden)
@@ -292,32 +306,104 @@ class TestChunkedPrefillWithCache(unittest.TestCase):
         mock.cache_seqlens.zero_()
         self._run_chunked_prefill(mock, emb, src_ids_b, tgt_pad_mask=tgt_pad_mask.clone())
 
-        # Two distinct forward calls (one per unique src_ids)
         self.assertEqual(mock._call_count[0], 2)
 
-    def test_caching_disabled_for_batch_size_gt1(self):
-        """Cache is not used when B > 1."""
-        S, chunk_size, hidden = 4, 4, 8
-        mock = self._make_mock_decoder(S, chunk_size)
-        # Extend KV cache to batch=2
-        for layer in mock.transformer_layers:
-            layer.self_attn.kcache = torch.zeros(2, S, 1, 4)
-            layer.self_attn.vcache = torch.zeros(2, S, 1, 4)
-        mock.cache_seqlens = torch.zeros(2, dtype=torch.int32)
+    # ------------------------------------------------------------------
+    # Batch size > 1
+    # ------------------------------------------------------------------
 
-        emb = torch.randn(2, S, hidden)
-        src_ids = torch.randint(0, 100, (2, S))
-        tgt_pad_mask = torch.zeros(2, 1, S, dtype=torch.bool)
+    def test_caching_works_for_batch_size_gt1(self):
+        """B > 1: per-sequence cache keys; all-hit skips forward."""
+        S, chunk_size, hidden, B = 4, 4, 8, 2
+        mock = self._make_mock_decoder(S, chunk_size, B=B)
+        emb = torch.randn(B, S, hidden)
+        src_ids = torch.randint(0, 100, (B, S))
+        tgt_pad_mask = torch.zeros(B, 1, S, dtype=torch.bool)
 
-        # Call twice with same src_ids
+        # First call: fills cache with B entries per chunk.
         self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
+        count_after_first = mock._call_count[0]
+        n_chunks = (S + chunk_size - 1) // chunk_size
+        # Each of the B sequences gets its own entry per chunk.
+        self.assertEqual(len(mock._prefill_cache), B * n_chunks)
+
         mock.cache_seqlens.zero_()
-        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
 
-        # Should have run _forward_eager twice (no cache hit for B>1)
-        self.assertEqual(mock._call_count[0], 2)
-        # Cache should remain empty
-        self.assertEqual(len(mock._prefill_cache), 0)
+        # Second call with same src_ids: all B sequences hit → no new forward calls.
+        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
+        self.assertEqual(mock._call_count[0], count_after_first)
+        # cache_seqlens incremented for all elements.
+        self.assertTrue((mock.cache_seqlens == S).all())
+
+    def test_batch_partial_miss_runs_forward(self):
+        """If one sequence misses, _forward_eager runs for the whole batch."""
+        S, chunk_size, hidden, B = 4, 4, 8, 2
+        mock = self._make_mock_decoder(S, chunk_size, B=B)
+
+        src_ids_shared = torch.randint(0, 100, (B, S))
+        src_ids_partial = src_ids_shared.clone()
+        src_ids_partial[1] = src_ids_partial[1] + 999  # seq 1 has different IDs
+
+        emb = torch.randn(B, S, hidden)
+        tgt_pad_mask = torch.zeros(B, 1, S, dtype=torch.bool)
+
+        # First call with shared IDs: fills cache for both sequences.
+        self._run_chunked_prefill(mock, emb, src_ids_shared, tgt_pad_mask=tgt_pad_mask.clone())
+        count_after_first = mock._call_count[0]
+
+        mock.cache_seqlens.zero_()
+
+        # Second call: seq 0 hits, seq 1 misses → forward must run for the whole batch.
+        self._run_chunked_prefill(mock, emb, src_ids_partial, tgt_pad_mask=tgt_pad_mask.clone())
+        self.assertGreater(mock._call_count[0], count_after_first)
+
+    # ------------------------------------------------------------------
+    # Linear attention (hybrid model)
+    # ------------------------------------------------------------------
+
+    def test_caching_works_for_linear_attention(self):
+        """Hybrid model: linear-attn recurrent states are cached and restored."""
+        S, chunk_size, hidden = 4, 4, 8
+        mock = self._make_mock_decoder(S, chunk_size, has_linear_attn=True)
+        emb = torch.randn(1, S, hidden)
+        src_ids = torch.zeros(1, S, dtype=torch.long)
+        tgt_pad_mask = torch.zeros(1, 1, S, dtype=torch.bool)
+
+        # First call: fills cache (including linear-attn states).
+        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
+        count_after_first = mock._call_count[0]
+        n_chunks = (S + chunk_size - 1) // chunk_size
+        self.assertEqual(len(mock._prefill_cache), n_chunks)
+
+        # Reset ALL layer states to zero, then run again with the same IDs.
+        mock.cache_seqlens.zero_()
+        for layer in mock.transformer_layers:
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn.conv_state.zero_()
+                layer.linear_attn.recurrent_state.zero_()
+            else:
+                layer.self_attn.kcache.zero_()
+                layer.self_attn.vcache.zero_()
+
+        # Second call: all chunks hit → _forward_eager must NOT be called.
+        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
+        self.assertEqual(mock._call_count[0], count_after_first, "forward should be skipped on cache hit")
+
+        # Verify that linear-attn states were non-trivially restored.
+        for layer in mock.transformer_layers:
+            if layer.layer_type == "linear_attention":
+                self.assertFalse(
+                    layer.linear_attn.conv_state.eq(0).all().item(),
+                    "conv_state should have been restored from cache",
+                )
+                self.assertFalse(
+                    layer.linear_attn.recurrent_state.eq(0).all().item(),
+                    "recurrent_state should have been restored from cache",
+                )
+
+    # ------------------------------------------------------------------
+    # Image token disables caching
+    # ------------------------------------------------------------------
 
     def test_caching_disabled_when_image_locations_present(self):
         """Cache is skipped when image_locations is provided."""
@@ -336,25 +422,6 @@ class TestChunkedPrefillWithCache(unittest.TestCase):
             mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone(), image_locations=image_locations
         )
 
-        # Both calls should have run _forward_eager
-        self.assertEqual(mock._call_count[0], 2)
-        self.assertEqual(len(mock._prefill_cache), 0)
-
-    def test_caching_disabled_for_linear_attention(self):
-        """Cache is skipped for hybrid models with linear-attention layers."""
-        S, chunk_size, hidden = 4, 4, 8
-        mock = self._make_mock_decoder(S, chunk_size)
-        mock.has_linear_attn = True  # hybrid model: disable caching
-
-        emb = torch.randn(1, S, hidden)
-        src_ids = torch.zeros(1, S, dtype=torch.long)
-        tgt_pad_mask = torch.zeros(1, 1, S, dtype=torch.bool)
-
-        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
-        mock.cache_seqlens.zero_()
-        self._run_chunked_prefill(mock, emb, src_ids, tgt_pad_mask=tgt_pad_mask.clone())
-
-        # Both calls should have run _forward_eager (no cache)
         self.assertEqual(mock._call_count[0], 2)
         self.assertEqual(len(mock._prefill_cache), 0)
 
@@ -365,8 +432,6 @@ class TestPrefillChunkSizeTrigger(unittest.TestCase):
 
     def test_effective_chunk_uses_prefill_chunk_size(self):
         """When sliding_window==0 and prefill_chunk_size>0, use prefill_chunk_size."""
-        # The logic in TransformerDecoder.forward is:
-        #   effective_chunk = sliding_window if sliding_window > 0 else prefill_chunk_size
         sliding_window = 0
         prefill_chunk_size = 2048
 

@@ -1,9 +1,20 @@
 """Prefix KV cache for chunked prefill.
 
-Stores per-chunk KV computation results so that identical prompt prefixes
-can be served from cache instead of recomputed on subsequent requests.
-The cache is keyed by a rolling SHA-256 hash of the token IDs, which
-ensures that two different prefixes never share a cache entry.
+Stores per-chunk state tensors so that identical prompt prefixes can be
+served from cache instead of recomputed on subsequent requests.  The cache
+is keyed by a rolling SHA-256 hash of the token IDs, which ensures that two
+different prefixes never share a cache entry.
+
+Each cache entry stores per-layer state without a batch dimension (one entry
+per sequence):
+
+* **Standard attention layers**: position-indexed KV slices
+  ``(k_slice, v_slice)`` each of shape ``(chunk_len, heads_kv, dim_per_head)``.
+* **Linear attention layers** (GatedDeltaNet): end-of-chunk accumulated states
+  ``(conv_state, recurrent_state)`` whose shapes match the layer's own
+  ``conv_state`` and ``recurrent_state`` tensors (without the batch dimension).
+  These states are a deterministic function of the entire token prefix, so
+  restoring them on a cache hit is equivalent to running the forward pass.
 
 Usage example::
 
@@ -15,11 +26,11 @@ Usage example::
         cached = cache.get(key)
         if cached is None:
             # compute and store
-            emb_out, kv_slices = run_forward(chunk_ids)
-            cache.put(key, emb_out, kv_slices)
+            emb_out, layer_states = run_forward(chunk_ids)
+            cache.put(key, emb_out, layer_states)
         else:
-            emb_out, kv_slices = cached
-            # restore kv_slices to the model cache
+            emb_out, layer_states = cached
+            # restore layer_states to the model
         prev_key = key
 """
 
@@ -32,12 +43,16 @@ import torch
 
 
 class PrefillCache:
-    """Thread-safe LRU cache for chunked prefill KV data.
+    """Thread-safe LRU cache for chunked prefill layer states.
 
     Maps a rolling hash of the token-ID prefix to the hidden-state output
-    and per-layer KV tensors produced when that prefix was last processed.
-    This avoids recomputing expensive attention for repeated prompt prefixes
-    (e.g. the same system prompt across many requests).
+    and per-layer state tensors produced when that prefix was last processed.
+    This avoids recomputing expensive attention (and linear-attention recurrent
+    state updates) for repeated prompt prefixes (e.g. the same system prompt
+    shared across many requests).
+
+    One cache entry is stored **per sequence** (without a batch dimension);
+    for batch size > 1, the caller creates B separate entries per chunk.
 
     All tensors are stored on CPU to keep GPU memory free for active
     inference; the caller must move them back to the correct device/dtype
@@ -84,16 +99,20 @@ class PrefillCache:
     # ------------------------------------------------------------------
 
     def get(self, key: bytes):
-        """Return ``(emb_out, kv_slices)`` for *key*, or ``None`` if absent.
+        """Return ``(emb_out, layer_states)`` for *key*, or ``None`` if absent.
 
         ``emb_out`` is a CPU tensor of shape ``(chunk_len, hidden_size)``.
-        ``kv_slices`` is a list (one entry per decoder layer) of either
-        ``(k_slice, v_slice)`` CPU tensor pairs each of shape
-        ``(chunk_len, heads_kv, dim_per_head)``, or ``None`` for
-        linear-attention layers that do not use an explicit KV cache.
+
+        ``layer_states`` is a list (one entry per decoder layer).  Each element
+        is a pair of CPU tensors whose meaning depends on the layer type:
+
+        * Standard attention: ``(k_slice, v_slice)`` each of shape
+          ``(chunk_len, heads_kv, dim_per_head)``.
+        * Linear attention: ``(conv_state, recurrent_state)`` with shapes
+          matching the layer's own state tensors (without the batch dimension).
 
         The caller is responsible for moving tensors back to the correct
-        device and dtype.
+        device and dtype before use.
         """
         with self._lock:
             entry = self._store.get(key)
@@ -101,34 +120,38 @@ class PrefillCache:
                 self._store.move_to_end(key)  # mark as recently used
             return entry
 
-    def put(self, key: bytes, emb_out: torch.Tensor, kv_slices: list) -> None:
+    def put(self, key: bytes, emb_out: torch.Tensor, layer_states: list) -> None:
         """Insert or update a cache entry.
 
         Args:
             key: Key produced by :meth:`compute_key`.
             emb_out: Hidden-state output for the chunk of shape
                 ``(chunk_len, hidden_size)``.  Stored on CPU.
-            kv_slices: Per-layer list.  Each element is either a
-                ``(k_slice, v_slice)`` pair of tensors with shape
-                ``(chunk_len, heads_kv, dim_per_head)``, or ``None``
-                for linear-attention layers.  Stored on CPU.
+            layer_states: Per-layer list.  Each element is a pair of tensors:
+
+                * Standard attention: ``(k_slice, v_slice)`` with shape
+                  ``(chunk_len, heads_kv, dim_per_head)``.
+                * Linear attention: ``(conv_state, recurrent_state)`` with
+                  shapes matching the layer's own state tensors (no batch dim).
+
+                Both tensors in each pair are detached and stored on CPU.
         """
         cpu_emb = emb_out.detach().cpu()
-        cpu_kv = []
-        for item in kv_slices:
+        cpu_states = []
+        for item in layer_states:
             if item is not None:
-                k, v = item
-                cpu_kv.append((k.detach().cpu(), v.detach().cpu()))
+                a, b = item
+                cpu_states.append((a.detach().cpu(), b.detach().cpu()))
             else:
-                cpu_kv.append(None)
+                cpu_states.append(None)
         with self._lock:
             if key in self._store:
                 self._store.move_to_end(key)
-                self._store[key] = (cpu_emb, cpu_kv)
+                self._store[key] = (cpu_emb, cpu_states)
                 return
             if len(self._store) >= self._max_entries:
                 self._store.popitem(last=False)  # evict LRU entry
-            self._store[key] = (cpu_emb, cpu_kv)
+            self._store[key] = (cpu_emb, cpu_states)
 
     def clear(self) -> None:
         """Remove all cached entries."""

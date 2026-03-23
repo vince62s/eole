@@ -590,14 +590,31 @@ class TransformerDecoder(DecoderBase):
 
         When a :class:`~eole.modules.prefill_cache.PrefillCache` is attached to
         this decoder (``self._prefill_cache is not None``), the output embeddings
-        and per-layer KV tensors for each chunk are cached on CPU.  On
-        subsequent calls with the same token prefix, the cached data is
-        restored directly into the KV cache buffers so that the transformer
-        forward pass is skipped entirely for those chunks.  Caching is only
-        active for single-sequence batches (``B == 1``) because the cache key
-        is derived from a single token-ID sequence.  Image-token sequences are
-        also excluded from caching because their attention patterns depend on
-        positional features not captured in the token-ID hash.
+        and per-layer state tensors for each chunk are cached on CPU.  On
+        subsequent calls whose token prefix produces the same rolling hash, the
+        cached data is restored directly into the running cache buffers so that
+        the transformer forward pass is skipped entirely for those chunks.
+
+        **What is cached per layer:**
+
+        * Standard attention layers: position-indexed KV slices
+          ``(kcache[b, start:end], vcache[b, start:end])``.
+        * Linear attention (GatedDeltaNet) layers: the accumulated
+          ``conv_state[b]`` and ``recurrent_state[b]`` *after* this chunk.
+          These states are a deterministic function of the entire prefix, so
+          two requests sharing the same prefix will have identical states at
+          every chunk boundary and restoration is safe.
+
+        **Batch size > 1:** cache keys are computed independently for every
+        sequence in the batch.  If *all* B sequences produce a cache hit for
+        a given chunk, ``_forward_eager`` is skipped for that chunk entirely.
+        If any sequence misses, ``_forward_eager`` runs for the whole batch
+        and all B results are stored (or overwritten) in the cache.
+
+        The only case where caching is unconditionally disabled is when
+        image-token sequences are present, because their attention patterns
+        depend on pixel-layout information that is not captured by the
+        token-ID hash.
 
         The KV cache is filled incrementally: after chunk *k* the cache holds
         keys/values for positions ``0 … (k+1)*chunk_size - 1``.
@@ -606,7 +623,7 @@ class TransformerDecoder(DecoderBase):
             emb (Tensor): ``(B, S, hidden_size)`` prefill embeddings.
             src_ids (Tensor, optional): ``(B, S)`` integer token IDs
                 corresponding to *emb*.  Required for cache key computation;
-                if ``None``, caching is skipped.
+                if ``None``, caching is skipped for the entire prefill.
             **kwargs: forwarded to ``_forward_eager`` unchanged except that
                 ``tgt_pad_mask`` is sliced per chunk, ``image_locations`` is
                 always passed as the full ``(B, S_full)`` tensor so that
@@ -618,8 +635,8 @@ class TransformerDecoder(DecoderBase):
         Returns:
             (Tensor, dict): concatenated hidden-state output over all chunks
                 and an attention dict whose tensors are concatenated across
-                all chunks along the query (tgt) dimension.  For chunks
-                served from cache, no attention tensors are collected.
+                all chunks along the query (tgt) dimension.  Chunks served
+                from cache contribute no attention tensors.
         """
         B, S, _ = emb.size()
         # Sliding window takes priority as the chunk size because it is a
@@ -633,18 +650,16 @@ class TransformerDecoder(DecoderBase):
         prefix_len = kwargs.pop("prefix_len", None)
         return_attn = kwargs.get("return_attn", False) or kwargs.get("with_align", False)
 
-        # Caching is only safe for single-sequence batches, when no image
-        # tokens are involved (image attention depends on layout info not
-        # captured by the token-ID hash), and when all layers use standard
-        # (non-recurrent) attention (linear-attention recurrent state is not
-        # position-indexed and therefore cannot be restored from a KV cache).
+        # Caching is disabled only when image tokens are present (their
+        # attention patterns depend on pixel-layout info not captured by
+        # the token-ID hash) or when no token IDs were supplied for hashing.
+        # Batch size > 1 and hybrid linear-attention models are both
+        # supported: see docstring for the full strategy.
         use_cache = (
             self._prefill_cache is not None
             and src_ids is not None
-            and B == 1
             and image_locations is None
             and not return_attn
-            and not self.has_linear_attn
         )
 
         all_emb_chunks = []
@@ -652,7 +667,10 @@ class TransformerDecoder(DecoderBase):
         all_align_attns = []
         all_cross_attns_layers = None  # list-of-lists, one inner list per layer
 
-        prev_key = None  # rolling hash key from the previous chunk
+        # Per-sequence rolling hash keys — one entry per batch element.
+        # Starts as None for every sequence; updated after each chunk so that
+        # chunk k+1's key depends on chunk k's key (rolling hash).
+        prev_keys = [None] * B
 
         for start in range(0, S, chunk_size):
             end = min(start + chunk_size, S)
@@ -661,27 +679,51 @@ class TransformerDecoder(DecoderBase):
             # ----------------------------------------------------------
             # Try to serve this chunk from the prefill KV cache.
             # ----------------------------------------------------------
-            cache_key = None
+            cache_keys = None
             if use_cache:
-                chunk_ids = src_ids[0, start:end]  # (chunk_len,)
-                cache_key = self._prefill_cache.compute_key(chunk_ids, prev_key)
-                cached = self._prefill_cache.get(cache_key)
-                if cached is not None:
-                    emb_out_cpu, kv_slices = cached
+                # Compute an independent rolling-hash key for each sequence.
+                cache_keys = [
+                    self._prefill_cache.compute_key(src_ids[b, start:end], prev_keys[b])
+                    for b in range(B)
+                ]
+                # A "full hit" means every sequence in the batch has a valid
+                # cache entry so _forward_eager can be skipped entirely.
+                cached_results = [self._prefill_cache.get(k) for k in cache_keys]
+                if all(r is not None for r in cached_results):
                     device = emb.device
                     dtype = emb.dtype
-                    # Restore per-layer KV tensors into the running KV cache.
-                    for layer_idx, layer in enumerate(self.transformer_layers):
-                        if layer.layer_type != "linear_attention" and kv_slices[layer_idx] is not None:
-                            k_cpu, v_cpu = kv_slices[layer_idx]
-                            layer.self_attn.kcache[0, start:end, :, :] = k_cpu.to(device=device, dtype=dtype)
-                            layer.self_attn.vcache[0, start:end, :, :] = v_cpu.to(device=device, dtype=dtype)
-                    # Advance the sequence-length counter as if _forward_eager ran.
-                    self.cache_seqlens.add_(chunk_len)
-                    # Use the cached hidden-state output (no transformer forward).
-                    emb_chunk_out = emb_out_cpu.to(device=device, dtype=dtype).unsqueeze(0)
+                    emb_outs = []
+                    for b, cached in enumerate(cached_results):
+                        emb_out_cpu, kv_slices = cached
+                        emb_outs.append(emb_out_cpu.to(device=device, dtype=dtype))
+                        for layer_idx, layer in enumerate(self.transformer_layers):
+                            layer_state = kv_slices[layer_idx]
+                            if layer_state is None:
+                                continue
+                            if layer.layer_type == "linear_attention":
+                                # Restore accumulated conv and recurrent states.
+                                conv_cpu, rec_cpu = layer_state
+                                layer.linear_attn.conv_state[b] = conv_cpu.to(
+                                    device=device, dtype=dtype
+                                )
+                                layer.linear_attn.recurrent_state[b] = rec_cpu.to(
+                                    device=device, dtype=dtype
+                                )
+                            else:
+                                # Restore position-indexed KV slices.
+                                k_cpu, v_cpu = layer_state
+                                layer.self_attn.kcache[b, start:end, :, :] = k_cpu.to(
+                                    device=device, dtype=dtype
+                                )
+                                layer.self_attn.vcache[b, start:end, :, :] = v_cpu.to(
+                                    device=device, dtype=dtype
+                                )
+                    # Reassemble batch dimension: list of (chunk_len, hidden)
+                    # → (B, chunk_len, hidden).
+                    emb_chunk_out = torch.stack(emb_outs, dim=0)
                     all_emb_chunks.append(emb_chunk_out)
-                    prev_key = cache_key
+                    self.cache_seqlens.add_(chunk_len)
+                    prev_keys = list(cache_keys)
                     continue  # skip _forward_eager for this chunk
 
             # ----------------------------------------------------------
@@ -710,20 +752,30 @@ class TransformerDecoder(DecoderBase):
             all_emb_chunks.append(emb_chunk_out)
 
             # ----------------------------------------------------------
-            # Store the result in the prefill KV cache.
+            # Store each sequence's result in the prefill KV cache.
+            # For partial hits (some sequences had a cache entry, some did
+            # not), all B results are stored; existing entries are
+            # overwritten with the same values (idempotent).
             # ----------------------------------------------------------
-            if cache_key is not None:
-                kv_slices = []
-                for layer in self.transformer_layers:
-                    if layer.layer_type != "linear_attention":
-                        k_slice = layer.self_attn.kcache[0, start:end, :, :].clone()
-                        v_slice = layer.self_attn.vcache[0, start:end, :, :].clone()
-                        kv_slices.append((k_slice, v_slice))
-                    else:
-                        kv_slices.append(None)
-                self._prefill_cache.put(cache_key, emb_chunk_out[0].detach(), kv_slices)
+            if cache_keys is not None:
+                for b in range(B):
+                    kv_slices = []
+                    for layer in self.transformer_layers:
+                        if layer.layer_type == "linear_attention":
+                            # Cache end-of-chunk linear-attention states.
+                            # These represent the fully accumulated conv and
+                            # recurrent state after processing tokens 0..end-1.
+                            conv_slice = layer.linear_attn.conv_state[b].clone()
+                            rec_slice = layer.linear_attn.recurrent_state[b].clone()
+                            kv_slices.append((conv_slice, rec_slice))
+                        else:
+                            k_slice = layer.self_attn.kcache[b, start:end, :, :].clone()
+                            v_slice = layer.self_attn.vcache[b, start:end, :, :].clone()
+                            kv_slices.append((k_slice, v_slice))
+                    self._prefill_cache.put(cache_keys[b], emb_chunk_out[b].detach(), kv_slices)
 
-            prev_key = cache_key
+            if cache_keys is not None:
+                prev_keys = list(cache_keys)
 
             if chunk_attns.get("std") is not None:
                 all_std_attns.append(chunk_attns["std"])
