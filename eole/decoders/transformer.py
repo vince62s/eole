@@ -10,6 +10,7 @@ from eole.modules.transformer_mlp import MLP
 from eole.modules.moe import MoE
 from eole.modules.gated_delta_net import GatedDeltaNet
 from eole.modules.rope import build_rope
+from eole.modules.prefill_cache import PrefillCache
 from eole.constants import LayerNorm, PositionEncodingType
 from eole import EOLE_TORCH_COMPILE, EOLE_COMPILE_MODE
 from eole.ops import _FLASH_ATTN_AVAILABLE
@@ -352,6 +353,17 @@ class TransformerDecoder(DecoderBase):
         self.cache_seqlens = None
         self.hidden_size = decoder_config.hidden_size
         self.compiled_shapes = set()
+
+        # Chunked prefill configuration.
+        # When sliding_window > 0 the window size is the natural chunk boundary;
+        # prefill_chunk_size provides a separate knob for non-sliding-window models.
+        self.prefill_chunk_size = getattr(running_config, "prefill_chunk_size", 0)
+
+        # Prefill KV cache: stores per-chunk KV tensors on CPU so that
+        # repeated prompt prefixes can be served without recomputation.
+        prefill_cache_size = getattr(running_config, "prefill_cache_size", 0)
+        self._prefill_cache = PrefillCache(max_entries=prefill_cache_size) if prefill_cache_size > 0 else None
+
         self._disable_cache()
 
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["0", "1"]:
@@ -561,22 +573,40 @@ class TransformerDecoder(DecoderBase):
 
         return mask.unsqueeze(1)  # (B, 1, chunk_size, cache_len)
 
-    def _forward_chunked_prefill(self, emb, **kwargs):
-        """Process a long prefill sequence in chunks of ``sliding_window`` size.
+    def _forward_chunked_prefill(self, emb, src_ids=None, **kwargs):
+        """Process a long prefill sequence in chunks.
 
         When ``sliding_window > 0`` and the input sequence is longer than the
         window, processing the full sequence as a single forward pass would
         allow early tokens to attend to positions they cannot see during
-        generation.  This method splits the sequence into consecutive chunks
-        of exactly ``sliding_window`` tokens (the last chunk may be shorter)
-        and runs ``_forward_eager`` on each chunk so that every token attends
-        only to the positions inside its window.
+        generation.  When ``prefill_chunk_size > 0`` (and no sliding window is
+        active), this method is also used to split long prompts so that their
+        KV computations can be cached and reused across requests.
+
+        The sequence is split into consecutive chunks of ``chunk_size`` tokens
+        (the last chunk may be shorter) and ``_forward_eager`` is run on each
+        chunk so that every token attends only to the positions inside its
+        causal window.
+
+        When a :class:`~eole.modules.prefill_cache.PrefillCache` is attached to
+        this decoder (``self._prefill_cache is not None``), the output embeddings
+        and per-layer KV tensors for each chunk are cached on CPU.  On
+        subsequent calls with the same token prefix, the cached data is
+        restored directly into the KV cache buffers so that the transformer
+        forward pass is skipped entirely for those chunks.  Caching is only
+        active for single-sequence batches (``B == 1``) because the cache key
+        is derived from a single token-ID sequence.  Image-token sequences are
+        also excluded from caching because their attention patterns depend on
+        positional features not captured in the token-ID hash.
 
         The KV cache is filled incrementally: after chunk *k* the cache holds
-        keys/values for positions ``0 … (k+1)*sliding_window - 1``.
+        keys/values for positions ``0 … (k+1)*chunk_size - 1``.
 
         Args:
-            emb (Tensor): ``(B, S, hidden_size)`` with ``S > sliding_window``.
+            emb (Tensor): ``(B, S, hidden_size)`` prefill embeddings.
+            src_ids (Tensor, optional): ``(B, S)`` integer token IDs
+                corresponding to *emb*.  Required for cache key computation;
+                if ``None``, caching is skipped.
             **kwargs: forwarded to ``_forward_eager`` unchanged except that
                 ``tgt_pad_mask`` is sliced per chunk, ``image_locations`` is
                 always passed as the full ``(B, S_full)`` tensor so that
@@ -588,24 +618,75 @@ class TransformerDecoder(DecoderBase):
         Returns:
             (Tensor, dict): concatenated hidden-state output over all chunks
                 and an attention dict whose tensors are concatenated across
-                all chunks along the query (tgt) dimension.
+                all chunks along the query (tgt) dimension.  For chunks
+                served from cache, no attention tensors are collected.
         """
-        _, S, _ = emb.size()
-        chunk_size = self.sliding_window
+        B, S, _ = emb.size()
+        # Sliding window takes priority as the chunk size because it is a
+        # correctness constraint; prefill_chunk_size is an optional knob.
+        chunk_size = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
 
         tgt_pad_mask_full = kwargs.pop("tgt_pad_mask")
         # Extract image_locations and prefix_len so we can distribute them
         # correctly to each chunk (see per-chunk handling below).
         image_locations = kwargs.pop("image_locations", None)
         prefix_len = kwargs.pop("prefix_len", None)
+        return_attn = kwargs.get("return_attn", False) or kwargs.get("with_align", False)
+
+        # Caching is only safe for single-sequence batches, when no image
+        # tokens are involved (image attention depends on layout info not
+        # captured by the token-ID hash), and when all layers use standard
+        # (non-recurrent) attention (linear-attention recurrent state is not
+        # position-indexed and therefore cannot be restored from a KV cache).
+        use_cache = (
+            self._prefill_cache is not None
+            and src_ids is not None
+            and B == 1
+            and image_locations is None
+            and not return_attn
+            and not self.has_linear_attn
+        )
 
         all_emb_chunks = []
         all_std_attns = []
         all_align_attns = []
         all_cross_attns_layers = None  # list-of-lists, one inner list per layer
 
+        prev_key = None  # rolling hash key from the previous chunk
+
         for start in range(0, S, chunk_size):
             end = min(start + chunk_size, S)
+            chunk_len = end - start
+
+            # ----------------------------------------------------------
+            # Try to serve this chunk from the prefill KV cache.
+            # ----------------------------------------------------------
+            cache_key = None
+            if use_cache:
+                chunk_ids = src_ids[0, start:end]  # (chunk_len,)
+                cache_key = self._prefill_cache.compute_key(chunk_ids, prev_key)
+                cached = self._prefill_cache.get(cache_key)
+                if cached is not None:
+                    emb_out_cpu, kv_slices = cached
+                    device = emb.device
+                    dtype = emb.dtype
+                    # Restore per-layer KV tensors into the running KV cache.
+                    for layer_idx, layer in enumerate(self.transformer_layers):
+                        if layer.layer_type != "linear_attention" and kv_slices[layer_idx] is not None:
+                            k_cpu, v_cpu = kv_slices[layer_idx]
+                            layer.self_attn.kcache[0, start:end, :, :] = k_cpu.to(device=device, dtype=dtype)
+                            layer.self_attn.vcache[0, start:end, :, :] = v_cpu.to(device=device, dtype=dtype)
+                    # Advance the sequence-length counter as if _forward_eager ran.
+                    self.cache_seqlens.add_(chunk_len)
+                    # Use the cached hidden-state output (no transformer forward).
+                    emb_chunk_out = emb_out_cpu.to(device=device, dtype=dtype).unsqueeze(0)
+                    all_emb_chunks.append(emb_chunk_out)
+                    prev_key = cache_key
+                    continue  # skip _forward_eager for this chunk
+
+            # ----------------------------------------------------------
+            # Cache miss (or caching disabled): run the forward pass.
+            # ----------------------------------------------------------
             emb_chunk = emb[:, start:end, :]
             pad_mask_chunk = tgt_pad_mask_full[:, :, start:end]
 
@@ -628,6 +709,22 @@ class TransformerDecoder(DecoderBase):
             emb_chunk_out, chunk_attns = self._forward_eager(emb_chunk, **chunk_kwargs)
             all_emb_chunks.append(emb_chunk_out)
 
+            # ----------------------------------------------------------
+            # Store the result in the prefill KV cache.
+            # ----------------------------------------------------------
+            if cache_key is not None:
+                kv_slices = []
+                for layer in self.transformer_layers:
+                    if layer.layer_type != "linear_attention":
+                        k_slice = layer.self_attn.kcache[0, start:end, :, :].clone()
+                        v_slice = layer.self_attn.vcache[0, start:end, :, :].clone()
+                        kv_slices.append((k_slice, v_slice))
+                    else:
+                        kv_slices.append(None)
+                self._prefill_cache.put(cache_key, emb_chunk_out[0].detach(), kv_slices)
+
+            prev_key = cache_key
+
             if chunk_attns.get("std") is not None:
                 all_std_attns.append(chunk_attns["std"])
             if chunk_attns.get("align") is not None:
@@ -649,14 +746,17 @@ class TransformerDecoder(DecoderBase):
 
     def forward(self, emb, **kwargs):
         B, S, _ = emb.size()
+        # Pop src_ids early; it is only consumed by _forward_chunked_prefill
+        # for cache key computation and must not be forwarded to _forward_eager.
+        src_ids = kwargs.pop("src_ids", None)
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["0", "1"] and S == 1:
             return self._forward_compile(emb, **kwargs)
-        # When sliding window attention is active and the prefill sequence is
-        # longer than the window, split it into window-sized chunks so that
-        # every token's effective receptive field matches what it will see
-        # during token-by-token generation.
-        if self.sliding_window > 0 and S > self.sliding_window and self.cache_seqlens is not None:
-            return self._forward_chunked_prefill(emb, **kwargs)
+        # Determine the effective chunk size for chunked prefill.
+        # Sliding window takes precedence (it is a correctness requirement);
+        # prefill_chunk_size is an optional performance knob for non-sliding models.
+        effective_chunk = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
+        if effective_chunk > 0 and S > effective_chunk and self.cache_seqlens is not None:
+            return self._forward_chunked_prefill(emb, src_ids=src_ids, **kwargs)
         return self._forward_eager(emb, **kwargs)
 
     def _forward_eager(self, emb, **kwargs):
