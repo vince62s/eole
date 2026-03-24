@@ -7,6 +7,18 @@ from eole.constants import PositionEncodingType
 
 from eole.ops import _CPP_OPS_AVAILABLE, rotary_embedding
 
+# Minimum cos/sin table size pre-allocated at init.  32768 was the previous
+# hardcoded default; keeping it ensures models with no length hints still work
+# up to that sequence length without dynamic table growth (which would break
+# torch.compile).
+_MIN_TABLE_SIZE = 32768
+
+# Fallback for `original_max_position_embeddings` when it is absent from both
+# the rope_scaling block and the model config.  8192 is the LLaMA-2 /
+# early-extended-context baseline and matches the default value of
+# RotaryPositionConfig.original_max_position_embeddings.
+_FALLBACK_TRAINING_LENGTH = 8192
+
 
 class NoOpPosition:
     """A no-op position encoding callable."""
@@ -207,9 +219,9 @@ class RotaryPosition(nn.Module):
         model_max_len = getattr(rope_config, "max_position_embeddings", None) or 0
 
         # Effective pre-allocation length: cover both the model's capacity and the runtime target.
-        # We always allocate at least 32768 to match the previous default and avoid small tables
-        # for models where max_position_embeddings was not stored in the config.
-        effective_max_len = max(context_length, model_max_len, 32768)
+        # We always allocate at least _MIN_TABLE_SIZE to match the previous default and avoid
+        # small tables for models where max_position_embeddings was not stored in the config.
+        effective_max_len = max(context_length, model_max_len, _MIN_TABLE_SIZE)
 
         # 1. Base Inverse Frequencies (calculated in FP32)
         if scaling_type in ["dynamic", "xdrope"] and explicit_alpha:
@@ -219,10 +231,7 @@ class RotaryPosition(nn.Module):
             # No explicit alpha: derive NTK scaling factor from effective_max_len vs the
             # model's original training length.  This is computed once at init time
             # (compile-compatible: no per-forward inv_freq recomputation needed).
-            # Fall back to the RotaryPositionConfig default (8192) when no length information
-            # is available; this matches the historical LLaMA-2 / early extended-context
-            # baseline and is the same as RotaryPositionConfig.original_max_position_embeddings.
-            orig_len = getattr(rope_config, "original_max_position_embeddings", None) or model_max_len or 8192
+            orig_len = getattr(rope_config, "original_max_position_embeddings", None) or model_max_len or _FALLBACK_TRAINING_LENGTH
             if effective_max_len > orig_len:
                 derived_alpha = effective_max_len / orig_len
                 base = self.rotary_theta * (derived_alpha ** (rotary_dim / (rotary_dim - 2)))

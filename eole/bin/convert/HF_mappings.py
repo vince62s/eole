@@ -308,6 +308,11 @@ MODEL_OVERRIDES = {
                     "interleave_local": 6,
                     "tmax_index": 1,
                     "rotary_interleave": False,
+                    # Gemma3 config.json omits max_position_embeddings; 131072 covers all
+                    # standard variants (4B/12B/27B). The 1B variant uses 32768 but a
+                    # slightly larger cos/sin table is harmless.  Users may override via
+                    # context_length in running_config.
+                    "max_position_embeddings": 131072,
                 },
             },
         },
@@ -361,6 +366,11 @@ MODEL_OVERRIDES = {
                     "interleave_local": 6,
                     "tmax_index": 1,
                     "rotary_interleave": False,
+                    # Gemma3 config.json omits max_position_embeddings; 131072 covers all
+                    # standard variants (4B/12B/27B). The 1B variant uses 32768 but a
+                    # slightly larger cos/sin table is harmless.  Users may override via
+                    # context_length in running_config.
+                    "max_position_embeddings": 131072,
                 },
             },
             "encoder": {

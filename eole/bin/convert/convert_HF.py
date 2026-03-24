@@ -331,7 +331,6 @@ def build_config_dict(hf):
         "rope_config": {
             "rotary_interleave": False,
             "rotary_theta": config.get("rope_theta", config.get("rope_parameters", {}).get("rope_theta", 10000)),
-            "max_position_embeddings": config.get("max_position_embeddings"),
         },
         "embeddings": {},  # Populated later
     }
@@ -737,6 +736,15 @@ def build_config_dict(hf):
             from eole.config import recursive_update_dict
 
             model_config = recursive_update_dict(model_config, arch_config, {})
+
+    # Let the HF config.json value for max_position_embeddings always win over any
+    # architecture-level fallback set in HF_mappings.  For models that omit the field
+    # entirely (e.g. Gemma3), the HF_mappings fallback already provides a sensible
+    # default and this block simply leaves it unchanged.
+    if "rope_config" in model_config:
+        _config_mpe = config.get("max_position_embeddings")
+        if _config_mpe is not None:
+            model_config["rope_config"]["max_position_embeddings"] = _config_mpe
 
     # Qwen3.5-specific: extract hybrid layer types and linear attention parameters
     if arch in [
