@@ -186,16 +186,18 @@ class RotaryPositionConfig(Config):
         description="Scaling factor applied to the higher frequency components of RoPE.",
     )
     original_max_position_embeddings: int | None = Field(
-        default=8192,
-        description="Original maximum position embeddings for RoPE scaling.",
-    )
-    max_position_embeddings: int | None = Field(
         default=None,
+        description="Original maximum position embeddings for RoPE scaling. "
+        "Only required for models that use rope_scaling (e.g. dynamic NTK, llama3). "
+        "When None, rope.py falls back to max_position_embeddings or 8192.",
+    )
+    max_position_embeddings: int = Field(
+        default=8192,
         description="Model's maximum position embeddings (designed training capacity). "
-        "RoPE cos/sin tables are pre-computed up to max(max_position_embeddings, context_length). "
-        "For 'dynamic' NTK scaling without an explicit alpha, the scaling factor is derived as "
-        "max(context_length, max_position_embeddings) / original_max_position_embeddings at init time, "
-        "making the approach torch.compile-compatible.",
+        "At inference the user may set context_length ≤ max_position_embeddings to reduce "
+        "KV-cache and RoPE table size; setting context_length > max_position_embeddings raises an error. "
+        "For 'dynamic' NTK scaling without an explicit alpha, the scaling factor is derived from "
+        "context_length / original_max_position_embeddings at init time (torch.compile-compatible).",
     )
     rotary_theta_local: int = Field(
         default=10000,

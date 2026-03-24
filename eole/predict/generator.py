@@ -176,6 +176,20 @@ class GeneratorLM(Inference):
         )
         prefill_length = max(src_len.tolist())
 
+        # Guard: sequence length must not exceed context_length unless sliding_window is active.
+        # Use the decoder's effective context_length (which defaults to max_position_embeddings
+        # when the user has not explicitly set context_length in running_config).
+        # With sliding_window the attention mask handles truncation automatically.
+        effective_ctx = self.model.decoder.context_length
+        if effective_ctx > 0 and not self.model.decoder.sliding_window:
+            if prefill_length + decode_strategy.max_length > effective_ctx:
+                raise ValueError(
+                    f"Input length ({prefill_length}) + max generation length ({decode_strategy.max_length}) "
+                    f"= {prefill_length + decode_strategy.max_length} exceeds context_length "
+                    f"({effective_ctx}). "
+                    "Reduce max_length or use a model/context_length that covers the required sequence length."
+                )
+
         # (4) warmup for Torch compile
         # use the current batch to generate the decode graph (B, 1)
         # we need proper set up to run the forward pass of the decoder or decoder layer
@@ -187,10 +201,9 @@ class GeneratorLM(Inference):
             else:
                 emb = self.model.tgt_emb(src, step=0)
             tgt_pad_mask = src.eq(self._tgt_pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
-            if prefill_length > self.context_length or self.context_length < self.max_length:
-                self._log("context_length not set or too small, adjusting to 64000 tokens for torch compile fixed size")
-                self.context_length = max(64000, prefill_length + self.max_length)  # a bit hard-coded but fine for now
-            self.model.decoder.kvcache_maxsize = self.context_length
+            # kvcache_maxsize is already set to effective_context_length at decoder init;
+            # re-apply here to ensure it is correct for the current batch's compile graph.
+            self.model.decoder.kvcache_maxsize = effective_ctx
             self.model.decoder._init_cache(emb, tgt_pad_mask)
             self.model.decoder.map_state(fn_tile)
             if EOLE_COMPILE_MODE in ["0", "1"]:

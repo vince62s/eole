@@ -218,10 +218,11 @@ class RotaryPosition(nn.Module):
         # Model's designed maximum context length (set from max_position_embeddings in HF config).
         model_max_len = getattr(rope_config, "max_position_embeddings", None) or 0
 
-        # Effective pre-allocation length: cover both the model's capacity and the runtime target.
-        # We always allocate at least _MIN_TABLE_SIZE to match the previous default and avoid
-        # small tables for models where max_position_embeddings was not stored in the config.
-        effective_max_len = max(context_length, model_max_len, _MIN_TABLE_SIZE)
+        # Effective pre-allocation length: use exactly context_length when set
+        # (which is guaranteed ≤ max_position_embeddings by the decoder's validation),
+        # otherwise fall back to the model's designed capacity.  _MIN_TABLE_SIZE is
+        # a minimum floor so the table is never too small for bootstrap usage.
+        effective_max_len = max(context_length if context_length > 0 else model_max_len, _MIN_TABLE_SIZE)
 
         # 1. Base Inverse Frequencies (calculated in FP32)
         if scaling_type in ["dynamic", "xdrope"] and explicit_alpha:

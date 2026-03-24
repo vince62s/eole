@@ -321,9 +321,20 @@ class TransformerDecoder(DecoderBase):
         self.with_cross_attn = decoder_config.with_cross_attn
         self.sliding_window = decoder_config.sliding_window
         context_length = getattr(running_config, "context_length", 0) or 0
-        self.rope = build_rope(decoder_config, context_length=context_length)
+        # Derive effective context length: validate against model capacity and default to it.
+        _rope_config = getattr(decoder_config, "rope_config", None)
+        _model_max_pos = getattr(_rope_config, "max_position_embeddings", 8192) or 8192
+        if context_length > _model_max_pos:
+            raise ValueError(
+                f"context_length ({context_length}) exceeds the model's "
+                f"max_position_embeddings ({_model_max_pos}). "
+                "Reduce context_length to be within the model's capacity."
+            )
+        effective_context_length = context_length if context_length > 0 else _model_max_pos
+        self.context_length = effective_context_length
+        self.rope = build_rope(decoder_config, context_length=effective_context_length)
         if hasattr(decoder_config, "rope_config") and getattr(decoder_config.rope_config, "interleave_local", 0) > 0:
-            self.rope_local = build_rope(decoder_config, variant="local", context_length=context_length)
+            self.rope_local = build_rope(decoder_config, variant="local", context_length=effective_context_length)
         else:
             self.rope_local = None
         self.interleave_local = getattr(decoder_config.rope_config, "interleave_local", 0) or 1
@@ -348,7 +359,7 @@ class TransformerDecoder(DecoderBase):
         self.dynamic_shapes = getattr(running_config, "dynamic_shapes", not EOLE_TORCH_COMPILE)
         if self.dynamic_shapes is None:
             self.dynamic_shapes = not EOLE_TORCH_COMPILE
-        self.kvcache_maxsize = getattr(running_config, "context_length", 4096)
+        self.kvcache_maxsize = effective_context_length
         self.left_pad_attn_mask = None
         self.position_indices = None
         self.cache_seqlens = None

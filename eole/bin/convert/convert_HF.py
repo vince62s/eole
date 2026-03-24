@@ -745,6 +745,9 @@ def build_config_dict(hf):
         _config_mpe = config.get("max_position_embeddings")
         if _config_mpe is not None:
             model_config["rope_config"]["max_position_embeddings"] = _config_mpe
+        # Final safety net: ensure max_position_embeddings is always explicitly saved
+        # so the model config never relies on RotaryPositionConfig's class default.
+        model_config["rope_config"].setdefault("max_position_embeddings", 8192)
 
     # Qwen3.5-specific: extract hybrid layer types and linear attention parameters
     if arch in [
