@@ -189,6 +189,14 @@ class RotaryPositionConfig(Config):
         default=8192,
         description="Original maximum position embeddings for RoPE scaling.",
     )
+    max_position_embeddings: int | None = Field(
+        default=None,
+        description="Model's maximum position embeddings (designed training capacity). "
+        "RoPE cos/sin tables are pre-computed up to max(max_position_embeddings, context_length). "
+        "For 'dynamic' NTK scaling without an explicit alpha, the scaling factor is derived as "
+        "max(context_length, max_position_embeddings) / original_max_position_embeddings at init time, "
+        "making the approach torch.compile-compatible.",
+    )
     rotary_theta_local: int = Field(
         default=10000,
         description="Rotary theta base length for local rotary layers",

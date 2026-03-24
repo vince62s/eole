@@ -320,9 +320,10 @@ class TransformerDecoder(DecoderBase):
         self.alignment_layer = decoder_config.alignment_layer
         self.with_cross_attn = decoder_config.with_cross_attn
         self.sliding_window = decoder_config.sliding_window
-        self.rope = build_rope(decoder_config)
+        context_length = getattr(running_config, "context_length", 0) or 0
+        self.rope = build_rope(decoder_config, context_length=context_length)
         if hasattr(decoder_config, "rope_config") and getattr(decoder_config.rope_config, "interleave_local", 0) > 0:
-            self.rope_local = build_rope(decoder_config, variant="local")
+            self.rope_local = build_rope(decoder_config, variant="local", context_length=context_length)
         else:
             self.rope_local = None
         self.interleave_local = getattr(decoder_config.rope_config, "interleave_local", 0) or 1

@@ -18,10 +18,10 @@ class NoOpPosition:
         return None
 
 
-def build_rope(model_config, mode="1d", variant="global"):
+def build_rope(model_config, mode="1d", variant="global", context_length=0):
     """Build RoPE with optional cuda acceleration."""
     if model_config.position_encoding_type == PositionEncodingType.Rotary:
-        return RotaryPosition(model_config, mode=mode, variant=variant)
+        return RotaryPosition(model_config, mode=mode, variant=variant, context_length=context_length)
     else:
         return NoOpPosition()
 
@@ -156,13 +156,25 @@ class RotaryPosition(nn.Module):
     and to support future enhancements, such as additional scaling types.
     """
 
-    def __init__(self, model_config, mode="1d", variant="global"):
+    def __init__(self, model_config, mode="1d", variant="global", context_length=0):
         """
         Initializes the RotaryPosition module.
 
         Args:
             model_config: Configuration object that contains model parameters,
                           including rotary embedding settings.
+            mode: ``"1d"`` for standard sequence RoPE; ``"2d"`` for vision
+                  patch positional embeddings.
+            variant: ``"global"`` or ``"local"`` for models with interleaved
+                     local/global attention windows (e.g. Gemma3).
+            context_length: Runtime context capacity in tokens (from
+                ``running_config.context_length``).  When > 0, the cos/sin
+                table is pre-computed up to
+                ``max(context_length, max_position_embeddings, 32768)`` so
+                that no dynamic table growth occurs during compiled forward
+                passes.  For ``scaling_type == "dynamic"`` without an
+                explicit ``alpha``, the NTK scaling factor is also derived
+                from this value at init time (compile-compatible).
 
         Attributes:
             model_config: The configuration object passed during initialization.
@@ -188,9 +200,34 @@ class RotaryPosition(nn.Module):
         self.rotary_interleave = rope_config.rotary_interleave
         self.rotary_theta = rope_config.rotary_theta if variant == "global" else rope_config.rotary_theta_local
 
+        scaling_type = getattr(rope_config, "scaling_type", None)
+        explicit_alpha = getattr(rope_config, "alpha", None)
+
+        # Model's designed maximum context length (set from max_position_embeddings in HF config).
+        model_max_len = getattr(rope_config, "max_position_embeddings", None) or 0
+
+        # Effective pre-allocation length: cover both the model's capacity and the runtime target.
+        # We always allocate at least 32768 to match the previous default and avoid small tables
+        # for models where max_position_embeddings was not stored in the config.
+        effective_max_len = max(context_length, model_max_len, 32768)
+
         # 1. Base Inverse Frequencies (calculated in FP32)
-        if getattr(rope_config, "scaling_type", None) in ["dynamic", "xdrope"] and getattr(rope_config, "alpha", None):
-            base = self.rotary_theta * (rope_config.alpha ** (rotary_dim / (rotary_dim - 2)))
+        if scaling_type in ["dynamic", "xdrope"] and explicit_alpha:
+            # Explicit alpha provided: classic NTK-aware scaling.
+            base = self.rotary_theta * (explicit_alpha ** (rotary_dim / (rotary_dim - 2)))
+        elif scaling_type == "dynamic" and not explicit_alpha:
+            # No explicit alpha: derive NTK scaling factor from effective_max_len vs the
+            # model's original training length.  This is computed once at init time
+            # (compile-compatible: no per-forward inv_freq recomputation needed).
+            # Fall back to the RotaryPositionConfig default (8192) when no length information
+            # is available; this matches the historical LLaMA-2 / early extended-context
+            # baseline and is the same as RotaryPositionConfig.original_max_position_embeddings.
+            orig_len = getattr(rope_config, "original_max_position_embeddings", None) or model_max_len or 8192
+            if effective_max_len > orig_len:
+                derived_alpha = effective_max_len / orig_len
+                base = self.rotary_theta * (derived_alpha ** (rotary_dim / (rotary_dim - 2)))
+            else:
+                base = self.rotary_theta
         else:
             base = self.rotary_theta
 
@@ -204,17 +241,18 @@ class RotaryPosition(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # 3. Apply Scaling Logic (In-place on FP32 buffer)
-        if getattr(rope_config, "scaling_type", None) == "llama3":
+        if scaling_type == "llama3":
             self.llama3_scaling()
-        elif getattr(rope_config, "scaling_type", None) == "gemma3" and variant == "global":
+        elif scaling_type == "gemma3" and variant == "global":
             self.gemma3_scaling()
 
         # 4. Initialize cos_sin placeholder
         self.register_buffer("cos_sin", torch.zeros(1), persistent=False)
 
-        # Pre-allocate 32k for 1D to prevent initial graph recompiles
+        # Pre-allocate the cos/sin table for the effective maximum length to avoid
+        # dynamic table growth (and associated recompilation) during forward passes.
         if mode == "1d":
-            self.update(32768)
+            self.update(effective_max_len)
 
     def init_2d_inv_freq(self, inv_freq):
         """
