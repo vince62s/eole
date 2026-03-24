@@ -681,9 +681,12 @@ class TransformerDecoder(DecoderBase):
             # ----------------------------------------------------------
             cache_keys = None
             if use_cache:
+                # Move the whole chunk slice to CPU once to avoid B separate
+                # GPU→CPU device syncs inside the per-sequence loop below.
+                src_ids_chunk_cpu = src_ids[:, start:end].cpu()
                 # Compute an independent rolling-hash key for each sequence.
                 cache_keys = [
-                    self._prefill_cache.compute_key(src_ids[b, start:end], prev_keys[b])
+                    self._prefill_cache.compute_key(src_ids_chunk_cpu[b], prev_keys[b])
                     for b in range(B)
                 ]
                 # A "full hit" means every sequence in the batch has a valid

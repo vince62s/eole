@@ -35,6 +35,15 @@ class TestPrefillCacheBasics(unittest.TestCase):
     def _make_ids(self, values):
         return torch.tensor(values, dtype=torch.long)
 
+    def test_compute_key_same_result_for_cpu_and_gpu_tensors(self):
+        """compute_key returns identical bytes for the same data on CPU vs GPU."""
+        ids_cpu = self._make_ids([7, 8, 9])
+        key_cpu = self.Cache.compute_key(ids_cpu)
+        if torch.cuda.is_available():
+            ids_gpu = ids_cpu.cuda()
+            key_gpu = self.Cache.compute_key(ids_gpu)
+            self.assertEqual(key_cpu, key_gpu)
+
     def test_compute_key_deterministic(self):
         """Same token IDs always produce the same key."""
         ids = self._make_ids([1, 2, 3])
