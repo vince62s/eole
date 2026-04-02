@@ -783,7 +783,8 @@ MODEL_OVERRIDES = {
 # Combine base mappings with overrides
 # KEY_MAPS = {model: {**BASE_KEY_MAP, **overrides} for model, overrides in MODEL_OVERRIDES.items()}
 KEY_MAPS = {
-    model: recursive_update_dict(deepcopy(BASE_KEY_MAP), overrides, {}) for model, overrides in MODEL_OVERRIDES.items()
+    model: recursive_update_dict(deepcopy(BASE_KEY_MAP), overrides, {}, silent=True)
+    for model, overrides in MODEL_OVERRIDES.items()
 }
 
 # Layer norm type
