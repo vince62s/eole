@@ -319,17 +319,36 @@ def build_config_dict(hf):
         "num_experts_per_tok": config.get("num_experts_per_tok", 0),
         "moe_transformer_ff": config.get("moe_intermediate_size", None),
         "add_qkvbias": False,
+        "add_key_bias": None,
         "add_final_linear_bias": False,
         "add_ffnbias": False,
         "shared_layer_norm": False,
+        "ffn_layernorm": False,
+        "moe_softmax_after": False,
+        "query_norm": False,
+        "key_norm": False,
+        "qk_norm_post_rope": False,
         "left_pad": True,
         "generator_bias": False,
+        "adapter": None,
         "adapter_bias": False,
         "rope_config": {
             "rotary_interleave": False,
             "rotary_theta": config.get("rope_theta", config.get("rope_parameters", {}).get("rope_theta", 10000)),
         },
-        "embeddings": {},  # Populated later
+        "embeddings": {"normalize": False},  # Populated later
+        # Decoder-layer sub-config defaults for arch-specific boolean flags.
+        # Pre-populating these here (rather than relying on arch_config to add them
+        # from scratch) means the arch_config application always overrides a known
+        # False default rather than None, producing meaningful log messages.
+        "decoder": {
+            "query_norm": False,
+            "key_norm": False,
+            "qk_norm_post_rope": False,
+            "q_gating": False,
+            "shared_expert_gate": False,
+            "moe_renormalize": False,
+        },
     }
     if model_config["num_experts"] == 1:
         model_config["num_experts"] = 0
