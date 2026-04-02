@@ -5,6 +5,10 @@ and config translation as ``eole_convert HF``, but entirely in memory so that
 inference can be run directly from a HuggingFace model ID or local HF directory
 without a separate conversion step.
 
+:func:`build_train_config` is the shared config-and-vocab building function used by
+both the in-memory inference path (:class:`HFLoader`) and the disk-based conversion
+tool (:class:`~eole.bin.convert.convert_HF.LlamaHFConverter`).
+
 The public entry point for the inference pipeline is :func:`load_hf_model`.
 """
 
@@ -29,7 +33,6 @@ from eole.bin.convert.convert_HF import (
 from eole.bin.convert.HF_mappings import KEY_MAPS, ARCH_TABLE, TOK_TABLE
 from eole.config.run import TrainConfig
 from eole.config.training import TrainingConfig
-from eole.config import recursive_model_fields_set
 from eole.inputters.inputter import vocabs_to_dict, dict_to_vocabs
 from eole.utils.logging import logger
 
@@ -67,6 +70,139 @@ def _hf_cache_dir(model_id: str) -> str:
     """
     slug = model_id.replace("/", "--").replace("\\", "--")
     return os.path.join(os.path.expanduser("~"), ".cache", "eole", "hf", slug)
+
+
+def build_train_config(hf, output_dir, tokenizer_pref="hf", dtype=None, use_env_path=False):
+    """Build the EOLE :class:`~eole.config.run.TrainConfig` and vocabulary from
+    a :class:`~eole.bin.convert.convert_HF.HuggingfaceFiles` instance.
+
+    This is the shared config-and-vocab building logic used by both the
+    in-memory inference path (:class:`HFLoader`) and the disk-based conversion
+    tool (:class:`~eole.bin.convert.convert_HF.LlamaHFConverter`).
+
+    Args:
+        hf: :class:`~eole.bin.convert.convert_HF.HuggingfaceFiles` instance.
+        output_dir: Directory where tokenizer artifacts (e.g. BPE model file)
+            are written.
+        tokenizer_pref: ``"hf"`` to use the HuggingFace tokenizer transform;
+            ``"onmt"`` to use the ONMT tokenizer transform.
+        dtype: Optional compute-dtype string (e.g. ``"fp16"``). Falls back to
+            the model's ``torch_dtype`` field and then to ``"fp16"``.
+        use_env_path: When ``True``, the ONMT tokenizer model path in the
+            produced transforms config uses the ``${MODEL_PATH}`` environment
+            variable prefix — suitable for on-disk ``config.json`` files that
+            must be portable.  When ``False`` (the default) an absolute path
+            rooted at *output_dir* is used instead.
+
+    Returns:
+        tuple: ``(train_config, vocabs, params, model_config_dict, inference_dict)``
+
+        * *train_config* – :class:`~eole.config.run.TrainConfig`.
+        * *vocabs* – ``dict`` with ``src``, ``tgt``, ``specials``, and
+          ``decoder_start_token`` entries.  ``vocabs["src"]`` and
+          ``vocabs["tgt"]`` are the pyonmttok vocabulary objects.
+        * *params* – list of HF parameter suffixes to extract
+          (``["weight", "bias"]`` or quantised equivalents).
+        * *model_config* – raw ``dict`` produced by
+          :func:`~eole.bin.convert.convert_HF.build_config_dict`; needed
+          by :func:`~eole.bin.convert.convert_HF.build_shards` and by
+          :meth:`HFLoader._build_tensors`.
+        * *inference_dict* – ``dict`` of inference-related settings
+          (``optional_eos``, ``chat_template``, generation params).
+    """
+    model_config, training_config, params = build_config_dict(hf)
+    compute_dtype = dtype or hf.config.get("torch_dtype") or "fp16"
+    gpt2_pretok = False
+
+    (add_bos_token, chat_template, optional_eos, mapped_tokens) = check_tokenizer_config(hf)
+    vocabs = check_special_tokens(hf)
+
+    if hf.tokenizer_model is not None:
+        src_subword_type = "sentencepiece"
+        src_vocab, tokenizer_basename = check_sentencepiece_tokenizer(hf)
+    else:
+        src_subword_type = "bpe"
+        src_vocab, tokenizer_basename, vocabs, gpt2_pretok = check_bpe_tokenizer(hf, vocabs, output_dir)
+
+    # Set decoder start token
+    if hf.config.get("decoder_start_token_id") is not None:
+        vocabs["decoder_start_token"] = src_vocab.ids_to_tokens[hf.config["decoder_start_token_id"]]
+    elif add_bos_token:
+        vocabs["decoder_start_token"] = vocabs["specials"].get("bos_token", "")
+    else:
+        vocabs["decoder_start_token"] = ""
+
+    vocabs["src"] = src_vocab
+    vocabs["tgt"] = src_vocab
+
+    # Configure transforms
+    if use_env_path:
+        tokenizer_model_path = os.path.join("${MODEL_PATH}", tokenizer_basename)
+    else:
+        tokenizer_model_path = os.path.join(output_dir, tokenizer_basename)
+
+    match TOK_TABLE[hf.arch], tokenizer_pref:
+        case "huggingface_tokenize", "hf":
+            transforms = ["huggingface_tokenize"]
+            transforms_configs = {
+                TOK_TABLE[hf.arch]: {"path": hf.tokenizer_json},
+            }
+        case _:
+            transforms = ["onmt_tokenize", "filtertoolong"]
+            transforms_configs = {
+                "filtertoolong": {"src_seq_length": 512, "tgt_seq_length": 512},
+                "onmt_tokenize": {
+                    "src_subword_type": src_subword_type,
+                    "src_subword_model": tokenizer_model_path,
+                    "gpt2_pretok": gpt2_pretok,
+                    "mapped_tokens": mapped_tokens,
+                },
+            }
+
+    generation_config_dict = check_generation_config(hf)
+
+    # Build an args-like namespace so get_huggingface_model() can read model_dir
+    hf_args = SimpleNamespace(model_dir=hf.model_dir)
+
+    train_config = TrainConfig(
+        data=None,
+        skip_empty_level="silent",
+        save_data=None,
+        n_sample=0,
+        src_vocab=None,
+        tgt_vocab=None,
+        share_vocab=True,
+        src_vocab_size=hf.vocab_size,
+        tgt_vocab_size=hf.vocab_size,
+        vocab_size_multiple=8,
+        decoder_start_token=vocabs["decoder_start_token"],
+        **vocabs["specials"],
+        transforms=transforms,
+        transforms_configs=transforms_configs,
+        model=ARCH_TABLE[hf.arch](
+            **model_config,
+            huggingface_model=get_huggingface_model(hf_args),
+        ),
+        training=TrainingConfig(
+            compute_dtype=compute_dtype,
+            batch_size=896,
+            batch_size_multiple=1,
+            batch_type="tokens",
+            normalization="tokens",
+            accum_count=[32],
+            accum_steps=[0],
+            valid_batch_size=256,
+            **training_config,
+        ),
+    )
+
+    inference_dict = {
+        "optional_eos": optional_eos,
+        **generation_config_dict,
+        **chat_template,
+    }
+
+    return train_config, vocabs, params, model_config, inference_dict
 
 
 class HFLoader:
@@ -131,98 +267,14 @@ class HFLoader:
         args = self._make_fetch_args(cache_dir)
         hf = HuggingfaceFiles.fetch(args)
 
-        # Build EOLE config dicts from HF config.json
-        model_config, training_config, params = build_config_dict(hf)
-
-        # Determine default compute dtype from HF config (fall back to fp16)
-        compute_dtype = hf.config.get("torch_dtype") or "fp16"
-
-        # Build vocab
-        (add_bos_token, chat_template, optional_eos, mapped_tokens) = check_tokenizer_config(hf)
-        vocabs = check_special_tokens(hf)
-
-        gpt2_pretok = False
-        if hf.tokenizer_model is not None:
-            src_subword_type = "sentencepiece"
-            src_vocab, tokenizer_basename = check_sentencepiece_tokenizer(hf)
-        else:
-            src_subword_type = "bpe"
-            src_vocab, tokenizer_basename, vocabs, gpt2_pretok = check_bpe_tokenizer(hf, vocabs, cache_dir)
-
-        # Set decoder start token
-        if hf.config.get("decoder_start_token_id") is not None:
-            vocabs["decoder_start_token"] = src_vocab.ids_to_tokens[hf.config["decoder_start_token_id"]]
-        elif add_bos_token:
-            vocabs["decoder_start_token"] = vocabs["specials"].get("bos_token", "")
-        else:
-            vocabs["decoder_start_token"] = ""
-
-        vocabs["src"] = src_vocab
-        vocabs["tgt"] = src_vocab
-        vocabs_dict = vocabs_to_dict(vocabs)
-
-        # Configure transforms (mirrors LlamaHFConverter.run logic)
-        match TOK_TABLE[hf.arch], "hf":
-            case "huggingface_tokenize", "hf":
-                transforms = ["huggingface_tokenize"]
-                transforms_configs = {
-                    TOK_TABLE[hf.arch]: {"path": hf.tokenizer_json},
-                }
-            case _:
-                tokenizer_model_path = os.path.join(cache_dir, tokenizer_basename)
-                transforms = ["onmt_tokenize", "filtertoolong"]
-                transforms_configs = {
-                    "filtertoolong": {"src_seq_length": 512, "tgt_seq_length": 512},
-                    "onmt_tokenize": {
-                        "src_subword_type": src_subword_type,
-                        "src_subword_model": tokenizer_model_path,
-                        "gpt2_pretok": gpt2_pretok,
-                        "mapped_tokens": mapped_tokens,
-                    },
-                }
-
-        generation_config_dict = check_generation_config(hf)
-
-        # Build the TrainConfig (identical to what convert_HF.py saves to config.json)
-        train_config = TrainConfig(
-            data=None,
-            skip_empty_level="silent",
-            save_data=None,
-            n_sample=0,
-            src_vocab=None,
-            tgt_vocab=None,
-            share_vocab=True,
-            src_vocab_size=hf.vocab_size,
-            tgt_vocab_size=hf.vocab_size,
-            vocab_size_multiple=8,
-            decoder_start_token=vocabs["decoder_start_token"],
-            **vocabs["specials"],
-            transforms=transforms,
-            transforms_configs=transforms_configs,
-            model=ARCH_TABLE[hf.arch](
-                **model_config,
-                huggingface_model=get_huggingface_model(args),
-            ),
-            training=TrainingConfig(
-                compute_dtype=compute_dtype,
-                batch_size=896,
-                batch_size_multiple=1,
-                batch_type="tokens",
-                normalization="tokens",
-                accum_count=[32],
-                accum_steps=[0],
-                valid_batch_size=256,
-                **training_config,
-            ),
+        train_config, vocabs, params, model_config, inference_dict = build_train_config(
+            hf, cache_dir
         )
-        # Attach inference settings (optional_eos, chat_template, generation params)
-        inference_dict = {
-            "optional_eos": optional_eos,
-            **generation_config_dict,
-            **chat_template,
-        }
-        # Store on the config object so callers can propagate them if needed
+
+        # Attach inference settings so callers can propagate them if needed
         train_config.__dict__["_hf_inference_dict"] = inference_dict
+
+        vocabs_dict = vocabs_to_dict(vocabs)
 
         # Build in-memory tensor store with remapped weights
         store = _InMemoryTensorStore()
