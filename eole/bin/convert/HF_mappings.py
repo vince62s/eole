@@ -780,12 +780,46 @@ MODEL_OVERRIDES = {
     },
 }
 
-# Combine base mappings with overrides
-# KEY_MAPS = {model: {**BASE_KEY_MAP, **overrides} for model, overrides in MODEL_OVERRIDES.items()}
-KEY_MAPS = {
-    model: recursive_update_dict(deepcopy(BASE_KEY_MAP), overrides, {}, silent=True)
-    for model, overrides in MODEL_OVERRIDES.items()
-}
+# Combine base mappings with overrides lazily so that only the architecture
+# actually being loaded triggers logging (and computation).
+# KEY_MAPS[arch] is identical to what the old dict comprehension produced, but
+# the map is built — and overrides logged — on first access for each arch.
+
+
+class _LazyKeyMaps:
+    """Per-architecture key maps, built on first access.
+
+    Only the architecture that is actually being converted/loaded causes its
+    override diff to be computed and logged.  Other architectures are never
+    touched, so MoE or vision-encoder keys never appear in the log when
+    loading a plain dense model.
+    """
+
+    def __init__(self):
+        self._cache = {}
+
+    def _build(self, arch):
+        overrides = MODEL_OVERRIDES.get(arch, {})
+        return recursive_update_dict(deepcopy(BASE_KEY_MAP), overrides, {})
+
+    def __getitem__(self, arch):
+        if arch not in self._cache:
+            self._cache[arch] = self._build(arch)
+        return self._cache[arch]
+
+    def __contains__(self, arch):
+        return arch in MODEL_OVERRIDES
+
+    def get(self, arch, default=None):
+        if arch not in MODEL_OVERRIDES:
+            return default
+        return self[arch]
+
+    def keys(self):
+        return MODEL_OVERRIDES.keys()
+
+
+KEY_MAPS = _LazyKeyMaps()
 
 # Layer norm type
 LN_TABLE = defaultdict(
