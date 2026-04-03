@@ -513,9 +513,19 @@ def build_config_dict(hf):
         if model_config.get("heads", None) is None:
             model_config["heads"] = 8
         if vision_config is not None:
+            # Gemma4VisionConfig has no `image_size` field; it uses
+            # `position_embedding_size` (maximum number of position embeddings).
+            # Fall back to that when `image_size` is not present.
+            _v_image_size = vision_config.get("image_size")
+            _v_patch_size = vision_config.get("patch_size", 0)
+            _v_pos_emb_size = vision_config.get("position_embedding_size", 0)
+            if _v_image_size is not None and _v_patch_size > 0:
+                n_positions = (_v_image_size // _v_patch_size) ** 2
+            else:
+                n_positions = _v_pos_emb_size
             model_config["encoder"].update(
                 {
-                    "n_positions": (vision_config["image_size"] // vision_config["patch_size"]) ** 2,
+                    "n_positions": n_positions,
                     # Gemma4 vision uses mm_tokens_per_image from the top-level config
                     "mm_tokens_per_image": other_config.get(
                         "mm_tokens_per_image", hf.config.get("mm_tokens_per_image", 256)
