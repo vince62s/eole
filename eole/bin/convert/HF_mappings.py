@@ -407,15 +407,14 @@ MODEL_OVERRIDES = {
         },
     },
     # Gemma4 multimodal model (text + SigLIP vision encoder).
-    # The decoder (text) part is identical to Gemma4ForCausalLM.
+    # The decoder (text) part is identical to Gemma4ForCausalLM: weight names
+    # use the flat "model.*" prefix (no "language_model." wrapper), so we rely
+    # on BASE_KEY_MAP defaults for decoder_layer_prefix, tgt_emb.embeddings.weight,
+    # and decoder.layer_norm.weight.
     # The vision encoder is the same SigLIP architecture as Gemma3.
     # Audio encoder support is not yet implemented in Eole.
     "Gemma4ForConditionalGeneration": {
-        "decoder_layer_prefix": "language_model.model.layers.",
-        "tgt_emb.embeddings.weight": "language_model.model.embed_tokens.weight",
-        "decoder.layer_norm.weight": "language_model.model.norm.weight",
-        # "generator.weight": "language_model.lm_head.weight",  # shared with embeddings
-        # decoder layer modules
+        # decoder layer modules (extends BASE_KEY_MAP decoder dict)
         "decoder": {
             ".self_attn.q_norm.": ".self_attn.q_norm.",
             ".self_attn.k_norm.": ".self_attn.k_norm.",

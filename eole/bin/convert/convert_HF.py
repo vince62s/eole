@@ -1440,8 +1440,7 @@ def check_bpe_tokenizer(hf, vocabs, directory_path):
     config = hf.config.get("text_config", hf.config)
     vocab_size = hf.vocab_size
     # gpt2_pretok
-    pretokenizers = hf.tokenizer.get("pre_tokenizer", {}).get("pretokenizers", [{}])
-    pre_tokenizer = hf.tokenizer.get("pre_tokenizer", None)
+    pre_tokenizer = hf.tokenizer.get("pre_tokenizer", None) or {}
     pretokenizers = pre_tokenizer.get("pretokenizers", None)
     if pretokenizers is None:
         pretokenizers = [pre_tokenizer]
