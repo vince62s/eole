@@ -1445,6 +1445,7 @@ def check_bpe_tokenizer(hf, vocabs, directory_path):
     pretokenizers = pre_tokenizer.get("pretokenizers", None)
     if pretokenizers is None:
         pretokenizers = [pre_tokenizer]
+    gpt2_pretok = False
     for pretokenizer in pretokenizers:
         if pretokenizer.get("type", None) == "ByteLevel":
             gpt2_pretok = True
