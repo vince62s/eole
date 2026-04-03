@@ -313,6 +313,42 @@ MODEL_OVERRIDES = {
             },
         },
     },
+    # Gemma4 text-only model.  Weight names are identical to Gemma3 (the HF
+    # class inherits from Gemma3ForCausalLM) but the config differs: per-layer
+    # RoPE (proportional for full_attention, default for sliding_attention),
+    # per-layer head_dim (global_head_dim for full_attention layers) and an
+    # explicit layer_types list ("sliding_attention"/"full_attention").
+    # These are extracted dynamically in convert_HF.py; only the common
+    # weight-name overrides that match Gemma3 are listed here.
+    "Gemma4ForCausalLM": {
+        "decoder.embed_tokens_per_layer.weight": "model.embed_tokens_per_layer.weight",
+        "decoder.per_layer_model_projection.weight": "model.per_layer_model_projection.weight",
+        "decoder.per_layer_projection_norm.weight": "model.per_layer_projection_norm.weight",
+        "decoder": {
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
+            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+            ".layer_scalar": ".layer_scalar",
+            ".per_layer_input_gate.": ".per_layer_input_gate.",
+            ".per_layer_projection.": ".per_layer_projection.",
+            ".post_per_layer_input_norm.": ".post_per_layer_input_norm.",
+        },
+        "config": {
+            "share_decoder_embeddings": True,
+            "ffn_layernorm": True,
+            "embeddings": {
+                "normalize": True,
+            },
+            "decoder": {
+                "query_norm": True,
+                "key_norm": True,
+                "attn_scaling": 1.0,
+                # rope_config defaults are filled by convert_HF.py from rope_parameters
+                "max_position_embeddings": 131072,
+            },
+        },
+    },
     "Gemma3ForConditionalGeneration": {
         "decoder_layer_prefix": "language_model.model.layers.",
         "tgt_emb.embeddings.weight": "language_model.model.embed_tokens.weight",
@@ -347,12 +383,12 @@ MODEL_OVERRIDES = {
         "adapter.norm.weight": "multi_modal_projector.mm_soft_emb_norm.weight",
         "config": {
             "share_decoder_embeddings": True,
-            "ffn_layernorm": True,
             "embeddings": {
                 "normalize": True,
             },
             "adapter": "gemma3",
             "decoder": {
+                "ffn_layernorm": True,
                 "query_norm": True,
                 "key_norm": True,
                 "rope_config": {
@@ -366,6 +402,10 @@ MODEL_OVERRIDES = {
                 "max_position_embeddings": 131072,
             },
             "encoder": {
+                "ffn_layernorm": False,
+                # SigLIP encoder uses default 1/sqrt(head_dim) scaling;
+                # prevent model-level query_pre_attn_scalar from propagating.
+                "attn_scaling": None,
                 "mlp_activation_fn": "gelu-tanh",
                 "position_encoding_type": PositionEncodingType.Learned,
                 "layer_norm": "standard",
@@ -375,6 +415,137 @@ MODEL_OVERRIDES = {
                 "layernorm_pre": False,
                 "layernorm_post": True,
                 "patch_conv_bias": True,
+            },
+        },
+    },
+    # Gemma4 multimodal model (text + custom vision encoder + multimodal projector).
+    #
+    # Weight layout (Gemma4ForConditionalGeneration):
+    #   self.model = Gemma4Model(config)
+    #     ├── self.language_model = Gemma4TextModel  → model.language_model.*
+    #     ├── self.vision_tower   = Gemma4VisionModel → model.vision_tower.*
+    #     └── self.embed_vision   = Gemma4MultimodalEmbedder → model.embed_vision.*
+    #   self.lm_head  (tied to model.language_model.embed_tokens.weight)
+    #
+    # IMPORTANT: Gemma4 uses Gemma4ClippableLinear (wraps nn.Linear as self.linear)
+    # for ALL vision attention and MLP projections, adding ".linear." to every path.
+    # The text decoder uses standard nn.Linear, so BASE_KEY_MAP decoder suffixes apply.
+    "Gemma4ForConditionalGeneration": {
+        # --- decoder (Gemma4TextModel inside Gemma4Model.language_model) ---
+        "decoder_layer_prefix": "model.language_model.layers.",
+        "tgt_emb.embeddings.weight": "model.language_model.embed_tokens.weight",
+        "decoder.layer_norm.weight": "model.language_model.norm.weight",
+        "decoder.embed_tokens_per_layer.weight": "model.language_model.embed_tokens_per_layer.weight",
+        "decoder.per_layer_model_projection.weight": "model.language_model.per_layer_model_projection.weight",
+        "decoder.per_layer_projection_norm.weight": "model.language_model.per_layer_projection_norm.weight",
+        # lm_head is tied to embed_tokens (share_decoder_embeddings=True), skipped
+        # decoder layer modules: text layers use standard nn.Linear, so BASE_KEY_MAP
+        # suffixes are correct; only the Gemma4-specific layernorms are added here.
+        "decoder": {
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
+            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+            ".layer_scalar": ".layer_scalar",
+            ".per_layer_input_gate.": ".per_layer_input_gate.",
+            ".per_layer_projection.": ".per_layer_projection.",
+            ".post_per_layer_input_norm.": ".post_per_layer_input_norm.",
+        },
+        # --- vision encoder (Gemma4VisionModel inside Gemma4Model.vision_tower) ---
+        # Gemma4 uses its own Gemma4VisionModel (NOT SigLIP).
+        # Structure: patch_embedder.input_proj (Linear, no bias) + encoder.layers
+        # All vision attention/MLP use Gemma4ClippableLinear → path has extra ".linear."
+        #
+        # IMPORTANT: Gemma4VisionPatchEmbedder.input_proj is nn.Linear(3*P*P, H), not Conv2d.
+        # EOLE's patch_conv is Conv2d([H, 3, P, P]).  The Linear weight must be reshaped:
+        #   [H, 3*P*P] → [H, 3, P, P]
+        "encoder_layer_prefix": "model.vision_tower.encoder.layers.",
+        "encoder.patch_conv.weight": (
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            # HF input_proj.weight is (H, P_h*P_w*C) where the patch pixels are in
+            # (P_h, P_w, C) order (channel-last per pixel).  EOLE's Conv2d kernel
+            # expects (H, C, P_h, P_w) — channel-first.  We must reshape+permute, not
+            # just view, to correctly re-order channels within each patch.
+            ".reshape(w.shape[0], int(round((w.shape[1]/3)**0.5)), int(round((w.shape[1]/3)**0.5)), 3).permute(0, 3, 1, 2).contiguous()",
+        ),
+        # No patch_conv bias (input_proj has bias=False).
+        # No post_layernorm at Gemma4VisionModel level.
+        # Gemma4 vision uses a 2D learnable position embedding table [2, P, H] in
+        # Gemma4VisionPatchEmbedder; mapped to encoder.position_embedding_table.
+        "encoder.position_embedding_table": "model.vision_tower.patch_embedder.position_embedding_table",
+        # Gemma4VisionModel optional output standardization buffers (standardize=True).
+        # HF applies these after the pooler, so they live in the adapter (projector).
+        "adapter.std_bias": "model.vision_tower.std_bias",
+        "adapter.std_scale": "model.vision_tower.std_scale",
+        "encoder": {
+            ".self_attn.linear_query.": ".self_attn.q_proj.linear.",
+            ".self_attn.linear_keys.": ".self_attn.k_proj.linear.",
+            ".self_attn.linear_values.": ".self_attn.v_proj.linear.",
+            ".self_attn.final_linear.": ".self_attn.o_proj.linear.",
+            # Gemma4 vision attention has learnable q_norm and k_norm (RMSNorm with scale)
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            # Gemma4 vision MLP is gated: act(gate_proj(x)) * up_proj(x)
+            ".mlp.gate_up_proj.": ".mlp.gate_proj.linear.",
+            ".mlp.down_proj.": ".mlp.down_proj.linear.",
+            ".mlp.up_proj.": ".mlp.up_proj.linear.",
+            ".input_layernorm.": ".input_layernorm.",
+            ".post_attention_layernorm.": ".post_attention_layernorm.",
+            # Gemma4 vision ffn layernorms (pre/post feedforward)
+            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
+            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+        },
+        # --- multimodal adapter (Gemma4MultimodalEmbedder inside Gemma4Model.embed_vision) ---
+        # embedding_projection is nn.Linear(multimodal_hidden, text_hidden), no transpose.
+        "adapter.w_in.weight": "model.embed_vision.embedding_projection.weight",
+        # adapter.norm.weight has no source: Gemma4MultimodalEmbedder uses
+        # Gemma4RMSNorm(with_scale=False) for pre-projection norm — no learnable weight.
+        "config": {
+            "share_decoder_embeddings": True,
+            "embeddings": {
+                "normalize": True,
+            },
+            "adapter": "gemma4",
+            "decoder": {
+                "ffn_layernorm": True,
+                "query_norm": True,
+                "key_norm": True,
+                "attn_scaling": 1.0,
+                # rope_config defaults are filled by convert_HF.py from rope_parameters
+                "max_position_embeddings": 131072,
+            },
+            "encoder": {
+                # Gemma4VisionAttention explicitly sets scaling=1.0 (no 1/sqrt(head_dim))
+                "attn_scaling": 1.0,
+                # Gemma4 vision MLP is gated (act(gate_proj) * up_proj)
+                "mlp_activation_fn": "gated-gelu-tanh",
+                # Use 2D RoPE for vision encoder (replaces 2D factorised absolute PE)
+                # image_size for 2D RoPE precomputation is set dynamically in convert_HF.py
+                "position_encoding_type": PositionEncodingType.Rotary,
+                # RoPE config: Gemma4VisionConfig default_theta = 100.0
+                "rope_config": {
+                    "rotary_theta": 100.0,
+                    "rotary_interleave": False,
+                },
+                # Gemma4 uses RMSNorm throughout (Gemma4RMSNorm)
+                "layer_norm": "rms",
+                "add_ffnbias": False,
+                "add_final_linear_bias": False,
+                "add_qkvbias": False,
+                # Gemma4 vision attention has learnable q/k norms
+                "query_norm": True,
+                "key_norm": True,
+                "layernorm_pre": False,
+                # Gemma4VisionModel has no global post_layernorm; the per-layer
+                # post_attention_layernorm is handled inside each encoder layer.
+                "layernorm_post": False,
+                "patch_conv_bias": False,
+                # Each Gemma4VisionEncoderLayer has pre/post_feedforward_layernorm
+                "ffn_layernorm": True,
+                # Gemma4 uses avg-pool with kernel_size=3 in the multimodal projector
+                "pooling_kernel_size": 3,
+                # position_embedding_size and standardize are set dynamically in convert_HF.py
+                # from vision_config (position_embedding_size and standardize fields).
             },
         },
     },
@@ -814,6 +985,8 @@ LN_TABLE = defaultdict(
         "M2M100ForConditionalGeneration": "standard",
         "WhisperForConditionalGeneration": "standard",
         "Gemma3ForConditionalGeneration": "gemma-rms",
+        "Gemma4ForCausalLM": "rms",
+        "Gemma4ForConditionalGeneration": "rms",
         "Qwen3_5ForConditionalGeneration": "gemma-rms",
         "Qwen3_5MoeForConditionalGeneration": "gemma-rms",
     },
@@ -829,6 +1002,8 @@ ACT_TABLE = defaultdict(
         "Gemma2ForCausalLM": "gated-gelu",
         "Gemma3ForCausalLM": "gated-gelu-tanh",
         "Gemma3ForConditionalGeneration": "gated-gelu-tanh",
+        "Gemma4ForCausalLM": "gated-gelu-tanh",
+        "Gemma4ForConditionalGeneration": "gated-gelu-tanh",
         "M2M100ForConditionalGeneration": "relu",
         "WhisperForConditionalGeneration": "gelu",
     },
@@ -850,6 +1025,7 @@ ARCH_TABLE = defaultdict(
         "LlavaForConditionalGeneration": VisionTransformerLMModelConfig,
         "Mistral3ForConditionalGeneration": VisionTransformerLMModelConfig,
         "Gemma3ForConditionalGeneration": VisionTransformerLMModelConfig,
+        "Gemma4ForConditionalGeneration": VisionTransformerLMModelConfig,
         "M2M100ForConditionalGeneration": TransformerModelConfig,
         "WhisperForConditionalGeneration": WhisperModelConfig,
         "DeepseekOCRForCausalLM": VisionTransformerLMModelConfig,
