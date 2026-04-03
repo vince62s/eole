@@ -313,6 +313,34 @@ MODEL_OVERRIDES = {
             },
         },
     },
+    # Gemma4 text-only model.  Weight names are identical to Gemma3 (the HF
+    # class inherits from Gemma3ForCausalLM) but the config differs: per-layer
+    # RoPE (proportional for full_attention, default for sliding_attention),
+    # per-layer head_dim (global_head_dim for full_attention layers) and an
+    # explicit layer_types list ("sliding_attention"/"full_attention").
+    # These are extracted dynamically in convert_HF.py; only the common
+    # weight-name overrides that match Gemma3 are listed here.
+    "Gemma4ForCausalLM": {
+        "decoder": {
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
+            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+        },
+        "config": {
+            "share_decoder_embeddings": True,
+            "ffn_layernorm": True,
+            "embeddings": {
+                "normalize": True,
+            },
+            "decoder": {
+                "query_norm": True,
+                "key_norm": True,
+                # rope_config defaults are filled by convert_HF.py from rope_parameters
+                "max_position_embeddings": 131072,
+            },
+        },
+    },
     "Gemma3ForConditionalGeneration": {
         "decoder_layer_prefix": "language_model.model.layers.",
         "tgt_emb.embeddings.weight": "language_model.model.embed_tokens.weight",
@@ -363,6 +391,67 @@ MODEL_OVERRIDES = {
                     "tmax_index": 1,
                     "rotary_interleave": False,
                 },
+                "max_position_embeddings": 131072,
+            },
+            "encoder": {
+                "mlp_activation_fn": "gelu-tanh",
+                "position_encoding_type": PositionEncodingType.Learned,
+                "layer_norm": "standard",
+                "add_ffnbias": True,
+                "add_final_linear_bias": True,
+                "add_qkvbias": True,
+                "layernorm_pre": False,
+                "layernorm_post": True,
+                "patch_conv_bias": True,
+            },
+        },
+    },
+    # Gemma4 multimodal model (text + SigLIP vision encoder).
+    # The decoder (text) part is identical to Gemma4ForCausalLM.
+    # The vision encoder is the same SigLIP architecture as Gemma3.
+    # Audio encoder support is not yet implemented in Eole.
+    "Gemma4ForConditionalGeneration": {
+        "decoder_layer_prefix": "language_model.model.layers.",
+        "tgt_emb.embeddings.weight": "language_model.model.embed_tokens.weight",
+        "decoder.layer_norm.weight": "language_model.model.norm.weight",
+        # "generator.weight": "language_model.lm_head.weight",  # shared with embeddings
+        # decoder layer modules
+        "decoder": {
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
+            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+        },
+        "encoder_layer_prefix": "vision_tower.vision_model.encoder.layers.",
+        "encoder.patch_conv.weight": "vision_tower.vision_model.embeddings.patch_embedding.weight",
+        "encoder.patch_conv.bias": "vision_tower.vision_model.embeddings.patch_embedding.bias",
+        "encoder.post_layernorm.weight": "vision_tower.vision_model.post_layernorm.weight",
+        "encoder.post_layernorm.bias": "vision_tower.vision_model.post_layernorm.bias",
+        "encoder.position_embeddings.weight": "vision_tower.vision_model.embeddings.position_embedding.weight",
+        # encoder layers modules
+        "encoder": {
+            ".self_attn.linear_query.": ".self_attn.q_proj.",
+            ".self_attn.linear_keys.": ".self_attn.k_proj.",
+            ".self_attn.linear_values.": ".self_attn.v_proj.",
+            ".self_attn.final_linear.": ".self_attn.out_proj.",
+            ".mlp.gate_up_proj.": ".mlp.fc1.",
+            ".mlp.down_proj.": ".mlp.fc2.",
+            ".input_layernorm.": ".layer_norm1.",
+            ".post_attention_layernorm.": ".layer_norm2.",
+        },
+        "adapter.w_in.weight": ("multi_modal_projector.mm_input_projection_weight", ".t()"),
+        "adapter.norm.weight": "multi_modal_projector.mm_soft_emb_norm.weight",
+        "config": {
+            "share_decoder_embeddings": True,
+            "ffn_layernorm": True,
+            "embeddings": {
+                "normalize": True,
+            },
+            "adapter": "gemma3",
+            "decoder": {
+                "query_norm": True,
+                "key_norm": True,
+                # rope_config defaults are filled by convert_HF.py from rope_parameters
                 "max_position_embeddings": 131072,
             },
             "encoder": {
@@ -814,6 +903,8 @@ LN_TABLE = defaultdict(
         "M2M100ForConditionalGeneration": "standard",
         "WhisperForConditionalGeneration": "standard",
         "Gemma3ForConditionalGeneration": "gemma-rms",
+        "Gemma4ForCausalLM": "gemma-rms",
+        "Gemma4ForConditionalGeneration": "gemma-rms",
         "Qwen3_5ForConditionalGeneration": "gemma-rms",
         "Qwen3_5MoeForConditionalGeneration": "gemma-rms",
     },
@@ -829,6 +920,8 @@ ACT_TABLE = defaultdict(
         "Gemma2ForCausalLM": "gated-gelu",
         "Gemma3ForCausalLM": "gated-gelu-tanh",
         "Gemma3ForConditionalGeneration": "gated-gelu-tanh",
+        "Gemma4ForCausalLM": "gated-gelu-tanh",
+        "Gemma4ForConditionalGeneration": "gated-gelu-tanh",
         "M2M100ForConditionalGeneration": "relu",
         "WhisperForConditionalGeneration": "gelu",
     },
@@ -850,6 +943,7 @@ ARCH_TABLE = defaultdict(
         "LlavaForConditionalGeneration": VisionTransformerLMModelConfig,
         "Mistral3ForConditionalGeneration": VisionTransformerLMModelConfig,
         "Gemma3ForConditionalGeneration": VisionTransformerLMModelConfig,
+        "Gemma4ForConditionalGeneration": VisionTransformerLMModelConfig,
         "M2M100ForConditionalGeneration": TransformerModelConfig,
         "WhisperForConditionalGeneration": WhisperModelConfig,
         "DeepseekOCRForCausalLM": VisionTransformerLMModelConfig,

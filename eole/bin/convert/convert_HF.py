@@ -258,6 +258,119 @@ def get_huggingface_model(args):
     return huggingface_model
 
 
+def _build_gemma4_config(config, model_config):
+    """Extract Gemma4-specific configuration into model_config.
+
+    Handles:
+    - ``layer_types``: list of "sliding_attention" / "full_attention" per layer.
+    - ``rope_parameters``: dict mapping layer-type names to rope settings.
+      Gemma4 uses ``{"sliding_attention": {...}, "full_attention": {...}}``
+      instead of the flat ``rope_scaling`` dict used by other models.
+    - ``global_head_dim`` / ``num_global_key_value_heads``: full_attention
+      layers may use a larger head_dim than sliding_attention layers.
+    - ``tmax_index``: Gemma4 uses tmax_index=1 (same as Gemma3).
+    """
+    from eole.config import recursive_update_dict
+
+    # --- 1. layer_types ---
+    layer_types = config.get("layer_types", None)
+    if layer_types is None:
+        # Build default 5:1 (sliding:full) pattern if not provided
+        n_layers = config.get("num_hidden_layers", 0)
+        if n_layers:
+            sliding_window_pattern = 6
+            layer_types = [
+                "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
+                for i in range(n_layers)
+            ]
+            # Ensure the last layer is always full_attention
+            if layer_types and layer_types[-1] != "full_attention":
+                layer_types[-1] = "full_attention"
+    if layer_types is not None:
+        model_config.setdefault("decoder", {})["layer_types"] = layer_types
+
+    # --- 2. rope_parameters (Gemma4 per-layer-type format) ---
+    rope_params = config.get("rope_parameters", None)
+    sliding_rope = None
+    full_rope = None
+    if isinstance(rope_params, dict) and "sliding_attention" in rope_params:
+        # Gemma4-style: keys are layer-type names
+        sliding_rope = rope_params.get("sliding_attention", {})
+        full_rope = rope_params.get("full_attention", {})
+
+    # Determine head dimensions
+    head_dim = config.get("head_dim", None)
+    global_head_dim = config.get("global_head_dim", None)
+    if global_head_dim is None:
+        global_head_dim = head_dim  # fall back to same dim for all layers
+
+    num_heads = config.get("num_attention_heads", config.get("num_heads", None))
+    heads_kv = config.get("num_key_value_heads", None)
+    num_global_kv_heads = config.get("num_global_key_value_heads", None)
+    if num_global_kv_heads is None:
+        num_global_kv_heads = heads_kv
+
+    # --- 3. Build rope_config ---
+    # The global rope uses: full_attention params (theta=1_000_000, proportional factor)
+    # The local rope  uses: sliding_attention params (theta=10_000, default/full rotation)
+    global_theta = 1_000_000
+    local_theta = 10_000
+    rotary_dim_global = 0
+
+    if full_rope:
+        global_theta = int(full_rope.get("rope_theta", global_theta))
+        partial_factor = full_rope.get("partial_rotary_factor", None)
+        if partial_factor is not None and global_head_dim:
+            rotary_dim_global = int(partial_factor * global_head_dim)
+    if sliding_rope:
+        local_theta = int(sliding_rope.get("rope_theta", local_theta))
+
+    # Derive interleave_local from the layer_types list (for rope selection fallback)
+    interleave_local = 6  # default 5:1 pattern
+    if layer_types:
+        n_full = sum(1 for lt in layer_types if lt == "full_attention")
+        n_total = len(layer_types)
+        if n_full > 0:
+            interleave_local = n_total // n_full
+
+    rope_config_update = {
+        "rotary_theta": global_theta,
+        "rotary_theta_local": local_theta,
+        "interleave_local": interleave_local,
+        "tmax_index": 1,  # same as Gemma3
+        "rotary_interleave": False,
+    }
+    if rotary_dim_global > 0:
+        rope_config_update["rotary_dim_global"] = rotary_dim_global
+
+    model_config = recursive_update_dict(
+        model_config,
+        {"decoder": {"rope_config": rope_config_update}},
+        {},
+    )
+
+    # Also set the model-level rope_config so it propagates through _override_values
+    model_config.setdefault("rope_config", {}).update(
+        {
+            "rotary_theta": global_theta,
+            "rotary_theta_local": local_theta,
+            "interleave_local": interleave_local,
+            "tmax_index": 1,
+            "rotary_interleave": False,
+        }
+    )
+    if rotary_dim_global > 0:
+        model_config["rope_config"]["rotary_dim_global"] = rotary_dim_global
+
+    # --- 4. global_head_dim / global_heads_kv ---
+    if global_head_dim and global_head_dim != head_dim:
+        model_config.setdefault("decoder", {})["global_head_dim"] = global_head_dim
+    if num_global_kv_heads and num_global_kv_heads != heads_kv:
+        model_config.setdefault("decoder", {})["global_heads_kv"] = num_global_kv_heads
+
+    return model_config
+
+
 def build_config_dict(hf):
     """Convert Hugging Face model configuration to eole config format.
 
@@ -391,6 +504,27 @@ def build_config_dict(hf):
                 "image_token_id": hf.config["image_token_index"],
             }
         )
+
+    if arch == "Gemma4ForConditionalGeneration":
+        if model_config.get("head_dim", None) is None:
+            model_config["head_dim"] = 256
+        if model_config.get("heads_kv", None) is None:
+            model_config["heads_kv"] = 4
+        if model_config.get("heads", None) is None:
+            model_config["heads"] = 8
+        if vision_config is not None:
+            model_config["encoder"].update(
+                {
+                    "n_positions": (vision_config["image_size"] // vision_config["patch_size"]) ** 2,
+                    # Gemma4 vision uses mm_tokens_per_image from the top-level config
+                    "mm_tokens_per_image": other_config.get(
+                        "mm_tokens_per_image", hf.config.get("mm_tokens_per_image", 256)
+                    ),
+                    "image_token_id": other_config.get(
+                        "image_token_id", hf.config.get("image_token_id", 258880)
+                    ),
+                }
+            )
 
     if arch in ["DeepseekOCRForCausalLM"]:
         model_config["encoder"].update(
@@ -552,13 +686,16 @@ def build_config_dict(hf):
         )
 
     # Handle rope_parameters (newer HF format, e.g. Qwen3.5 VL)
+    # Skip Gemma4's per-layer-type format ("sliding_attention"/"full_attention" keys)
+    # which is handled separately by _build_gemma4_config.
     if config.get("rope_parameters", None) is not None:
         rope_params = config["rope_parameters"]
-        mrope_section = rope_params.get("mrope_section", None)
-        if mrope_section is not None:
-            model_config["rope_config"]["xdrope_section"] = mrope_section
-        if rope_params.get("mrope_interleaved", False):
-            model_config["rope_config"]["rotary_interleave"] = True
+        if "sliding_attention" not in rope_params:
+            mrope_section = rope_params.get("mrope_section", None)
+            if mrope_section is not None:
+                model_config["rope_config"]["xdrope_section"] = mrope_section
+            if rope_params.get("mrope_interleaved", False):
+                model_config["rope_config"]["rotary_interleave"] = True
 
     # Validate required fields
     required_fields = {
@@ -750,6 +887,11 @@ def build_config_dict(hf):
             val = config.get(key, None)
             if val is not None:
                 model_config.setdefault("decoder", {})[key] = val
+
+    # Gemma4-specific: extract layer_types, per-layer-type rope parameters,
+    # global_head_dim and global_heads_kv for full_attention layers.
+    if arch in ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"]:
+        model_config = _build_gemma4_config(config, model_config)
 
     return model_config, training_config, params
 

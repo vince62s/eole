@@ -184,7 +184,12 @@ class RotaryPosition(nn.Module):
         self.dim_per_head = model_config.dim_per_head
 
         rope_config = model_config.rope_config
-        rotary_dim = rope_config.rotary_dim if rope_config.rotary_dim != 0 else self.dim_per_head
+        # For global (full_attention) layers: use rotary_dim_global if set (Gemma4 proportional rope)
+        rotary_dim_global = getattr(rope_config, "rotary_dim_global", 0)
+        if variant == "global" and rotary_dim_global > 0:
+            rotary_dim = rotary_dim_global
+        else:
+            rotary_dim = rope_config.rotary_dim if rope_config.rotary_dim != 0 else self.dim_per_head
         self.rotary_interleave = rope_config.rotary_interleave
         self.rotary_theta = rope_config.rotary_theta if variant == "global" else rope_config.rotary_theta_local
 

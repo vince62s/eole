@@ -201,6 +201,12 @@ class RotaryPositionConfig(Config):
         default=0,
         description="tmax indexing, 0 for all cases except gemma 3 = 1",
     )
+    rotary_dim_global: int = Field(
+        default=0,
+        description="Rotary dimension for global (full_attention) layers when different from rotary_dim. "
+        "Used by Gemma4 where full_attention layers use a smaller rotary dimension "
+        "(partial_rotary_factor * global_head_dim). 0 means use rotary_dim or dim_per_head.",
+    )
 
 
 class TransformerConfig(Config):
@@ -377,9 +383,19 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
     )
     layer_types: List[str] | None = Field(
         default=None,
-        description="Per-layer types for hybrid architectures (e.g. Qwen3.5). "
-        "Supported values: 'full_attention', 'linear_attention'. "
+        description="Per-layer types for hybrid architectures (e.g. Qwen3.5, Gemma4). "
+        "Supported values: 'full_attention', 'sliding_attention', 'linear_attention'. "
         "When None, all layers use full attention.",
+    )
+    global_head_dim: int | None = Field(
+        default=None,
+        description="Head dimension for 'full_attention' layers when different from head_dim. "
+        "Used by Gemma4 where full_attention layers use a larger head_dim than sliding_attention layers.",
+    )
+    global_heads_kv: int | None = Field(
+        default=None,
+        description="Number of KV heads for 'full_attention' layers when different from heads_kv. "
+        "Used by Gemma4. When None, falls back to heads_kv.",
     )
     linear_conv_kernel_dim: int = Field(
         default=4,
