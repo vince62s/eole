@@ -82,7 +82,7 @@ class TransformerDecoderLayer(nn.Module):
         else:
             # For full_attention layers in Gemma4-style hybrid models, use a
             # modified config with global_head_dim / global_heads_kv / no sliding window.
-            if self.layer_type == "full_attention" and getattr(decoder_config, "global_head_dim", None):
+            if self.layer_type == "full_attention" and getattr(decoder_config, "global_head_dim", None) is not None:
                 attn_config = _make_full_attn_config(decoder_config)
             else:
                 attn_config = decoder_config
@@ -1051,7 +1051,9 @@ class TransformerDecoder(DecoderBase):
             if lin_attn_mask is not None and layer.layer_type == "linear_attention":
                 layer_attn_mask = lin_attn_mask
             elif self.has_sliding_attn and layer.layer_type == "full_attention":
-                # Full_attention layers in Gemma4 see all previous tokens (no sliding window)
+                # Full_attention layers in Gemma4 see all previous tokens (no sliding window).
+                # attn_mask_full is None in the flash path (flash handles per-layer window_size
+                # natively); in the non-flash path it is computed alongside attn_mask.
                 layer_attn_mask = attn_mask_full
             else:
                 layer_attn_mask = attn_mask
