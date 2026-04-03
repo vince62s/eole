@@ -622,7 +622,7 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
             continue
 
         # content is a list of blocks
-        text_parts: list = []
+        content_parts: list = []
         tool_calls: list = []
         pending_tool_results: list = []
 
@@ -637,7 +637,23 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
                 block = {"text": str(block)}
 
             if btype == "text":
-                text_parts.append(block.get("text", ""))
+                content_parts.append({"type": "text", "text": block.get("text", "")})
+            elif btype == "image":
+                # Anthropic image block → OpenAI image_url block
+                source = block.get("source", {})
+                media_type = source.get("media_type", "image/jpeg")
+                data = source.get("data", "")
+                source_type = source.get("type", "base64")
+                if source_type == "base64":
+                    url = f"data:{media_type};base64,{data}"
+                elif source_type == "url":
+                    url = source.get("url", data)
+                else:
+                    url = data
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
+            elif btype == "image_url":
+                # Already in OpenAI format — pass through
+                content_parts.append(block)
             elif btype == "tool_use":
                 tool_id = block.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
                 tool_name = block.get("name", "")
@@ -672,12 +688,18 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
         # Build the message for this turn.  When the assistant made tool calls
         # the content should be null (or the text prefix if any) and the
         # tool_calls array should be set.
+        has_images = any(p.get("type") == "image_url" for p in content_parts)
+        text_parts = [p.get("text", "") for p in content_parts if p.get("type") == "text"]
+
         if tool_calls:
             msg_out: dict = {"role": role}
             # Include any preceding text as content (or null if none)
             msg_out["content"] = "\n".join(text_parts) if text_parts else ""
             msg_out["tool_calls"] = tool_calls
             openai_messages.append(msg_out)
+        elif has_images:
+            # Preserve multimodal content blocks for downstream image processing.
+            openai_messages.append({"role": role, "content": content_parts})
         elif text_parts:
             openai_messages.append({"role": role, "content": "\n".join(text_parts)})
         # If only tool_result blocks were present (user turn), there is no
@@ -812,6 +834,7 @@ class QueuedRequest:
     is_chat: bool
     future: asyncio.Future
     timestamp: float
+    images: any = None
 
 
 class Model(object):
@@ -880,14 +903,17 @@ class Model(object):
 
                 # Collect all inputs
                 all_inputs = []
+                all_images = []
                 request_boundaries = []  # Track (start_idx, end_idx) for each request
 
                 for req in reqs:
                     start_idx = len(all_inputs)
 
                     if is_chat:
-                        # Chat mode: single input per request
-                        all_inputs.append(self.apply_chat_template(req.inputs))
+                        # Chat mode: extract images and render template
+                        processed_msgs, images = self._extract_and_process_images(req.inputs)
+                        all_inputs.append(self.apply_chat_template(processed_msgs))
+                        all_images.extend(images)
                         end_idx = len(all_inputs)
                     elif isinstance(req.inputs, str):
                         # Single string input
@@ -902,12 +928,19 @@ class Model(object):
                         all_inputs.append(req.inputs)
                         end_idx = len(all_inputs)
 
+                    # Collect pre-processed images from the request (e.g.
+                    # from the Anthropic non-streaming path where template
+                    # rendering and image extraction happened earlier).
+                    if req.images:
+                        all_images.extend(req.images)
+
                     request_boundaries.append((start_idx, end_idx))
 
                 # Run batched inference in thread pool to avoid blocking event loop
+                images_arg = all_images if all_images else None
                 scores, _, preds = await asyncio.get_event_loop().run_in_executor(
                     self.engine._thread_pool,  # ← warmed thread
-                    lambda s=settings: self.engine.infer_list(all_inputs, settings=s),
+                    lambda s=settings, imgs=images_arg: self.engine.infer_list(all_inputs, settings=s, images=imgs),
                 )
 
                 # Distribute results back to individual requests using boundaries
@@ -1073,6 +1106,120 @@ class Model(object):
                         break
         return estimate_tokens(text)
 
+    def _extract_and_process_images(self, messages):
+        """Extract images from multimodal content blocks and process them.
+
+        Walks through the messages list and for each ``image_url`` content
+        block:
+        1. Loads the image (from base64 data-URL, HTTP URL, or local path).
+        2. Processes it through ``process_image()`` to obtain the pixel array
+           and the model-specific image-token string.
+        3. Replaces the ``image_url`` block with a ``text`` block containing
+           the generated image tokens.
+
+        Returns:
+            tuple: ``(updated_messages, images_list)`` where
+                *updated_messages* has image_url blocks replaced by text
+                blocks and *images_list* is a list of numpy arrays (one
+                per image, shape ``(C, H, W)``), or an empty list when
+                no images were found.
+        """
+        from eole.inputters.image_utils import process_image
+        from PIL import Image
+        import base64
+        import io
+
+        # Determine adapter-specific settings from model config
+        _encoder = getattr(getattr(self.config, "model", None), "encoder", None)
+        adapter = getattr(self.config.model, "adapter", None) or "llava"
+        patch_size = getattr(_encoder, "patch_size", 16)
+        image_size = getattr(_encoder, "image_size", 1024)
+        pooling_kernel_size = getattr(_encoder, "pooling_kernel_size", 1)
+        mm_tokens_per_image = getattr(_encoder, "mm_tokens_per_image", 280)
+
+        images_list = []
+        updated_messages = []
+
+        for msg in messages:
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "user")
+
+            if not isinstance(content, list):
+                # Plain string content or None — pass through unchanged.
+                updated_messages.append(msg)
+                continue
+
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type", "text")
+                elif hasattr(block, "type"):
+                    btype = block.type
+                    block = block.model_dump() if hasattr(block, "model_dump") else vars(block)
+                else:
+                    btype = "text"
+                    block = {"text": str(block)}
+
+                if btype == "image_url":
+                    # Extract image data
+                    image_url_info = block.get("image_url", {})
+                    url = image_url_info.get("url", "") if isinstance(image_url_info, dict) else str(image_url_info)
+
+                    pil_image = None
+                    if url.startswith("data:"):
+                        # data:image/jpeg;base64,<data>
+                        try:
+                            header, b64data = url.split(",", 1)
+                            raw = base64.b64decode(b64data)
+                            pil_image = Image.open(io.BytesIO(raw))
+                        except Exception as exc:
+                            logger.warning(f"Failed to decode base64 image: {exc}")
+                    elif url.startswith(("http://", "https://")):
+                        try:
+                            import urllib.request
+
+                            with urllib.request.urlopen(url, timeout=30) as resp:
+                                pil_image = Image.open(io.BytesIO(resp.read()))
+                        except Exception as exc:
+                            logger.warning(f"Failed to download image from {url}: {exc}")
+                    else:
+                        # Treat as a local file path
+                        try:
+                            pil_image = Image.open(url)
+                        except Exception as exc:
+                            logger.warning(f"Failed to open image file {url}: {exc}")
+
+                    if pil_image is not None:
+                        result = process_image(
+                            pil_image,
+                            adapter=adapter,
+                            image_patch_size=patch_size,
+                            image_size=image_size,
+                            pooling_kernel_size=pooling_kernel_size,
+                            mm_tokens_per_image=mm_tokens_per_image,
+                        )
+                        images_list.append(result["image"])
+                        # Replace the image_url block with a text block
+                        # containing the model-specific image tokens.
+                        token_str = result["tokens"] if isinstance(result["tokens"], str) else "".join(result["tokens"])
+                        new_blocks.append({"type": "text", "text": token_str})
+                    else:
+                        # Could not load image — drop the block silently.
+                        logger.warning("Dropping unreadable image_url block.")
+                else:
+                    new_blocks.append(block)
+
+            # Rebuild the message with updated content blocks.
+            # Collapse to a single string if all blocks are text.
+            text_parts = [b.get("text", "") for b in new_blocks if b.get("type") == "text"]
+            non_text = [b for b in new_blocks if b.get("type") != "text"]
+            if non_text:
+                updated_messages.append({"role": role, "content": new_blocks})
+            else:
+                updated_messages.append({"role": role, "content": "".join(text_parts)})
+
+        return updated_messages, images_list
+
     def apply_chat_template(self, inputs, tools=None, tool_choice=None):
         """
         Render the model input based on the model chat template
@@ -1172,7 +1319,7 @@ class Model(object):
 
         return rendered_output
 
-    async def infer_async(self, inputs, settings={}, is_chat=False):
+    async def infer_async(self, inputs, settings={}, is_chat=False, images=None):
         """
         Queue inference request and wait for result.
         """
@@ -1184,7 +1331,14 @@ class Model(object):
         await self.ensure_batch_processor()
 
         future = asyncio.Future()
-        req = QueuedRequest(inputs=inputs, settings=settings, is_chat=is_chat, future=future, timestamp=time.time())
+        req = QueuedRequest(
+            inputs=inputs,
+            settings=settings,
+            is_chat=is_chat,
+            future=future,
+            timestamp=time.time(),
+            images=images,
+        )
         await self.request_queue.put(req)
         return await future
 
@@ -1348,11 +1502,14 @@ def create_app(config_file):
                 if not model_obj.loaded:
                     model_obj.load()
 
+                # Extract and process images from multimodal content blocks
+                processed_msgs, images = model_obj._extract_and_process_images(messages)
                 chat_input = model_obj.apply_chat_template(
-                    messages,
+                    processed_msgs,
                     tools=template_tools,
                     tool_choice=template_tool_choice,
                 )
+                images_arg = images if images else None
                 completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
                 created_ts = int(time.time())
 
@@ -1363,7 +1520,9 @@ def create_app(config_file):
 
                     def _produce():
                         try:
-                            for chunk in model_obj.engine.infer_list_stream(chat_input, settings=settings):
+                            for chunk in model_obj.engine.infer_list_stream(
+                                chat_input, settings=settings, images=images_arg
+                            ):
                                 loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
                         except Exception as exc:  # noqa: BLE001
                             loop.call_soon_threadsafe(chunk_queue.put_nowait, exc)
@@ -1704,8 +1863,11 @@ def create_app(config_file):
             completion_id = f"msg_{uuid.uuid4().hex[:24]}"
 
             # Apply chat template once (shared by both streaming and non-streaming)
+            # Extract and process images from multimodal content blocks first.
+            processed_msgs, images = model_obj._extract_and_process_images(openai_messages)
+            images_arg = images if images else None
             chat_input = model_obj.apply_chat_template(
-                openai_messages,
+                processed_msgs,
                 tools=template_tools,
                 tool_choice=template_tool_choice,
             )
@@ -1757,7 +1919,9 @@ def create_app(config_file):
 
                     def _produce():
                         try:
-                            for chunk in model_obj.engine.infer_list_stream(chat_input, settings=settings):
+                            for chunk in model_obj.engine.infer_list_stream(
+                                chat_input, settings=settings, images=images_arg
+                            ):
                                 loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
                         except Exception as exc:  # noqa: BLE001
                             loop.call_soon_threadsafe(chunk_queue.put_nowait, exc)
@@ -1884,6 +2048,7 @@ def create_app(config_file):
                 inputs=chat_input,
                 settings=settings,
                 is_chat=False,
+                images=images_arg,
             )
             raw_text = preds[0][0] if preds and preds[0] else ""
             _log_json_payload("MODEL RESPONSE [anthropic raw]", raw_text)

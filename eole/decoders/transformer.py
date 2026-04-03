@@ -4,6 +4,7 @@ Implementation of "Attention is All You Need" Transformer Decoder
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from eole.decoders.decoder import DecoderBase
 from eole.modules.multi_headed_attn import SelfMHA, ContextMHA
 from eole.modules.transformer_mlp import MLP
@@ -16,6 +17,35 @@ from eole import EOLE_TORCH_COMPILE, EOLE_COMPILE_MODE
 from eole.ops import _FLASH_ATTN_AVAILABLE
 
 
+def _make_full_attn_config(decoder_config):
+    """Create a modified decoder config for full_attention layers (Gemma4 style).
+
+    Full_attention layers use ``global_head_dim`` and ``global_heads_kv`` instead
+    of the sliding-attention head dimensions, and have no sliding window.
+    The rope rotary_dim is also updated to ``rotary_dim_global`` so that only a
+    fraction of the larger head is rotated (proportional RoPE).
+    """
+    global_head_dim = getattr(decoder_config, "global_head_dim", None)
+    global_heads_kv = getattr(decoder_config, "global_heads_kv", None)
+    if global_head_dim is None:
+        # Nothing to override; return as-is.
+        return decoder_config
+
+    update = {"head_dim": global_head_dim, "sliding_window": 0}
+    if global_heads_kv is not None:
+        update["heads_kv"] = global_heads_kv
+
+    # Update rotary_dim inside rope_config to rotary_dim_global if set
+    rope_config = getattr(decoder_config, "rope_config", None)
+    if rope_config is not None:
+        rotary_dim_global = getattr(rope_config, "rotary_dim_global", 0)
+        if rotary_dim_global > 0:
+            new_rope_config = rope_config.model_copy(update={"rotary_dim": rotary_dim_global})
+            update["rope_config"] = new_rope_config
+
+    return decoder_config.model_copy(update=update)
+
+
 class TransformerDecoderLayer(nn.Module):
     """Single layer of a transformer decoder
 
@@ -24,7 +54,7 @@ class TransformerDecoderLayer(nn.Module):
         running_config (TrainingConfig / InferenceConfig)
     """
 
-    def __init__(self, decoder_config, idx: int, running_config=None):
+    def __init__(self, decoder_config, idx: int, running_config=None, is_kv_shared: bool = False):
         super(TransformerDecoderLayer, self).__init__()
         self.parallel_residual = decoder_config.parallel_residual
         self.shared_layer_norm = decoder_config.shared_layer_norm
@@ -32,8 +62,10 @@ class TransformerDecoderLayer(nn.Module):
         self.full_context_alignment = decoder_config.full_context_alignment
         self.alignment_heads = decoder_config.alignment_heads
         self.ffn_layernorm = decoder_config.ffn_layernorm
+        # Whether this layer borrows K/V from a provider layer (Gemma4-E2B).
+        self.is_kv_shared = is_kv_shared
 
-        # Determine the layer type for hybrid architectures (e.g. Qwen3.5).
+        # Determine the layer type for hybrid architectures (e.g. Qwen3.5, Gemma4).
         layer_types = getattr(decoder_config, "layer_types", None)
         if layer_types is not None and idx < len(layer_types):
             self.layer_type = layer_types[idx]
@@ -51,9 +83,16 @@ class TransformerDecoderLayer(nn.Module):
             self.self_attn = None
             self.context_attn = None
         else:
+            # For full_attention layers in Gemma4-style hybrid models, use a
+            # modified config with global_head_dim / global_heads_kv / no sliding window.
+            if self.layer_type == "full_attention" and getattr(decoder_config, "global_head_dim", None) is not None:
+                attn_config = _make_full_attn_config(decoder_config)
+            else:
+                attn_config = decoder_config
             self.self_attn = SelfMHA(
-                decoder_config,
+                attn_config,
                 running_config=running_config,
+                is_kv_shared=is_kv_shared,
             )
         if decoder_config.with_cross_attn:
             self.precontext_layernorm = LayerNorm[decoder_config.layer_norm](
@@ -84,6 +123,13 @@ class TransformerDecoderLayer(nn.Module):
             self.post_attention_layernorm = LayerNorm[decoder_config.layer_norm](
                 decoder_config.hidden_size, eps=decoder_config.norm_eps
             )
+        # Gemma4-E2B: consumer (KV-shared) layers use a double-wide MLP
+        # (2 × transformer_ff) to compensate for reusing the provider's K/V.
+        # The factor of 2 matches HF Gemma4TextMLP: intermediate_size * (2 if use_double_wide_mlp else 1).
+        consumer_ff = None
+        if is_kv_shared and getattr(decoder_config, "use_double_wide_mlp", False):
+            consumer_ff = decoder_config.transformer_ff * 2
+
         if decoder_config.num_experts > 0:
             if idx >= decoder_config.first_k_dense_replace:
                 self.mlp = MoE(decoder_config, running_config)
@@ -91,11 +137,13 @@ class TransformerDecoderLayer(nn.Module):
                 self.mlp = MLP(
                     decoder_config,
                     running_config=running_config,
+                    moe_transformer_ff=consumer_ff,
                 )
         else:
             self.mlp = MLP(
                 decoder_config,
                 running_config=running_config,
+                moe_transformer_ff=consumer_ff,
             )
 
         if self.layer_type == "linear_attention":
@@ -111,6 +159,24 @@ class TransformerDecoderLayer(nn.Module):
 
         self.compiled_shapes = set()
         self.hidden_size = decoder_config.hidden_size
+
+        # Gemma4 per-layer scalar (initialized to 1 so it is a no-op for all other models).
+        # In HF it is a registered buffer applied as `hidden_states *= self.layer_scalar`
+        # at the very end of every decoder layer's forward pass.
+        self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
+
+        # Gemma4 per-layer input gate/projection/norm.
+        # When hidden_size_per_layer_input > 0 (Gemma4), each layer receives a
+        # per-layer input tensor of shape (B, S, hidden_size_per_layer_input) that
+        # is mixed into the hidden state after the FFN block.
+        self.hidden_size_per_layer_input = getattr(decoder_config, "hidden_size_per_layer_input", 0)
+        if self.hidden_size_per_layer_input:
+            hidden_pli = self.hidden_size_per_layer_input
+            self.per_layer_input_gate = nn.Linear(decoder_config.hidden_size, hidden_pli, bias=False)
+            self.per_layer_projection = nn.Linear(hidden_pli, decoder_config.hidden_size, bias=False)
+            self.post_per_layer_input_norm = LayerNorm[decoder_config.layer_norm](
+                decoder_config.hidden_size, eps=decoder_config.norm_eps
+            )
 
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
             self._forward_compile = torch.compile(
@@ -146,15 +212,40 @@ class TransformerDecoderLayer(nn.Module):
                 )
             self.compiled_shapes.add((B, S))
 
+    def _apply_per_layer_input(self, layer_out, per_layer_input):
+        """Apply Gemma4 per-layer input gating to layer_out (in-place style).
+
+        Args:
+            layer_out (Tensor): current hidden states ``(B, S, hidden_size)``.
+            per_layer_input (Tensor | None): per-layer input ``(B, S, hidden_size_per_layer_input)``
+                or ``None`` when the mechanism is disabled / input not available.
+
+        Returns:
+            Tensor: updated hidden states.
+        """
+        if self.hidden_size_per_layer_input and per_layer_input is not None:
+            residual = layer_out
+            # gelu_pytorch_tanh approximation matches HF hidden_activation="gelu_pytorch_tanh"
+            gate = F.gelu(self.per_layer_input_gate(layer_out), approximate="tanh")
+            gate = gate * per_layer_input
+            gate = self.per_layer_projection(gate)
+            gate = self.post_per_layer_input_norm(gate)
+            layer_out = residual + gate
+        return layer_out
+
     def _forward_ffn_layernorm(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         kwargs.pop("return_attn", None)
         ff_in = layer_in + self.post_attention_layernorm(self_attn)
         ff_in2 = self.pre_feedforward_layernorm(ff_in)
         ff_in2 = self.mlp(ff_in2)
         layer_out = ff_in + self.post_feedforward_layernorm(ff_in2)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
+        layer_out = layer_out * self.layer_scalar
         return layer_out, attns
 
     def _forward_parallel_residual(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         enc_out = kwargs.pop("enc_out", None)
         src_pad_mask = kwargs.pop("src_pad_mask", None)
         return_attn = kwargs.pop("return_attn", False)
@@ -174,9 +265,13 @@ class TransformerDecoderLayer(nn.Module):
         else:
             ff_in = norm_layer_in
 
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def _forward_cross_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         enc_out = kwargs.pop("enc_out", None)
         src_pad_mask = kwargs.pop("src_pad_mask", None)
         return_attn = kwargs.pop("return_attn", False)
@@ -195,20 +290,31 @@ class TransformerDecoderLayer(nn.Module):
 
         ff_in = self.post_attention_layernorm(self_attn)
         # we apply residual with un-normed
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def _forward_linear_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
         """Forward pass for linear attention (GatedDeltaNet) layers."""
+        per_layer_input = kwargs.pop("per_layer_input", None)
         # Note: self_attn here is already the output of linear_attn (set by _forward_eager)
         self_attn.add_(layer_in)
         ff_in = self.post_attention_layernorm(self_attn)
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def _forward_no_cross_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         kwargs.pop("return_attn", None)
         self_attn.add_(layer_in)
         ff_in = self.post_attention_layernorm(self_attn)
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def forward(self, layer_in, **kwargs):
         if layer_in.size(1) > 1:
@@ -254,6 +360,7 @@ class TransformerDecoderLayer(nn.Module):
         cache_seqlens = kwargs.pop("cache_seqlens", None)
         cache_slice = kwargs.pop("cache_slice", None)
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
+        kwargs.pop("shared_kv", None)  # no longer used; kept for backward compat
         norm_layer_in = self.input_layernorm(layer_in)
 
         if self.layer_type == "linear_attention":
@@ -337,20 +444,53 @@ class TransformerDecoder(DecoderBase):
         else:
             self.rope_local = None
         self.interleave_local = getattr(decoder_config.rope_config, "interleave_local", 0) or 1
+
+        # KV-sharing (Gemma4-E2B): the last num_kv_shared_layers layers are "consumers"
+        # that reuse K/V from a "provider" layer.  Unlike the naive single-provider
+        # approach, each consumer finds its own provider: the last non-shared layer of
+        # the SAME TYPE (sliding_attention or full_attention).  This matches the HF
+        # Gemma4TextAttention implementation where kv_shared_layer_index is the last
+        # non-shared layer of the same type as the consumer.
+        num_kv_shared = getattr(decoder_config, "num_kv_shared_layers", 0)
+        n_total = decoder_config.layers
+        # kv_providers: consumer_idx -> provider_idx
+        kv_providers: dict = {}
+        if num_kv_shared > 0:
+            first_consumer = n_total - num_kv_shared
+            _layer_types = getattr(decoder_config, "layer_types", None)
+            for ci in range(first_consumer, n_total):
+                ctype = _layer_types[ci] if _layer_types and ci < len(_layer_types) else "full_attention"
+                # Walk backwards through non-shared layers to find the last of same type.
+                for pi in range(first_consumer - 1, -1, -1):
+                    ptype = _layer_types[pi] if _layer_types and pi < len(_layer_types) else "full_attention"
+                    if ptype == ctype:
+                        kv_providers[ci] = pi
+                        break
+        self.kv_providers = kv_providers
+        # Set of provider layer indices (may contain 1 or 2 entries for hybrid models).
+        self.kv_provider_set: set = set(kv_providers.values())
+        # Backward-compat alias (used nowhere outside this class, but kept for safety).
+        self.kv_provider_idx = min(self.kv_provider_set) if self.kv_provider_set else -1
+
         self.transformer_layers = nn.ModuleList(
             [
                 TransformerDecoderLayer(
                     decoder_config,
                     running_config=running_config,
                     idx=i,
+                    is_kv_shared=(i in kv_providers),
                 )
-                for i in range(decoder_config.layers)
+                for i in range(n_total)
             ]
         )
         self.layer_norm = LayerNorm[decoder_config.layer_norm](decoder_config.hidden_size, eps=decoder_config.norm_eps)
         self.LM_type = getattr(decoder_config, "LM_type", "causal")
         self.has_linear_attn = any(
             getattr(layer, "layer_type", "full_attention") == "linear_attention" for layer in self.transformer_layers
+        )
+        # Whether any layers use sliding_attention (Gemma4-style hybrid with explicit layer_types)
+        self.has_sliding_attn = any(
+            getattr(layer, "layer_type", "") == "sliding_attention" for layer in self.transformer_layers
         )
         self.self_attn_backend = getattr(running_config, "self_attn_backend", "flash")
         self.position_encoding_type = decoder_config.position_encoding_type
@@ -363,6 +503,31 @@ class TransformerDecoder(DecoderBase):
         self.cache_seqlens = None
         self.hidden_size = decoder_config.hidden_size
         self.compiled_shapes = set()
+
+        # Gemma4 per-layer input mechanism.
+        # embed_tokens_per_layer: separate embedding table (vocab_size_per_layer_input,
+        #   num_layers * hidden_size_per_layer_input) used to compute per-layer inputs.
+        # per_layer_model_projection: linear projection from hidden_size to the same space.
+        # per_layer_projection_norm: RMSNorm applied to the projected hidden states.
+        # Together they compute a (B, S, num_layers, hidden_size_per_layer_input) tensor
+        # where each [:, :, i, :] slice is passed to decoder layer i.
+        self.hidden_size_per_layer_input = getattr(decoder_config, "hidden_size_per_layer_input", 0)
+        if self.hidden_size_per_layer_input:
+            n_layers = decoder_config.layers
+            vocab_size_pli = decoder_config.vocab_size_per_layer_input
+            hidden_pli = self.hidden_size_per_layer_input
+            self.embed_tokens_per_layer = nn.Embedding(vocab_size_pli, n_layers * hidden_pli)
+            # scale applied to embed_tokens_per_layer output (mirrors Gemma4TextScaledWordEmbedding)
+            self.embed_tokens_per_layer_scale = hidden_pli**0.5
+            self.per_layer_model_projection = nn.Linear(decoder_config.hidden_size, n_layers * hidden_pli, bias=False)
+            # scale applied to per_layer_model_projection output
+            self.per_layer_model_projection_scale = decoder_config.hidden_size**-0.5
+            # normalization over the per-layer hidden dim (hidden_size_per_layer_input)
+            self.per_layer_projection_norm = LayerNorm[decoder_config.layer_norm](
+                hidden_pli, eps=decoder_config.norm_eps
+            )
+            # combining scale: (token_emb + model_proj) * 2**-0.5
+            self.per_layer_input_combine_scale = 2.0**-0.5
 
         # Chunked prefill configuration.
         # When sliding_window > 0 the window size is the natural chunk boundary;
@@ -386,6 +551,45 @@ class TransformerDecoder(DecoderBase):
                     "triton.cudagraphs": EOLE_COMPILE_MODE == "0",
                 },
             )
+
+    def _compute_per_layer_inputs(self, emb, src_ids):
+        """Compute per-layer input tensor for Gemma4's per-layer input mechanism.
+
+        Mirrors ``Gemma4TextModel.get_per_layer_inputs`` +
+        ``Gemma4TextModel.project_per_layer_inputs``.
+
+        The HF implementation applies ``per_layer_projection_norm`` to the model
+        projection **before** combining it with token embeddings:
+            model_input = per_layer_model_projection(emb) * scale
+            model_input = per_layer_projection_norm(model_input)
+            return (token_emb + model_input) * sqrt(0.5)
+
+        Args:
+            emb (Tensor): decoder input embeddings ``(B, S, hidden_size)``.
+            src_ids (Tensor | None): token IDs ``(B, S)``, or ``None``.
+
+        Returns:
+            Tensor: ``(B, S, num_layers, hidden_size_per_layer_input)``
+        """
+        n_layers = len(self.transformer_layers)
+        hidden_pli = self.hidden_size_per_layer_input
+
+        # Model-level projection from embeddings, then normalize (HF applies norm here).
+        model_proj = self.per_layer_model_projection(emb) * self.per_layer_model_projection_scale
+        model_proj = model_proj.reshape(*emb.shape[:-1], n_layers, hidden_pli)
+        model_proj = self.per_layer_projection_norm(model_proj)
+
+        if src_ids is not None:
+            token_emb = self.embed_tokens_per_layer(src_ids) * self.embed_tokens_per_layer_scale
+            token_emb = token_emb.reshape(*src_ids.shape, n_layers, hidden_pli)
+            # Combine: (token_emb + normed_model_proj) * sqrt(0.5)
+            return (token_emb + model_proj) * self.per_layer_input_combine_scale
+        else:
+            # src_ids not available (e.g. training without raw token IDs, or
+            # non-inference code paths).  Fall back to model-projection only.
+            # During inference, inference.py always supplies src_ids (decoder_in)
+            # so this branch should not be reached in normal predict flows.
+            return model_proj * self.per_layer_input_combine_scale
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
 
@@ -422,17 +626,31 @@ class TransformerDecoder(DecoderBase):
                     if layer.context_attn.kcache is not None:
                         layer.context_attn.kcache = fn(layer.context_attn.kcache)
                         layer.context_attn.vcache = fn(layer.context_attn.vcache)
-                if layer.self_attn.kcache is not None:
+                # KV-shared consumer layers share the provider's cache tensor.
+                # Skip them here to avoid applying fn twice (once via the provider
+                # entry and once via the now-stale consumer reference), which would
+                # break the link.  They are re-linked to the (already mapped)
+                # provider cache in the step below.
+                if layer.self_attn.kcache is not None and not layer.is_kv_shared:
                     layer.self_attn.kcache = fn(layer.self_attn.kcache)
                     layer.self_attn.vcache = fn(layer.self_attn.vcache)
-                if layer.self_attn.cache_leftpad is not None:
+                if layer.self_attn.cache_leftpad is not None and not layer.is_kv_shared:
                     layer.self_attn.cache_leftpad = fn(layer.self_attn.cache_leftpad)
+        # Re-link KV-shared consumer layers to the (now mapped) provider caches.
+        if self.kv_providers:
+            for consumer_idx, provider_idx in self.kv_providers.items():
+                consumer_attn = self.transformer_layers[consumer_idx].self_attn
+                provider_attn = self.transformer_layers[provider_idx].self_attn
+                if consumer_attn is not None:
+                    consumer_attn.kcache = provider_attn.kcache
+                    consumer_attn.vcache = provider_attn.vcache
+                    consumer_attn.cache_leftpad = provider_attn.cache_leftpad
 
     def update_dropout(self, dropout, attention_dropout):
         for layer in self.transformer_layers:
             layer.update_dropout(dropout, attention_dropout)
 
-    def _causal_attn_mask(self, tgt_pad_mask, prefix_len=None):
+    def _causal_attn_mask(self, tgt_pad_mask, prefix_len=None, use_sliding_window=True):
         B, _, seq_len = tgt_pad_mask.size()
         device = tgt_pad_mask.device
         MAX_T = seq_len if (self.training or self.dynamic_shapes) else self.kvcache_maxsize
@@ -442,7 +660,7 @@ class TransformerDecoder(DecoderBase):
             torch.ones((MAX_T, MAX_T), device=tgt_pad_mask.device, dtype=torch.bool),
             diagonal=0,
         )
-        if self.sliding_window > 0:
+        if use_sliding_window and self.sliding_window > 0:
             # Use "- sliding_window + 1" to match the chunked-prefill path
             # (_chunk_attn_mask: k >= q - sliding_window + 1) and the single-step
             # decoding path (start = current_step - sliding_window + 1), giving a
@@ -504,7 +722,7 @@ class TransformerDecoder(DecoderBase):
 
         return attn_mask | full_mask
 
-    def _chunk_attn_mask(self, chunk_size, current_step, tgt_pad_mask, prefix_len=None):
+    def _chunk_attn_mask(self, chunk_size, current_step, tgt_pad_mask, prefix_len=None, use_sliding_window=True):
         """Create an absolute-position attention mask for a prefill chunk.
 
         Handles positional/causal masking only.  Image-token type masking is
@@ -530,6 +748,9 @@ class TransformerDecoder(DecoderBase):
                 prefix tokens are allowed to attend bidirectionally to every
                 other prefix token, mirroring the logic of
                 ``_causal_attn_mask``.
+            use_sliding_window (bool): Whether to apply the sliding window
+                constraint.  Pass ``False`` to get a full causal mask (used
+                for full_attention layers in hybrid models like Gemma4).
 
         Returns:
             Tensor: boolean mask ``(B, 1, chunk_size, cache_len_tgt)``,
@@ -547,7 +768,7 @@ class TransformerDecoder(DecoderBase):
         # Causal constraint: key position must not exceed query position
         mask = k_pos <= q_pos  # (chunk_size, cache_len)
 
-        if self.sliding_window > 0:
+        if use_sliding_window and self.sliding_window > 0:
             # Sliding window: key position must be within the window.
             # Use "- sliding_window + 1" to match the single-step decoding path
             # (start = current_step - sliding_window + 1), giving a window of
@@ -583,7 +804,7 @@ class TransformerDecoder(DecoderBase):
 
         return mask.unsqueeze(1)  # (B, 1, chunk_size, cache_len)
 
-    def _forward_chunked_prefill(self, emb, src_ids=None, **kwargs):
+    def _forward_chunked_prefill(self, emb, src_ids=None, per_layer_inputs=None, **kwargs):
         """Process a long prefill sequence in chunks.
 
         When ``sliding_window > 0`` and the input sequence is longer than the
@@ -745,7 +966,11 @@ class TransformerDecoder(DecoderBase):
                 # are handled correctly in all chunks.
                 chunk_kwargs["prefix_len"] = prefix_len
 
-            emb_chunk_out, chunk_attns = self._forward_eager(emb_chunk, **chunk_kwargs)
+            emb_chunk_out, chunk_attns = self._forward_eager(
+                emb_chunk,
+                per_layer_inputs=per_layer_inputs[:, start:end] if per_layer_inputs is not None else None,
+                **chunk_kwargs,
+            )
             all_emb_chunks.append(emb_chunk_out)
 
             # ----------------------------------------------------------
@@ -766,9 +991,15 @@ class TransformerDecoder(DecoderBase):
                             rec_slice = layer.linear_attn.recurrent_state[b].clone()
                             kv_slices.append((conv_slice, rec_slice))
                         else:
-                            k_slice = layer.self_attn.kcache[b, start:end, :, :].clone()
-                            v_slice = layer.self_attn.vcache[b, start:end, :, :].clone()
-                            kv_slices.append((k_slice, v_slice))
+                            if layer.is_kv_shared:
+                                # Consumer layer: its cache is the same tensor as the
+                                # provider's.  The provider entry in kv_slices already
+                                # covers this data, so skip to avoid double-writes.
+                                kv_slices.append(None)
+                            else:
+                                k_slice = layer.self_attn.kcache[b, start:end, :, :].clone()
+                                v_slice = layer.self_attn.vcache[b, start:end, :, :].clone()
+                                kv_slices.append((k_slice, v_slice))
                     self._prefill_cache.put(cache_keys[b], emb_chunk_out[b].detach(), kv_slices)
 
             if cache_keys is not None:
@@ -795,9 +1026,16 @@ class TransformerDecoder(DecoderBase):
 
     def forward(self, emb, **kwargs):
         B, S, _ = emb.size()
-        # Pop src_ids early; it is only consumed by _forward_chunked_prefill
-        # for cache key computation and must not be forwarded to _forward_eager.
+        # Pop src_ids; it is used for:
+        #   1. Per-layer input computation (Gemma4 only).
+        #   2. Prefill KV-cache key computation in _forward_chunked_prefill.
         src_ids = kwargs.pop("src_ids", None)
+
+        # Compute Gemma4 per-layer inputs once for the whole sequence.
+        per_layer_inputs = None
+        if self.hidden_size_per_layer_input:
+            per_layer_inputs = self._compute_per_layer_inputs(emb, src_ids)
+
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["0", "1"] and S == 1:
             return self._forward_compile(emb, **kwargs)
         # Determine the effective chunk size for chunked prefill.
@@ -805,10 +1043,10 @@ class TransformerDecoder(DecoderBase):
         # prefill_chunk_size is an optional performance knob for non-sliding models.
         effective_chunk = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
         if effective_chunk > 0 and S > effective_chunk and self.cache_seqlens is not None:
-            return self._forward_chunked_prefill(emb, src_ids=src_ids, **kwargs)
-        return self._forward_eager(emb, **kwargs)
+            return self._forward_chunked_prefill(emb, src_ids=src_ids, per_layer_inputs=per_layer_inputs, **kwargs)
+        return self._forward_eager(emb, per_layer_inputs=per_layer_inputs, **kwargs)
 
-    def _forward_eager(self, emb, **kwargs):
+    def _forward_eager(self, emb, per_layer_inputs=None, **kwargs):
         """
         Decode a sequence using transformer layers.
 
@@ -816,6 +1054,10 @@ class TransformerDecoder(DecoderBase):
             emb (Tensor):
                 Target embeddings of shape
                 ``(batch_size, tgt_len, hidden_size)``.
+            per_layer_inputs (Tensor | None):
+                Optional Gemma4 per-layer inputs of shape
+                ``(batch_size, tgt_len, num_layers, hidden_size_per_layer_input)``.
+                ``None`` for all other models.
 
             **kwargs:
                 enc_out (Tensor, optional):
@@ -871,14 +1113,27 @@ class TransformerDecoder(DecoderBase):
 
         if self.rope_local is not None:
             position_embeddings_local = self.rope_local.cos_sin
-            pos_emb_list = [
-                (
-                    position_embeddings_local[pos_ids_1d]
-                    if (i + 1) % self.interleave_local
-                    else position_embeddings[pos_ids_1d]
-                )
-                for i in range(len(self.transformer_layers))
-            ]
+            if self.has_sliding_attn:
+                # Gemma4-style: use layer_types to select rope per layer
+                # "sliding_attention" → local rope, "full_attention" → global rope
+                pos_emb_list = [
+                    (
+                        position_embeddings_local[pos_ids_1d]
+                        if layer.layer_type == "sliding_attention"
+                        else position_embeddings[pos_ids_1d]
+                    )
+                    for layer in self.transformer_layers
+                ]
+            else:
+                # Legacy interleave_local approach (e.g. Gemma3)
+                pos_emb_list = [
+                    (
+                        position_embeddings_local[pos_ids_1d]
+                        if (i + 1) % self.interleave_local
+                        else position_embeddings[pos_ids_1d]
+                    )
+                    for i in range(len(self.transformer_layers))
+                ]
         elif position_embeddings is not None:
             pos_emb_list = [position_embeddings[pos_ids_1d]] * len(self.transformer_layers)
         else:
@@ -906,6 +1161,12 @@ class TransformerDecoder(DecoderBase):
                         tgt_pad_mask,
                         prefix_len=prefix_len,
                     )
+                    # For hybrid sliding/full attention models, also compute a full
+                    # (no-sliding-window) mask for full_attention layers.
+                    if self.has_sliding_attn:
+                        attn_mask_full = self._chunk_attn_mask(
+                            S, current_step, tgt_pad_mask, prefix_len=prefix_len, use_sliding_window=False
+                        )
                     if image_locations is not None:
                         # Query tokens occupy absolute positions
                         # [current_step, current_step + S); key tokens span the
@@ -940,13 +1201,25 @@ class TransformerDecoder(DecoderBase):
                             image_locations[:, q_abs_positions],
                             k_img_full & filled_mask,
                         )
+                        if self.has_sliding_attn:
+                            attn_mask_full = self._update_causal_mask(
+                                attn_mask_full,
+                                image_locations[:, q_abs_positions],
+                                k_img_full & filled_mask,
+                            )
                 else:
                     # Training path (no KV cache): _causal_attn_mask handles
                     # the full sequence with MAX_T = seq_len (training) or
                     # self.max_length (static-shape eval without cache).
                     attn_mask = self._causal_attn_mask(tgt_pad_mask, prefix_len=prefix_len)
+                    if self.has_sliding_attn:
+                        attn_mask_full = self._causal_attn_mask(
+                            tgt_pad_mask, prefix_len=prefix_len, use_sliding_window=False
+                        )
                     if image_locations is not None:
                         attn_mask = self._update_causal_mask(attn_mask, image_locations)
+                        if self.has_sliding_attn:
+                            attn_mask_full = self._update_causal_mask(attn_mask_full, image_locations)
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
                 # at decoding _init_cache must be called and init these
@@ -956,9 +1229,15 @@ class TransformerDecoder(DecoderBase):
                     start = torch.clamp(current_step - self.sliding_window + 1, min=0)
                     valid = valid & (self.position_indices >= start)
                 attn_mask = valid.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, MAX_T or Dynamic Cache Len)
+                if self.has_sliding_attn:
+                    # full_attention layers: no sliding window restriction
+                    valid_full = self.position_indices <= self.cache_seqlens.view(-1, 1)
+                    valid_full = valid_full & self.left_pad_attn_mask
+                    attn_mask_full = valid_full.unsqueeze(1).unsqueeze(2)
                 lin_attn_mask = None
         else:
             attn_mask = None
+            attn_mask_full = None
             cache_slice = None  # triggers flash decoding
             if S > 1 and self.has_linear_attn:
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :]
@@ -968,10 +1247,19 @@ class TransformerDecoder(DecoderBase):
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
         attn_aligns = []
 
-        for layer, pos_emb in zip(self.transformer_layers, pos_emb_list):
-            layer_attn_mask = (
-                lin_attn_mask if (lin_attn_mask is not None and layer.layer_type == "linear_attention") else attn_mask
-            )
+        for i, (layer, pos_emb) in enumerate(zip(self.transformer_layers, pos_emb_list)):
+            if lin_attn_mask is not None and layer.layer_type == "linear_attention":
+                layer_attn_mask = lin_attn_mask
+            elif self.has_sliding_attn and layer.layer_type == "full_attention":
+                # Full_attention layers in Gemma4 see all previous tokens (no sliding window).
+                # attn_mask_full is None in the flash path (flash handles per-layer window_size
+                # natively); in the non-flash path it is computed alongside attn_mask.
+                layer_attn_mask = attn_mask_full
+            else:
+                layer_attn_mask = attn_mask
+            # Slice per-layer input for this specific layer (Gemma4 only; None for others).
+            per_layer_input_i = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+
             emb, attn = layer(
                 emb.clone() if (EOLE_COMPILE_MODE == "2" and EOLE_TORCH_COMPILE) else emb,
                 enc_out=enc_out,
@@ -982,7 +1270,9 @@ class TransformerDecoder(DecoderBase):
                 cache_seqlens=self.cache_seqlens,
                 cache_slice=cache_slice,
                 pos_ids_2d=pos_ids_2d,
+                per_layer_input=per_layer_input_i,
             )
+
             if all_cross_attns is not None and attn is not None:
                 all_cross_attns.append(attn)
             if with_align:
@@ -1065,7 +1355,10 @@ class TransformerDecoder(DecoderBase):
                     dtype=dtype,
                     device=device,
                 )
-            else:
+            elif not layer.is_kv_shared:
+                # Normal layer: allocate its own K/V cache.
+                # KV-shared layers are intentionally skipped here; they will
+                # have their kcache/vcache set by the linking step below.
                 heads_kv = layer.self_attn.heads_kv
                 dph = layer.self_attn.dim_per_head
                 layer.self_attn.kcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
@@ -1075,10 +1368,28 @@ class TransformerDecoder(DecoderBase):
                     # prefill context KV with encoder out
                     layer.context_attn._prefill_cache(enc_out)
 
+        # KV-shared layers: link each consumer's cache to its type-matched provider's
+        # cache so that consumers always see the up-to-date K/V without any additional
+        # cache write.  Each consumer may point to a different provider (e.g., sliding
+        # consumers share a sliding provider, full_attention consumers share a
+        # full_attention provider).
+        if self.kv_providers:
+            for consumer_idx, provider_idx in self.kv_providers.items():
+                consumer_attn = self.transformer_layers[consumer_idx].self_attn
+                provider_attn = self.transformer_layers[provider_idx].self_attn
+                if consumer_attn is not None:
+                    consumer_attn.kcache = provider_attn.kcache
+                    consumer_attn.vcache = provider_attn.vcache
+                    consumer_attn.cache_leftpad = provider_attn.cache_leftpad
+
     def _extend_cache(self, threshold=1, addzeros=32):
         if self.dynamic_shapes and (self.cache_len_tgt - self.cache_seqlens[0].item()) < threshold:
             for layer in self.transformer_layers:
                 if layer.layer_type == "linear_attention":
+                    continue
+                if layer.is_kv_shared:
+                    # Shared layers' cache is the same tensor as the provider's;
+                    # it will be replaced when the provider layer is extended.
                     continue
                 b, l, h, d = layer.self_attn.kcache.shape
                 extend = torch.zeros(
@@ -1091,6 +1402,14 @@ class TransformerDecoder(DecoderBase):
             b, _ = self.left_pad_attn_mask.shape
             extend = torch.ones(b, addzeros, device=self.left_pad_attn_mask.device, dtype=torch.bool)
             self.left_pad_attn_mask = torch.cat([self.left_pad_attn_mask, extend], dim=1)
+            # Re-link shared layers to the (now new) provider cache tensors.
+            if self.kv_providers:
+                for consumer_idx, provider_idx in self.kv_providers.items():
+                    consumer_attn = self.transformer_layers[consumer_idx].self_attn
+                    provider_attn = self.transformer_layers[provider_idx].self_attn
+                    if consumer_attn is not None:
+                        consumer_attn.kcache = provider_attn.kcache
+                        consumer_attn.vcache = provider_attn.vcache
 
     def _disable_cache(self):
         self.left_pad_attn_mask = None
@@ -1100,8 +1419,17 @@ class TransformerDecoder(DecoderBase):
             if layer.layer_type == "linear_attention":
                 layer.linear_attn.conv_state = None
                 layer.linear_attn.recurrent_state = None
-            else:
+            elif not layer.is_kv_shared:
                 layer.self_attn.kcache, layer.self_attn.vcache = None, None
                 layer.self_attn.cache_leftpad = None
                 if layer.context_attn:
                     layer.context_attn.kcache, layer.context_attn.vcache = None, None
+            else:
+                # KV-shared layer: its kcache/vcache attributes are Python
+                # references that point to the provider's tensors.  The
+                # provider's branch above already set those tensors to None, but
+                # each Python attribute is independent, so we must null them out
+                # here too to release the reference to the tensor.
+                layer.self_attn.kcache = None
+                layer.self_attn.vcache = None
+                layer.self_attn.cache_leftpad = None

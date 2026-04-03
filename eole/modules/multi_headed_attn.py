@@ -11,7 +11,7 @@ from torch.distributed import all_reduce
 from eole.constants import PositionEncodingType
 from .relative_position_bias import relative_matmul, gen_relative_positions, compute_bias
 from .alibi_position_bias import AlibiPositionalBias
-from .rope import apply_rotary_emb, apply_rotary_pos_emb_xdrope
+from .rope import apply_rotary_emb, apply_rotary_emb_multidim, apply_rotary_pos_emb_xdrope
 from eole.constants import LayerNorm
 
 
@@ -118,6 +118,10 @@ class MultiHeadedAttention(torch.nn.Module):
             self.q_norm = LayerNorm[model_config.layer_norm](model_config.head_dim, eps=model_config.norm_eps)
         if model_config.key_norm:
             self.k_norm = LayerNorm[model_config.layer_norm](model_config.head_dim, eps=model_config.norm_eps)
+        if model_config.value_norm:
+            from eole.modules.rmsnorm import RMSNormNoScale
+
+            self.v_norm = RMSNormNoScale(model_config.head_dim, eps=model_config.norm_eps)
         self.qk_norm_post_rope = model_config.qk_norm_post_rope
 
         self.final_linear = skip_init(
@@ -127,7 +131,7 @@ class MultiHeadedAttention(torch.nn.Module):
             bias=model_config.add_final_linear_bias,
         )
         self.is_decoder = is_decoder
-        self.scale = self.attn_scaling**-0.5 if self.is_decoder and self.attn_scaling is not None else None
+        self.scale = self.attn_scaling**-0.5 if self.attn_scaling is not None else None
         self.relative_positions_buckets = model_config.relative_positions_buckets
         self.kcache, self.vcache, self.cache_leftpad = None, None, None
         self.sliding_window = model_config.sliding_window
@@ -154,6 +158,7 @@ class MultiHeadedAttention(torch.nn.Module):
                 self.rotary_dim = model_config.rope_config.rotary_dim
             self.rotary_interleave = model_config.rope_config.rotary_interleave
             self.xdrope_section = model_config.rope_config.xdrope_section
+            self.multidimensional_rope = model_config.rope_config.multidimensional_rope
         elif self.position_encoding_type == PositionEncodingType.Alibi:
             self.alibi = AlibiPositionalBias(self.heads)
 
@@ -267,6 +272,9 @@ class MultiHeadedAttention(torch.nn.Module):
         value = bld_to_blhd(value, self.dim_per_head)
         query = bld_to_blhd(query, self.dim_per_head)
 
+        if hasattr(self, "v_norm"):
+            value = self.v_norm(value)
+
         if not self.qk_norm_post_rope:
             if hasattr(self, "q_norm"):
                 query = self.q_norm(query)
@@ -285,6 +293,8 @@ class MultiHeadedAttention(torch.nn.Module):
                     self.xdrope_section,
                     interleave=self.rotary_interleave,
                 )
+            elif getattr(self, "multidimensional_rope", False):
+                query, key = apply_rotary_emb_multidim(query, key, position_embeddings)
             else:
                 query, key = apply_rotary_emb(query, key, position_embeddings, interleave=self.rotary_interleave)
             if self.qk_norm_post_rope:
@@ -433,10 +443,20 @@ class MultiHeadedAttention(torch.nn.Module):
 
 
 class SelfMHA(MultiHeadedAttention):
-    def __init__(self, model_config, running_config=None, is_decoder: bool = True) -> None:
+    def __init__(self, model_config, running_config=None, is_decoder: bool = True, is_kv_shared: bool = False) -> None:
         self.position_encoding_type = model_config.position_encoding_type
         self.n_positions = model_config.n_positions
         super(SelfMHA, self).__init__(model_config, running_config, is_decoder)
+        # KV-shared layers (Gemma4-E2B cross-layer KV sharing): at inference these
+        # layers compute their own Query but reuse Key/Value from the provider's
+        # pre-linked KV cache.  During training (no KV cache) they compute their
+        # own K/V using their own projection weights, just like any normal layer.
+        self.is_kv_shared = is_kv_shared
+        # NOTE: even when is_kv_shared=True we keep linear_keys / linear_values
+        # because the HF checkpoint contains k_proj / v_proj weights for these
+        # layers.  At inference (with KV cache) these projections are bypassed and
+        # the provider's cached K/V is used directly.  During training the
+        # projections are used normally.
 
     def _update_cache_w_inputs(
         self,
@@ -461,6 +481,64 @@ class SelfMHA(MultiHeadedAttention):
 
         return (self.kcache, self.vcache, query)
 
+    def _prepare_query_only(
+        self,
+        query: Tensor,
+        position_embeddings=None,
+        pos_ids_2d=None,
+    ) -> Tensor:
+        """Compute only the query projection for KV-shared layers.
+
+        KV-shared layers reuse K/V from a provider layer, so we only need to
+        project and rotate the query.
+
+        Args:
+            query (Tensor): input hidden states ``(B, S, hidden_size)``.
+            position_embeddings: RoPE (cos, sin) table, or ``None``.
+            pos_ids_2d: 2-D position IDs for 2D RoPE (vision), or ``None``.
+
+        Returns:
+            Tensor: query in head format ``(B, S, heads, dim_per_head)``.
+        """
+        query = self.maybe_ckpt(self.linear_query, query)
+
+        if self.q_gating:
+            num_heads_local = self.heads // self.parallel_gpu
+            q_g = query.view(query.shape[0], query.shape[1], num_heads_local, 2, self.dim_per_head)
+            query = q_g[:, :, :, 0, :].reshape(query.shape[0], query.shape[1], -1)
+            self._attn_gate = torch.sigmoid(q_g[:, :, :, 1, :].reshape(query.shape[0], query.shape[1], -1))
+
+        query = bld_to_blhd(query, self.dim_per_head)
+
+        if not self.qk_norm_post_rope:
+            if hasattr(self, "q_norm"):
+                query = self.q_norm(query)
+
+        if self.position_encoding_type == PositionEncodingType.Rotary:
+            if self.xdrope_section is not None and pos_ids_2d is not None:
+                # Use a zero dummy key so the function rotates only the query portion
+                dummy_key = query.new_zeros(query.size(0), query.size(1), self.heads_kv, self.dim_per_head)
+                query, _ = apply_rotary_pos_emb_xdrope(
+                    query,
+                    dummy_key,
+                    position_embeddings,
+                    pos_ids_2d,
+                    self.xdrope_section,
+                    interleave=self.rotary_interleave,
+                )
+            elif getattr(self, "multidimensional_rope", False):
+                dummy_key = query.new_zeros(query.size(0), query.size(1), self.heads_kv, self.dim_per_head)
+                query, _ = apply_rotary_emb_multidim(query, dummy_key, position_embeddings)
+            else:
+                # Use a zero dummy key – the key rotation result is discarded.
+                dummy_key = query.new_zeros(query.size(0), query.size(1), self.heads_kv, self.dim_per_head)
+                query, _ = apply_rotary_emb(query, dummy_key, position_embeddings, self.rotary_interleave)
+            if self.qk_norm_post_rope:
+                if hasattr(self, "q_norm"):
+                    query = self.q_norm(query)
+
+        return query
+
     def forward(
         self,
         query: Tensor,
@@ -470,8 +548,70 @@ class SelfMHA(MultiHeadedAttention):
         cache_seqlens=None,
         cache_slice=None,
         pos_ids_2d=None,
+        shared_kv=None,
     ) -> Tuple[Tensor, Tensor]:
+        """Forward pass for self-attention.
 
+        Args:
+            query: input hidden states ``(B, S, hidden_size)``.
+            attn_mask: boolean attention mask ``(B, 1, S_q, S_k)``.
+            return_attn: whether to return attention weights.
+            position_embeddings: RoPE table.
+            cache_seqlens: current sequence lengths for KV cache ``(B,)``.
+            cache_slice: position indices for cache update.
+            pos_ids_2d: 2-D position IDs for vision RoPE.
+            shared_kv: unused, kept for backward compatibility.
+        """
+        if self.is_kv_shared and self.kcache is not None:
+            # -----------------------------------------------------------------
+            # KV-shared layer at inference: compute Q only, borrow K/V from
+            # the provider's pre-linked cache.
+            # The cache for this layer was pre-linked to the provider's cache
+            # in _init_cache.  The provider already wrote the current token's
+            # K/V there.  We read from it without any cache write.  Always use
+            # SDPA (_compute_attention) to avoid flash_attn_with_kvcache, which
+            # would try to write new K/V to the provider's (shared) cache and
+            # corrupt it.
+            # -----------------------------------------------------------------
+            query = self._prepare_query_only(query, position_embeddings=position_embeddings, pos_ids_2d=pos_ids_2d)
+            key = self.kcache  # full accumulated K from provider
+            value = self.vcache
+            if attn_mask is None and cache_seqlens is not None:
+                # Flash decode/prefill path: no explicit mask was provided.
+                # Build a causal + validity mask so the consumer only attends
+                # to positions that have been filled by the provider and that
+                # are causally reachable from the current query token(s).
+                S_q = query.size(1)
+                cache_len = key.size(1)
+                device = key.device
+                # Absolute position of each query token: for decode (S_q=1)
+                # the query is at position cache_seqlens; for prefill the
+                # queries span cache_seqlens .. cache_seqlens + S_q - 1.
+                q_pos = cache_seqlens.unsqueeze(1) + torch.arange(S_q, device=device).unsqueeze(0)  # [B, S_q]
+                k_pos = torch.arange(cache_len, device=device)  # [cache_len]
+                # Causal constraint: key position <= query position
+                valid = k_pos.view(1, 1, cache_len) <= q_pos.unsqueeze(2)  # [B, S_q, cache_len]
+                if self.sliding_window > 0:
+                    start = (q_pos - self.sliding_window + 1).clamp(min=0)  # [B, S_q]
+                    valid = valid & (k_pos.view(1, 1, cache_len) >= start.unsqueeze(2))
+                if self.cache_leftpad is not None:
+                    # Exclude left-padded positions that were never filled.
+                    valid = valid & (k_pos.view(1, 1, cache_len) >= self.cache_leftpad.view(-1, 1, 1))
+                attn_mask = valid.unsqueeze(1)  # [B, 1, S_q, cache_len]
+            else:
+                attn_mask = attn_mask[..., : key.size(1)] if attn_mask is not None else None
+
+            return super()._compute_attention(
+                key,
+                value,
+                query,
+                attn_mask=attn_mask,
+                return_attn=return_attn,
+            )
+
+        # -----------------------------------------------------------------
+        # Normal (non-shared) self-attention
+        # -----------------------------------------------------------------
         key, value, query = super()._prepare_inputs(
             query,
             query,
@@ -479,6 +619,7 @@ class SelfMHA(MultiHeadedAttention):
             position_embeddings=position_embeddings,
             pos_ids_2d=pos_ids_2d,
         )
+
         if self.kcache is not None:
 
             if cache_slice is not None:
