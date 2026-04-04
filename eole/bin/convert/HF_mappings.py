@@ -406,40 +406,60 @@ MODEL_OVERRIDES = {
             },
         },
     },
-    # Gemma4 multimodal model (text + SigLIP vision encoder).
-    # The decoder (text) part is identical to Gemma4ForCausalLM: weight names
-    # use the flat "model.*" prefix (no "language_model." wrapper), so we rely
-    # on BASE_KEY_MAP defaults for decoder_layer_prefix, tgt_emb.embeddings.weight,
-    # and decoder.layer_norm.weight.
-    # The vision encoder is the same SigLIP architecture as Gemma3.
-    # Audio encoder support is not yet implemented in Eole.
+    # Gemma4 multimodal model (text + custom vision encoder + multimodal projector).
+    #
+    # Weight layout (Gemma4ForConditionalGeneration):
+    #   self.model = Gemma4Model(config)
+    #     ├── self.language_model = Gemma4TextModel  → model.language_model.*
+    #     ├── self.vision_tower   = Gemma4VisionModel → model.vision_tower.*
+    #     └── self.embed_vision   = Gemma4MultimodalEmbedder → model.embed_vision.*
+    #   self.lm_head  (tied to model.language_model.embed_tokens.weight)
+    #
+    # IMPORTANT: Gemma4 uses Gemma4ClippableLinear (wraps nn.Linear as self.linear)
+    # for ALL vision attention and MLP projections, adding ".linear." to every path.
+    # The text decoder uses standard nn.Linear, so BASE_KEY_MAP decoder suffixes apply.
     "Gemma4ForConditionalGeneration": {
-        # decoder layer modules (extends BASE_KEY_MAP decoder dict)
+        # --- decoder (Gemma4TextModel inside Gemma4Model.language_model) ---
+        "decoder_layer_prefix": "model.language_model.layers.",
+        "tgt_emb.embeddings.weight": "model.language_model.embed_tokens.weight",
+        "decoder.layer_norm.weight": "model.language_model.norm.weight",
+        # lm_head is tied to embed_tokens (share_decoder_embeddings=True), skipped
+        # decoder layer modules: text layers use standard nn.Linear, so BASE_KEY_MAP
+        # suffixes are correct; only the Gemma4-specific layernorms are added here.
         "decoder": {
             ".self_attn.q_norm.": ".self_attn.q_norm.",
             ".self_attn.k_norm.": ".self_attn.k_norm.",
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
             ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
         },
-        "encoder_layer_prefix": "vision_tower.vision_model.encoder.layers.",
-        "encoder.patch_conv.weight": "vision_tower.vision_model.embeddings.patch_embedding.weight",
-        "encoder.patch_conv.bias": "vision_tower.vision_model.embeddings.patch_embedding.bias",
-        "encoder.post_layernorm.weight": "vision_tower.vision_model.post_layernorm.weight",
-        "encoder.post_layernorm.bias": "vision_tower.vision_model.post_layernorm.bias",
-        "encoder.position_embeddings.weight": "vision_tower.vision_model.embeddings.position_embedding.weight",
-        # encoder layers modules
+        # --- vision encoder (Gemma4VisionModel inside Gemma4Model.vision_tower) ---
+        # Gemma4 uses its own Gemma4VisionModel (NOT SigLIP).
+        # Structure: patch_embedder.input_proj (linear, no bias) + encoder.layers
+        # All vision attention/MLP use Gemma4ClippableLinear → path has extra ".linear."
+        "encoder_layer_prefix": "model.vision_tower.encoder.layers.",
+        "encoder.patch_conv.weight": "model.vision_tower.patch_embedder.input_proj.weight",
+        # No patch_conv bias (input_proj has bias=False).
+        # No post_layernorm at Gemma4VisionModel level.
+        # No position_embeddings.weight (Gemma4 uses position_embedding_table, a [2,P,H] tensor
+        # not compatible with EOLE's Embedding-based encoder.position_embeddings).
         "encoder": {
-            ".self_attn.linear_query.": ".self_attn.q_proj.",
-            ".self_attn.linear_keys.": ".self_attn.k_proj.",
-            ".self_attn.linear_values.": ".self_attn.v_proj.",
-            ".self_attn.final_linear.": ".self_attn.out_proj.",
-            ".mlp.gate_up_proj.": ".mlp.fc1.",
-            ".mlp.down_proj.": ".mlp.fc2.",
-            ".input_layernorm.": ".layer_norm1.",
-            ".post_attention_layernorm.": ".layer_norm2.",
+            ".self_attn.linear_query.": ".self_attn.q_proj.linear.",
+            ".self_attn.linear_keys.": ".self_attn.k_proj.linear.",
+            ".self_attn.linear_values.": ".self_attn.v_proj.linear.",
+            ".self_attn.final_linear.": ".self_attn.o_proj.linear.",
+            ".mlp.gate_up_proj.": ".mlp.gate_proj.linear.",
+            ".mlp.down_proj.": ".mlp.down_proj.linear.",
+            ".mlp.up_proj.": ".mlp.up_proj.linear.",
+            ".input_layernorm.": ".input_layernorm.",
+            ".post_attention_layernorm.": ".post_attention_layernorm.",
+            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
+            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
         },
-        "adapter.w_in.weight": ("multi_modal_projector.mm_input_projection_weight", ".t()"),
-        "adapter.norm.weight": "multi_modal_projector.mm_soft_emb_norm.weight",
+        # --- multimodal adapter (Gemma4MultimodalEmbedder inside Gemma4Model.embed_vision) ---
+        # embedding_projection is nn.Linear(multimodal_hidden, text_hidden), no transpose.
+        "adapter.w_in.weight": "model.embed_vision.embedding_projection.weight",
+        # adapter.norm.weight has no source: Gemma4MultimodalEmbedder uses
+        # Gemma4RMSNorm(with_scale=False) for pre-projection norm — no learnable weight.
         "config": {
             "share_decoder_embeddings": True,
             "ffn_layernorm": True,
@@ -457,12 +477,12 @@ MODEL_OVERRIDES = {
                 "mlp_activation_fn": "gelu-tanh",
                 "position_encoding_type": PositionEncodingType.Learned,
                 "layer_norm": "standard",
-                "add_ffnbias": True,
-                "add_final_linear_bias": True,
-                "add_qkvbias": True,
+                "add_ffnbias": False,
+                "add_final_linear_bias": False,
+                "add_qkvbias": False,
                 "layernorm_pre": False,
                 "layernorm_post": True,
-                "patch_conv_bias": True,
+                "patch_conv_bias": False,
             },
         },
     },
