@@ -1325,6 +1325,30 @@ def build_shards(model_config, hf, args, params):
         if shard == 0:
             eole_safetensor = build_first_shard(hf, eole_safetensor)
 
+            # Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False): no learnable
+            # weight. EOLE's Gemma3MultiModalProjector uses GemmaRMSNorm (x*(1+weight)),
+            # so weight=0 gives the correct identity scaling.  Inject zeros explicitly so
+            # load_state_dict doesn't log a missing-key warning and leave it uninitialized.
+            if hf.arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+                adapter_norm_key = "adapter.norm.weight"
+                if adapter_norm_key not in eole_safetensor.keys():
+                    enc_hidden = model_config.get("encoder", {}).get("hidden_size", None)
+                    if enc_hidden is not None:
+                        z = torch.zeros(enc_hidden)
+                        if target_dtype is not None:
+                            z = z.to(target_dtype)
+                        eole_safetensor[adapter_norm_key] = z
+                        conversion_details.append(
+                            {
+                                "shard_path": output_path,
+                                "eole_key": adapter_norm_key,
+                                "srckey": None,
+                                "srcmap": "[zeros: Gemma4RMSNorm with_scale=False]",
+                                "context": {},
+                                "special": "gemma4_adapter_norm_zeros",
+                            }
+                        )
+
         # TODO: could we reverse the mapping and loop on params instead? (would reduce conditions)
         for ckpt in shard_checkpoints[shard]:
             print("Loading %s" % ckpt)
@@ -1417,7 +1441,9 @@ def build_shards(model_config, hf, args, params):
                                         and section == "decoder"
                                         and hf.arch
                                         in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
-                                        and hf.config.get("attention_k_eq_v", False)
+                                        and hf.config.get("text_config", hf.config).get(
+                                            "attention_k_eq_v", False
+                                        )
                                     ):
                                         layer_types = model_config.get("decoder", {}).get("layer_types", [])
                                         if i < len(layer_types) and layer_types[i] == "full_attention":

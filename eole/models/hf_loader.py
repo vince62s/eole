@@ -386,19 +386,31 @@ class HFLoader:
 
                 _layer_cache.clear()
 
-        # Post-process: for Gemma4 full_attention layers with attention_k_eq_v=True,
-        # v_proj is None in HF (value reuses key), so tie linear_values to linear_keys.
-        if hf.arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration") and hf.config.get(
-            "attention_k_eq_v", False
-        ):
-            layer_types = model_config.get("decoder", {}).get("layer_types", [])
-            for i, lt in enumerate(layer_types):
-                if lt == "full_attention":
-                    for param in params:
-                        k_key = f"decoder.transformer_layers.{i}.self_attn.linear_keys.{param}"
-                        v_key = f"decoder.transformer_layers.{i}.self_attn.linear_values.{param}"
-                        if k_key in store and v_key not in store:
-                            store[v_key] = store[k_key]
+        # Post-process: Gemma4-specific weight fixups.
+        if hf.arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+            text_config = hf.config.get("text_config", hf.config)
+
+            # For full_attention layers with attention_k_eq_v=True, v_proj is None in HF
+            # (value states reuse key states), so tie linear_values to linear_keys.
+            if text_config.get("attention_k_eq_v", False):
+                layer_types = model_config.get("decoder", {}).get("layer_types", [])
+                for i, lt in enumerate(layer_types):
+                    if lt == "full_attention":
+                        for param in params:
+                            k_key = f"decoder.transformer_layers.{i}.self_attn.linear_keys.{param}"
+                            v_key = f"decoder.transformer_layers.{i}.self_attn.linear_values.{param}"
+                            if k_key in store and v_key not in store:
+                                store[v_key] = store[k_key]
+
+            # Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False): no learnable
+            # weight tensor (effectively scale=1).  EOLE's Gemma3MultiModalProjector uses
+            # GemmaRMSNorm which computes x*(1+weight), so weight=0 gives the correct
+            # identity scaling.  Set it explicitly to avoid torch.empty garbage.
+            adapter_norm_key = "adapter.norm.weight"
+            if adapter_norm_key not in store:
+                enc_hidden = model_config.get("encoder", {}).get("hidden_size", None)
+                if enc_hidden is not None:
+                    store[adapter_norm_key] = torch.zeros(enc_hidden)
 
 
 # ---------------------------------------------------------------------------
