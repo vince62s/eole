@@ -386,6 +386,20 @@ class HFLoader:
 
                 _layer_cache.clear()
 
+        # Post-process: for Gemma4 full_attention layers with attention_k_eq_v=True,
+        # v_proj is None in HF (value reuses key), so tie linear_values to linear_keys.
+        if hf.arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration") and hf.config.get(
+            "attention_k_eq_v", False
+        ):
+            layer_types = model_config.get("decoder", {}).get("layer_types", [])
+            for i, lt in enumerate(layer_types):
+                if lt == "full_attention":
+                    for param in params:
+                        k_key = f"decoder.transformer_layers.{i}.self_attn.linear_keys.{param}"
+                        v_key = f"decoder.transformer_layers.{i}.self_attn.linear_values.{param}"
+                        if k_key in store and v_key not in store:
+                            store[v_key] = store[k_key]
+
 
 # ---------------------------------------------------------------------------
 # Public API

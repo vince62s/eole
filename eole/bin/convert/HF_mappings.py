@@ -505,7 +505,9 @@ MODEL_OVERRIDES = {
                 "query_norm": True,
                 "key_norm": True,
                 "layernorm_pre": False,
-                "layernorm_post": True,
+                # Gemma4VisionModel has no global post_layernorm; the per-layer
+                # post_attention_layernorm is handled inside each encoder layer.
+                "layernorm_post": False,
                 "patch_conv_bias": False,
             },
         },

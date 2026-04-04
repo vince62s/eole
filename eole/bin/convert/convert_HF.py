@@ -1410,6 +1410,32 @@ def build_shards(model_config, hf, args, params):
                                             "special": None,
                                         }
                                     )
+                                    # For Gemma4 full_attention layers with attention_k_eq_v=True,
+                                    # v_proj is None in HF (value reuses key): tie linear_values to linear_keys.
+                                    if (
+                                        ".self_attn.linear_keys." in eole_key
+                                        and section == "decoder"
+                                        and hf.arch
+                                        in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
+                                        and hf.config.get("attention_k_eq_v", False)
+                                    ):
+                                        layer_types = model_config.get("decoder", {}).get("layer_types", [])
+                                        if i < len(layer_types) and layer_types[i] == "full_attention":
+                                            v_key = eole_key.replace(
+                                                ".self_attn.linear_keys.", ".self_attn.linear_values."
+                                            )
+                                            if v_key not in eole_safetensor.keys():
+                                                eole_safetensor[v_key] = w
+                                                conversion_details.append(
+                                                    {
+                                                        "shard_path": output_path,
+                                                        "eole_key": v_key,
+                                                        "srckey": full_srckey,
+                                                        "srcmap": "[tied to linear_keys]",
+                                                        "context": {},
+                                                        "special": "gemma4_kv_eq",
+                                                    }
+                                                )
                 _layer_tensor_cache.clear()
 
         print("Saving output model shard: %d" % shard)
