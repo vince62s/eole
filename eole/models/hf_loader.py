@@ -400,7 +400,7 @@ class HFLoader:
                             k_key = f"decoder.transformer_layers.{i}.self_attn.linear_keys.{param}"
                             v_key = f"decoder.transformer_layers.{i}.self_attn.linear_values.{param}"
                             if k_key in store and v_key not in store:
-                                store[v_key] = store[k_key]
+                                store[v_key] = store.get_tensor(k_key)
 
             # Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False): no learnable
             # weight tensor (effectively scale=1).  EOLE's Gemma3MultiModalProjector uses
