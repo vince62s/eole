@@ -434,26 +434,38 @@ MODEL_OVERRIDES = {
         },
         # --- vision encoder (Gemma4VisionModel inside Gemma4Model.vision_tower) ---
         # Gemma4 uses its own Gemma4VisionModel (NOT SigLIP).
-        # Structure: patch_embedder.input_proj (linear, no bias) + encoder.layers
+        # Structure: patch_embedder.input_proj (Linear, no bias) + encoder.layers
         # All vision attention/MLP use Gemma4ClippableLinear → path has extra ".linear."
+        #
+        # IMPORTANT: Gemma4VisionPatchEmbedder.input_proj is nn.Linear(3*P*P, H), not Conv2d.
+        # EOLE's patch_conv is Conv2d([H, 3, P, P]).  The Linear weight must be reshaped:
+        #   [H, 3*P*P] → [H, 3, P, P]
         "encoder_layer_prefix": "model.vision_tower.encoder.layers.",
-        "encoder.patch_conv.weight": "model.vision_tower.patch_embedder.input_proj.weight",
+        "encoder.patch_conv.weight": (
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            ".view(w.shape[0], 3, int(round((w.shape[1]/3)**0.5)), int(round((w.shape[1]/3)**0.5)))",
+        ),
         # No patch_conv bias (input_proj has bias=False).
         # No post_layernorm at Gemma4VisionModel level.
-        # No position_embeddings.weight (Gemma4 uses position_embedding_table, a [2,P,H] tensor
-        # not compatible with EOLE's Embedding-based encoder.position_embeddings).
+        # Gemma4 vision uses a 2D position table (position_embedding_table [2,P,H]) rather
+        # than a 1D Embedding; EOLE uses 2D RoPE (PositionEncodingType.Rotary) instead.
         "encoder": {
             ".self_attn.linear_query.": ".self_attn.q_proj.linear.",
             ".self_attn.linear_keys.": ".self_attn.k_proj.linear.",
             ".self_attn.linear_values.": ".self_attn.v_proj.linear.",
             ".self_attn.final_linear.": ".self_attn.o_proj.linear.",
+            # Gemma4 vision attention has learnable q_norm and k_norm (RMSNorm with scale)
+            ".self_attn.q_norm.": ".self_attn.q_norm.",
+            ".self_attn.k_norm.": ".self_attn.k_norm.",
+            # Gemma4 vision MLP is gated: act(gate_proj(x)) * up_proj(x)
             ".mlp.gate_up_proj.": ".mlp.gate_proj.linear.",
             ".mlp.down_proj.": ".mlp.down_proj.linear.",
             ".mlp.up_proj.": ".mlp.up_proj.linear.",
             ".input_layernorm.": ".input_layernorm.",
             ".post_attention_layernorm.": ".post_attention_layernorm.",
-            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
-            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+            # Note: Gemma4 vision layers also have pre/post_feedforward_layernorm but
+            # EOLE's TransformerEncoderLayer only has 2 layernorms (no ffn_layernorm
+            # support in the encoder), so those HF weights are intentionally skipped.
         },
         # --- multimodal adapter (Gemma4MultimodalEmbedder inside Gemma4Model.embed_vision) ---
         # embedding_projection is nn.Linear(multimodal_hidden, text_hidden), no transpose.
@@ -474,12 +486,24 @@ MODEL_OVERRIDES = {
                 "max_position_embeddings": 131072,
             },
             "encoder": {
-                "mlp_activation_fn": "gelu-tanh",
-                "position_encoding_type": PositionEncodingType.Learned,
-                "layer_norm": "standard",
+                # Gemma4 vision MLP is gated (act(gate_proj) * up_proj)
+                "mlp_activation_fn": "gated-gelu-tanh",
+                # Use 2D RoPE for vision encoder (replaces 2D factorised absolute PE)
+                # image_size for 2D RoPE precomputation is set dynamically in convert_HF.py
+                "position_encoding_type": PositionEncodingType.Rotary,
+                # RoPE config: Gemma4VisionConfig default_theta = 100.0
+                "rope_config": {
+                    "rotary_theta": 100.0,
+                    "rotary_interleave": False,
+                },
+                # Gemma4 uses RMSNorm throughout (Gemma4RMSNorm)
+                "layer_norm": "rms",
                 "add_ffnbias": False,
                 "add_final_linear_bias": False,
                 "add_qkvbias": False,
+                # Gemma4 vision attention has learnable q/k norms
+                "query_norm": True,
+                "key_norm": True,
                 "layernorm_pre": False,
                 "layernorm_post": True,
                 "patch_conv_bias": False,

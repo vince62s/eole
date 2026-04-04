@@ -514,18 +514,24 @@ def build_config_dict(hf):
             model_config["heads"] = 8
         if vision_config is not None:
             # Gemma4VisionConfig has no `image_size` field; it uses
-            # `position_embedding_size` (maximum number of position embeddings).
-            # Fall back to that when `image_size` is not present.
+            # `position_embedding_size` (maximum number of position embeddings per axis).
             _v_image_size = vision_config.get("image_size")
-            _v_patch_size = vision_config.get("patch_size", 0)
+            _v_patch_size = vision_config.get("patch_size", 16)
             _v_pos_emb_size = vision_config.get("position_embedding_size", 0)
             if _v_image_size is not None and _v_patch_size > 0:
                 n_positions = (_v_image_size // _v_patch_size) ** 2
             else:
                 n_positions = _v_pos_emb_size
+            # EOLE uses 2D RoPE (PositionEncodingType.Rotary) for the vision encoder.
+            # init_2d_inv_freq requires image_size to precompute the frequency table.
+            # Gemma4VisionConfig has no fixed image_size, so derive a practical maximum:
+            # 128 patches per side (= 2048 pixels for 16-pixel patches).
+            effective_image_size = _v_image_size or (_v_patch_size * 128)
             model_config["encoder"].update(
                 {
                     "n_positions": n_positions,
+                    # Set image_size for 2D RoPE precomputation
+                    "image_size": effective_image_size,
                     # Gemma4 vision uses mm_tokens_per_image from the top-level config
                     "mm_tokens_per_image": other_config.get(
                         "mm_tokens_per_image", hf.config.get("mm_tokens_per_image", 256)
