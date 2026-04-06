@@ -207,6 +207,13 @@ class RotaryPositionConfig(Config):
         "Used by Gemma4 where full_attention layers use a smaller rotary dimension "
         "(partial_rotary_factor * global_head_dim). 0 means use rotary_dim or dim_per_head.",
     )
+    partial_rotary_factor: float = Field(
+        default=0.0,
+        description="Fraction of global_head_dim used for rotation in 'proportional' RoPE (Gemma4 full_attention). "
+        "When > 0, the inv_freq is computed with global_head_dim as denominator and zero-padded so that "
+        "cos/sin covers all global_head_dim dimensions (zero-freq dims get identity rotation). "
+        "0.0 means standard full rotation (no partial rotation).",
+    )
 
 
 class TransformerConfig(Config):

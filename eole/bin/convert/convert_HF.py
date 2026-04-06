@@ -316,11 +316,14 @@ def _build_gemma4_config(config, model_config):
     global_theta = 1_000_000
     local_theta = 10_000
     rotary_dim_global = 0
+    partial_rotary_factor = 0.0
 
     if full_rope:
         global_theta = int(full_rope.get("rope_theta", global_theta))
         partial_factor = full_rope.get("partial_rotary_factor", None)
         if partial_factor is not None and global_head_dim:
+            partial_rotary_factor = float(partial_factor)
+            # Keep rotary_dim_global for backward compat (= effective rotary dims)
             rotary_dim_global = int(partial_factor * global_head_dim)
     if sliding_rope:
         local_theta = int(sliding_rope.get("rope_theta", local_theta))
@@ -340,6 +343,8 @@ def _build_gemma4_config(config, model_config):
         "tmax_index": 1,  # same as Gemma3
         "rotary_interleave": False,
     }
+    if partial_rotary_factor > 0.0:
+        rope_config_update["partial_rotary_factor"] = partial_rotary_factor
     if rotary_dim_global > 0:
         rope_config_update["rotary_dim_global"] = rotary_dim_global
 
@@ -350,17 +355,18 @@ def _build_gemma4_config(config, model_config):
     )
 
     # Also set the model-level rope_config so it propagates through _override_values
-    model_config.setdefault("rope_config", {}).update(
-        {
-            "rotary_theta": global_theta,
-            "rotary_theta_local": local_theta,
-            "interleave_local": interleave_local,
-            "tmax_index": 1,
-            "rotary_interleave": False,
-        }
-    )
+    model_config_rope_update = {
+        "rotary_theta": global_theta,
+        "rotary_theta_local": local_theta,
+        "interleave_local": interleave_local,
+        "tmax_index": 1,
+        "rotary_interleave": False,
+    }
+    if partial_rotary_factor > 0.0:
+        model_config_rope_update["partial_rotary_factor"] = partial_rotary_factor
     if rotary_dim_global > 0:
-        model_config["rope_config"]["rotary_dim_global"] = rotary_dim_global
+        model_config_rope_update["rotary_dim_global"] = rotary_dim_global
+    model_config.setdefault("rope_config", {}).update(model_config_rope_update)
 
     # --- 4. global_head_dim / global_heads_kv ---
     if global_head_dim and global_head_dim != head_dim:

@@ -186,6 +186,7 @@ class RotaryPosition(nn.Module):
         rope_config = model_config.rope_config
         # For global (full_attention) layers: use rotary_dim_global if set (Gemma4 proportional rope)
         rotary_dim_global = getattr(rope_config, "rotary_dim_global", 0)
+        partial_rotary_factor = getattr(rope_config, "partial_rotary_factor", 0.0)
         if variant == "global" and rotary_dim_global > 0:
             rotary_dim = rotary_dim_global
         else:
@@ -211,7 +212,20 @@ class RotaryPosition(nn.Module):
         else:
             base = self.rotary_theta
 
-        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+        # Proportional RoPE (Gemma4 full_attention): inv_freq has global_head_dim//2 entries where the
+        # first rope_angles entries are non-zero and the remaining nope_dim entries are zero.  This means
+        # the cos/sin table covers ALL global_head_dim dimensions; zero-freq dims get cos=1, sin=0 → identity.
+        # This exactly matches HF's _compute_proportional_rope_parameters.
+        if variant == "global" and partial_rotary_factor > 0.0:
+            full_head_dim = getattr(model_config, "global_head_dim", 0) or self.dim_per_head
+            rope_angles = int(partial_rotary_factor * full_head_dim / 2)
+            nope_dim = full_head_dim // 2 - rope_angles
+            inv_freq_rotated = 1.0 / (
+                base ** (torch.arange(0, 2 * rope_angles, 2).float() / full_head_dim)
+            )
+            inv_freq = torch.cat([inv_freq_rotated, torch.zeros(nope_dim)], dim=0)
+        else:
+            inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
 
         # 2. Handle 2D Expansion
         if mode == "2d":
