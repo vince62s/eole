@@ -268,7 +268,7 @@ def _build_gemma4_config(config, model_config):
       instead of the flat ``rope_scaling`` dict used by other models.
     - ``global_head_dim`` / ``num_global_key_value_heads``: full_attention
       layers may use a larger head_dim than sliding_attention layers.
-    - ``tmax_index``: Gemma4 uses tmax_index=1 (same as Gemma3).
+    - ``tmax_index``: Gemma4 uses tmax_index=0 (positions start at 0, unlike Gemma3 which uses 1).
     """
     from eole.config import recursive_update_dict
 
@@ -340,7 +340,7 @@ def _build_gemma4_config(config, model_config):
         "rotary_theta": global_theta,
         "rotary_theta_local": local_theta,
         "interleave_local": interleave_local,
-        "tmax_index": 1,  # same as Gemma3
+        "tmax_index": 0,  # Gemma4 uses positions 0..N-1 (unlike Gemma3 which shifts by 1)
         "rotary_interleave": False,
     }
     if partial_rotary_factor > 0.0:
@@ -359,7 +359,7 @@ def _build_gemma4_config(config, model_config):
         "rotary_theta": global_theta,
         "rotary_theta_local": local_theta,
         "interleave_local": interleave_local,
-        "tmax_index": 1,
+        "tmax_index": 0,
         "rotary_interleave": False,
     }
     if partial_rotary_factor > 0.0:
