@@ -278,6 +278,9 @@ class TransformerConfig(Config):
     key_norm: bool = Field(
         default=False,
     )
+    value_norm: bool = Field(
+        default=False,
+    )
     qk_norm_post_rope: bool = Field(
         default=False,
     )

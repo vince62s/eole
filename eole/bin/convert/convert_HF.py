@@ -383,6 +383,10 @@ def _build_gemma4_config(config, model_config):
         model_config.setdefault("decoder", {})["hidden_size_per_layer_input"] = hidden_size_per_layer_input
         model_config.setdefault("decoder", {})["vocab_size_per_layer_input"] = vocab_size_per_layer_input
 
+    # --- 6. value_norm ---
+    # Both text and vision Gemma4 attention apply RMSNorm (no scale) to value states.
+    model_config.setdefault("decoder", {})["value_norm"] = True
+
     return model_config
 
 
@@ -554,6 +558,8 @@ def build_config_dict(hf):
                     "image_token_id": other_config.get(
                         "image_token_id", hf.config.get("image_token_id", 258880)
                     ),
+                    # Gemma4VisionAttention applies RMSNorm (no scale) to value states
+                    "value_norm": True,
                 }
             )
 

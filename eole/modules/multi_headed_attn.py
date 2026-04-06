@@ -118,6 +118,10 @@ class MultiHeadedAttention(torch.nn.Module):
             self.q_norm = LayerNorm[model_config.layer_norm](model_config.head_dim, eps=model_config.norm_eps)
         if model_config.key_norm:
             self.k_norm = LayerNorm[model_config.layer_norm](model_config.head_dim, eps=model_config.norm_eps)
+        if model_config.value_norm:
+            from eole.modules.rmsnorm import RMSNormNoScale
+
+            self.v_norm = RMSNormNoScale(model_config.head_dim, eps=model_config.norm_eps)
         self.qk_norm_post_rope = model_config.qk_norm_post_rope
 
         self.final_linear = skip_init(
@@ -266,6 +270,9 @@ class MultiHeadedAttention(torch.nn.Module):
         key = bld_to_blhd(key, self.dim_per_head)
         value = bld_to_blhd(value, self.dim_per_head)
         query = bld_to_blhd(query, self.dim_per_head)
+
+        if hasattr(self, "v_norm"):
+            value = self.v_norm(value)
 
         if not self.qk_norm_post_rope:
             if hasattr(self, "q_norm"):
