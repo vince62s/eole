@@ -326,6 +326,7 @@ MODEL_OVERRIDES = {
             ".self_attn.k_norm.": ".self_attn.k_norm.",
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
             ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+            ".layer_scalar": ".layer_scalar",
         },
         "config": {
             "share_decoder_embeddings": True,
@@ -431,6 +432,7 @@ MODEL_OVERRIDES = {
             ".self_attn.k_norm.": ".self_attn.k_norm.",
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
             ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
+            ".layer_scalar": ".layer_scalar",
         },
         # --- vision encoder (Gemma4VisionModel inside Gemma4Model.vision_tower) ---
         # Gemma4 uses its own Gemma4VisionModel (NOT SigLIP).

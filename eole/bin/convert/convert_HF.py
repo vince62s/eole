@@ -1555,7 +1555,7 @@ def save_vocab(vocabs, src_vocab, directory_path):
 
     with open(os.path.join(directory_path, "vocab.txt"), "w", encoding="utf-8") as vocabfile:
         for tok in vocab_dict["src"]:
-            vocabfile.write(tok + "\n")
+            vocabfile.write(tok.replace("\n", DefaultTokens.SEP) + "\n")
 
 
 @register_bin(name="HF")

@@ -147,6 +147,11 @@ class TransformerDecoderLayer(nn.Module):
         self.compiled_shapes = set()
         self.hidden_size = decoder_config.hidden_size
 
+        # Gemma4 per-layer scalar (initialized to 1 so it is a no-op for all other models).
+        # In HF it is a registered buffer applied as `hidden_states *= self.layer_scalar`
+        # at the very end of every decoder layer's forward pass.
+        self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
+
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
             self._forward_compile = torch.compile(
                 self._forward_eager,
@@ -187,6 +192,7 @@ class TransformerDecoderLayer(nn.Module):
         ff_in2 = self.pre_feedforward_layernorm(ff_in)
         ff_in2 = self.mlp(ff_in2)
         layer_out = ff_in + self.post_feedforward_layernorm(ff_in2)
+        layer_out = layer_out * self.layer_scalar
         return layer_out, attns
 
     def _forward_parallel_residual(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
@@ -209,7 +215,9 @@ class TransformerDecoderLayer(nn.Module):
         else:
             ff_in = norm_layer_in
 
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def _forward_cross_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
         enc_out = kwargs.pop("enc_out", None)
@@ -230,20 +238,26 @@ class TransformerDecoderLayer(nn.Module):
 
         ff_in = self.post_attention_layernorm(self_attn)
         # we apply residual with un-normed
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def _forward_linear_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
         """Forward pass for linear attention (GatedDeltaNet) layers."""
         # Note: self_attn here is already the output of linear_attn (set by _forward_eager)
         self_attn.add_(layer_in)
         ff_in = self.post_attention_layernorm(self_attn)
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def _forward_no_cross_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
         kwargs.pop("return_attn", None)
         self_attn.add_(layer_in)
         ff_in = self.post_attention_layernorm(self_attn)
-        return self_attn + self.mlp(ff_in), attns
+        layer_out = self_attn + self.mlp(ff_in)
+        layer_out = layer_out * self.layer_scalar
+        return layer_out, attns
 
     def forward(self, layer_in, **kwargs):
         if layer_in.size(1) > 1:
