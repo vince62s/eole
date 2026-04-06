@@ -368,6 +368,15 @@ def _build_gemma4_config(config, model_config):
     if num_global_kv_heads and num_global_kv_heads != heads_kv:
         model_config.setdefault("decoder", {})["global_heads_kv"] = num_global_kv_heads
 
+    # --- 5. per-layer input embedding (hidden_size_per_layer_input) ---
+    # Gemma4 uses a separate embedding table + model projection to compute
+    # per-layer inputs injected into each decoder layer.  Default = 256.
+    hidden_size_per_layer_input = config.get("hidden_size_per_layer_input", 0)
+    vocab_size_per_layer_input = config.get("vocab_size_per_layer_input", 0)
+    if hidden_size_per_layer_input:
+        model_config.setdefault("decoder", {})["hidden_size_per_layer_input"] = hidden_size_per_layer_input
+        model_config.setdefault("decoder", {})["vocab_size_per_layer_input"] = vocab_size_per_layer_input
+
     return model_config
 
 

@@ -321,12 +321,18 @@ MODEL_OVERRIDES = {
     # These are extracted dynamically in convert_HF.py; only the common
     # weight-name overrides that match Gemma3 are listed here.
     "Gemma4ForCausalLM": {
+        "decoder.embed_tokens_per_layer.weight": "model.embed_tokens_per_layer.weight",
+        "decoder.per_layer_model_projection.weight": "model.per_layer_model_projection.weight",
+        "decoder.per_layer_projection_norm.weight": "model.per_layer_projection_norm.weight",
         "decoder": {
             ".self_attn.q_norm.": ".self_attn.q_norm.",
             ".self_attn.k_norm.": ".self_attn.k_norm.",
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
             ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
             ".layer_scalar": ".layer_scalar",
+            ".per_layer_input_gate.": ".per_layer_input_gate.",
+            ".per_layer_projection.": ".per_layer_projection.",
+            ".post_per_layer_input_norm.": ".post_per_layer_input_norm.",
         },
         "config": {
             "share_decoder_embeddings": True,
@@ -424,6 +430,9 @@ MODEL_OVERRIDES = {
         "decoder_layer_prefix": "model.language_model.layers.",
         "tgt_emb.embeddings.weight": "model.language_model.embed_tokens.weight",
         "decoder.layer_norm.weight": "model.language_model.norm.weight",
+        "decoder.embed_tokens_per_layer.weight": "model.language_model.embed_tokens_per_layer.weight",
+        "decoder.per_layer_model_projection.weight": "model.language_model.per_layer_model_projection.weight",
+        "decoder.per_layer_projection_norm.weight": "model.language_model.per_layer_projection_norm.weight",
         # lm_head is tied to embed_tokens (share_decoder_embeddings=True), skipped
         # decoder layer modules: text layers use standard nn.Linear, so BASE_KEY_MAP
         # suffixes are correct; only the Gemma4-specific layernorms are added here.
@@ -433,6 +442,9 @@ MODEL_OVERRIDES = {
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
             ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
             ".layer_scalar": ".layer_scalar",
+            ".per_layer_input_gate.": ".per_layer_input_gate.",
+            ".per_layer_projection.": ".per_layer_projection.",
+            ".post_per_layer_input_norm.": ".post_per_layer_input_norm.",
         },
         # --- vision encoder (Gemma4VisionModel inside Gemma4Model.vision_tower) ---
         # Gemma4 uses its own Gemma4VisionModel (NOT SigLIP).

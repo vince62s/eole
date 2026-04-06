@@ -4,6 +4,7 @@ Implementation of "Attention is All You Need" Transformer Decoder
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from eole.decoders.decoder import DecoderBase
 from eole.modules.multi_headed_attn import SelfMHA, ContextMHA
 from eole.modules.transformer_mlp import MLP
@@ -152,6 +153,19 @@ class TransformerDecoderLayer(nn.Module):
         # at the very end of every decoder layer's forward pass.
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
 
+        # Gemma4 per-layer input gate/projection/norm.
+        # When hidden_size_per_layer_input > 0 (Gemma4), each layer receives a
+        # per-layer input tensor of shape (B, S, hidden_size_per_layer_input) that
+        # is mixed into the hidden state after the FFN block.
+        self.hidden_size_per_layer_input = getattr(decoder_config, "hidden_size_per_layer_input", 0)
+        if self.hidden_size_per_layer_input:
+            hidden_pli = self.hidden_size_per_layer_input
+            self.per_layer_input_gate = nn.Linear(decoder_config.hidden_size, hidden_pli, bias=False)
+            self.per_layer_projection = nn.Linear(hidden_pli, decoder_config.hidden_size, bias=False)
+            self.post_per_layer_input_norm = LayerNorm[decoder_config.layer_norm](
+                decoder_config.hidden_size, eps=decoder_config.norm_eps
+            )
+
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["2", "3"]:
             self._forward_compile = torch.compile(
                 self._forward_eager,
@@ -186,16 +200,40 @@ class TransformerDecoderLayer(nn.Module):
                 )
             self.compiled_shapes.add((B, S))
 
+    def _apply_per_layer_input(self, layer_out, per_layer_input):
+        """Apply Gemma4 per-layer input gating to layer_out (in-place style).
+
+        Args:
+            layer_out (Tensor): current hidden states ``(B, S, hidden_size)``.
+            per_layer_input (Tensor | None): per-layer input ``(B, S, hidden_size_per_layer_input)``
+                or ``None`` when the mechanism is disabled / input not available.
+
+        Returns:
+            Tensor: updated hidden states.
+        """
+        if self.hidden_size_per_layer_input and per_layer_input is not None:
+            residual = layer_out
+            # gelu_pytorch_tanh approximation matches HF hidden_activation="gelu_pytorch_tanh"
+            gate = F.gelu(self.per_layer_input_gate(layer_out), approximate="tanh")
+            gate = gate * per_layer_input
+            gate = self.per_layer_projection(gate)
+            gate = self.post_per_layer_input_norm(gate)
+            layer_out = residual + gate
+        return layer_out
+
     def _forward_ffn_layernorm(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         kwargs.pop("return_attn", None)
         ff_in = layer_in + self.post_attention_layernorm(self_attn)
         ff_in2 = self.pre_feedforward_layernorm(ff_in)
         ff_in2 = self.mlp(ff_in2)
         layer_out = ff_in + self.post_feedforward_layernorm(ff_in2)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
         layer_out = layer_out * self.layer_scalar
         return layer_out, attns
 
     def _forward_parallel_residual(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         enc_out = kwargs.pop("enc_out", None)
         src_pad_mask = kwargs.pop("src_pad_mask", None)
         return_attn = kwargs.pop("return_attn", False)
@@ -216,10 +254,12 @@ class TransformerDecoderLayer(nn.Module):
             ff_in = norm_layer_in
 
         layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
         layer_out = layer_out * self.layer_scalar
         return layer_out, attns
 
     def _forward_cross_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         enc_out = kwargs.pop("enc_out", None)
         src_pad_mask = kwargs.pop("src_pad_mask", None)
         return_attn = kwargs.pop("return_attn", False)
@@ -239,23 +279,28 @@ class TransformerDecoderLayer(nn.Module):
         ff_in = self.post_attention_layernorm(self_attn)
         # we apply residual with un-normed
         layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
         layer_out = layer_out * self.layer_scalar
         return layer_out, attns
 
     def _forward_linear_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
         """Forward pass for linear attention (GatedDeltaNet) layers."""
+        per_layer_input = kwargs.pop("per_layer_input", None)
         # Note: self_attn here is already the output of linear_attn (set by _forward_eager)
         self_attn.add_(layer_in)
         ff_in = self.post_attention_layernorm(self_attn)
         layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
         layer_out = layer_out * self.layer_scalar
         return layer_out, attns
 
     def _forward_no_cross_attn(self, layer_in, norm_layer_in, self_attn, attns, **kwargs):
+        per_layer_input = kwargs.pop("per_layer_input", None)
         kwargs.pop("return_attn", None)
         self_attn.add_(layer_in)
         ff_in = self.post_attention_layernorm(self_attn)
         layer_out = self_attn + self.mlp(ff_in)
+        layer_out = self._apply_per_layer_input(layer_out, per_layer_input)
         layer_out = layer_out * self.layer_scalar
         return layer_out, attns
 
@@ -417,6 +462,33 @@ class TransformerDecoder(DecoderBase):
         self.hidden_size = decoder_config.hidden_size
         self.compiled_shapes = set()
 
+        # Gemma4 per-layer input mechanism.
+        # embed_tokens_per_layer: separate embedding table (vocab_size_per_layer_input,
+        #   num_layers * hidden_size_per_layer_input) used to compute per-layer inputs.
+        # per_layer_model_projection: linear projection from hidden_size to the same space.
+        # per_layer_projection_norm: RMSNorm applied to the projected hidden states.
+        # Together they compute a (B, S, num_layers, hidden_size_per_layer_input) tensor
+        # where each [:, :, i, :] slice is passed to decoder layer i.
+        self.hidden_size_per_layer_input = getattr(decoder_config, "hidden_size_per_layer_input", 0)
+        if self.hidden_size_per_layer_input:
+            n_layers = decoder_config.layers
+            vocab_size_pli = decoder_config.vocab_size_per_layer_input
+            hidden_pli = self.hidden_size_per_layer_input
+            self.embed_tokens_per_layer = nn.Embedding(vocab_size_pli, n_layers * hidden_pli)
+            # scale applied to embed_tokens_per_layer output (mirrors Gemma4TextScaledWordEmbedding)
+            self.embed_tokens_per_layer_scale = hidden_pli**0.5
+            self.per_layer_model_projection = nn.Linear(
+                decoder_config.hidden_size, n_layers * hidden_pli, bias=False
+            )
+            # scale applied to per_layer_model_projection output
+            self.per_layer_model_projection_scale = decoder_config.hidden_size**-0.5
+            # normalization over the per-layer hidden dim (hidden_size_per_layer_input)
+            self.per_layer_projection_norm = LayerNorm[decoder_config.layer_norm](
+                hidden_pli, eps=decoder_config.norm_eps
+            )
+            # combining scale: (token_emb + model_proj) * 2**-0.5
+            self.per_layer_input_combine_scale = 2.0**-0.5
+
         # Chunked prefill configuration.
         # When sliding_window > 0 the window size is the natural chunk boundary;
         # prefill_chunk_size provides a separate knob for non-sliding-window models.
@@ -439,6 +511,36 @@ class TransformerDecoder(DecoderBase):
                     "triton.cudagraphs": EOLE_COMPILE_MODE == "0",
                 },
             )
+
+    def _compute_per_layer_inputs(self, emb, src_ids):
+        """Compute per-layer input tensor for Gemma4's per-layer input mechanism.
+
+        Mirrors ``Gemma4TextModel.get_per_layer_inputs`` +
+        ``Gemma4TextModel.project_per_layer_inputs``.
+
+        Args:
+            emb (Tensor): decoder input embeddings ``(B, S, hidden_size)``.
+            src_ids (Tensor | None): token IDs ``(B, S)``, or ``None``.
+
+        Returns:
+            Tensor: ``(B, S, num_layers, hidden_size_per_layer_input)``
+        """
+        n_layers = len(self.transformer_layers)
+        hidden_pli = self.hidden_size_per_layer_input
+
+        # Model-level projection from embeddings (always available)
+        model_proj = self.per_layer_model_projection(emb) * self.per_layer_model_projection_scale
+        model_proj = model_proj.reshape(*emb.shape[:-1], n_layers, hidden_pli)
+        model_proj = self.per_layer_projection_norm(model_proj)
+
+        if src_ids is not None:
+            token_emb = self.embed_tokens_per_layer(src_ids) * self.embed_tokens_per_layer_scale
+            token_emb = token_emb.reshape(*src_ids.shape, n_layers, hidden_pli)
+            return (model_proj + token_emb) * self.per_layer_input_combine_scale
+
+        # src_ids not available (e.g. non-Gemma4 callers that don't supply token IDs):
+        # fall back to model-projection only (token embedding contribution omitted).
+        return model_proj
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
 
@@ -639,7 +741,7 @@ class TransformerDecoder(DecoderBase):
 
         return mask.unsqueeze(1)  # (B, 1, chunk_size, cache_len)
 
-    def _forward_chunked_prefill(self, emb, src_ids=None, **kwargs):
+    def _forward_chunked_prefill(self, emb, src_ids=None, per_layer_inputs=None, **kwargs):
         """Process a long prefill sequence in chunks.
 
         When ``sliding_window > 0`` and the input sequence is longer than the
@@ -801,7 +903,11 @@ class TransformerDecoder(DecoderBase):
                 # are handled correctly in all chunks.
                 chunk_kwargs["prefix_len"] = prefix_len
 
-            emb_chunk_out, chunk_attns = self._forward_eager(emb_chunk, **chunk_kwargs)
+            emb_chunk_out, chunk_attns = self._forward_eager(
+                emb_chunk,
+                per_layer_inputs=per_layer_inputs[:, start:end] if per_layer_inputs is not None else None,
+                **chunk_kwargs,
+            )
             all_emb_chunks.append(emb_chunk_out)
 
             # ----------------------------------------------------------
@@ -851,9 +957,16 @@ class TransformerDecoder(DecoderBase):
 
     def forward(self, emb, **kwargs):
         B, S, _ = emb.size()
-        # Pop src_ids early; it is only consumed by _forward_chunked_prefill
-        # for cache key computation and must not be forwarded to _forward_eager.
+        # Pop src_ids; it is used for:
+        #   1. Per-layer input computation (Gemma4 only).
+        #   2. Prefill KV-cache key computation in _forward_chunked_prefill.
         src_ids = kwargs.pop("src_ids", None)
+
+        # Compute Gemma4 per-layer inputs once for the whole sequence.
+        per_layer_inputs = None
+        if self.hidden_size_per_layer_input:
+            per_layer_inputs = self._compute_per_layer_inputs(emb, src_ids)
+
         if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["0", "1"] and S == 1:
             return self._forward_compile(emb, **kwargs)
         # Determine the effective chunk size for chunked prefill.
@@ -861,10 +974,12 @@ class TransformerDecoder(DecoderBase):
         # prefill_chunk_size is an optional performance knob for non-sliding models.
         effective_chunk = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
         if effective_chunk > 0 and S > effective_chunk and self.cache_seqlens is not None:
-            return self._forward_chunked_prefill(emb, src_ids=src_ids, **kwargs)
-        return self._forward_eager(emb, **kwargs)
+            return self._forward_chunked_prefill(
+                emb, src_ids=src_ids, per_layer_inputs=per_layer_inputs, **kwargs
+            )
+        return self._forward_eager(emb, per_layer_inputs=per_layer_inputs, **kwargs)
 
-    def _forward_eager(self, emb, **kwargs):
+    def _forward_eager(self, emb, per_layer_inputs=None, **kwargs):
         """
         Decode a sequence using transformer layers.
 
@@ -872,6 +987,10 @@ class TransformerDecoder(DecoderBase):
             emb (Tensor):
                 Target embeddings of shape
                 ``(batch_size, tgt_len, hidden_size)``.
+            per_layer_inputs (Tensor | None):
+                Optional Gemma4 per-layer inputs of shape
+                ``(batch_size, tgt_len, num_layers, hidden_size_per_layer_input)``.
+                ``None`` for all other models.
 
             **kwargs:
                 enc_out (Tensor, optional):
@@ -1061,7 +1180,7 @@ class TransformerDecoder(DecoderBase):
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
         attn_aligns = []
 
-        for layer, pos_emb in zip(self.transformer_layers, pos_emb_list):
+        for i, (layer, pos_emb) in enumerate(zip(self.transformer_layers, pos_emb_list)):
             if lin_attn_mask is not None and layer.layer_type == "linear_attention":
                 layer_attn_mask = lin_attn_mask
             elif self.has_sliding_attn and layer.layer_type == "full_attention":
@@ -1071,6 +1190,8 @@ class TransformerDecoder(DecoderBase):
                 layer_attn_mask = attn_mask_full
             else:
                 layer_attn_mask = attn_mask
+            # Slice per-layer input for this specific layer (Gemma4 only; None for others).
+            per_layer_input_i = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
             emb, attn = layer(
                 emb.clone() if (EOLE_COMPILE_MODE == "2" and EOLE_TORCH_COMPILE) else emb,
                 enc_out=enc_out,
@@ -1081,6 +1202,7 @@ class TransformerDecoder(DecoderBase):
                 cache_seqlens=self.cache_seqlens,
                 cache_slice=cache_slice,
                 pos_ids_2d=pos_ids_2d,
+                per_layer_input=per_layer_input_i,
             )
             if all_cross_attns is not None and attn is not None:
                 all_cross_attns.append(attn)

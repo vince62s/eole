@@ -417,6 +417,18 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
         default=32,
         description="Number of value heads for linear attention layers (Qwen3.5 GatedDeltaNet).",
     )
+    hidden_size_per_layer_input: int = Field(
+        default=0,
+        description="Hidden size of the per-layer input embeddings (Gemma4). "
+        "When > 0, each decoder layer receives an additional per-layer input "
+        "computed from a separate embedding table and a model-level projection. "
+        "0 means disabled (default for all non-Gemma4 models).",
+    )
+    vocab_size_per_layer_input: int = Field(
+        default=0,
+        description="Vocabulary size for the per-layer input embedding table (Gemma4). "
+        "Only used when hidden_size_per_layer_input > 0.",
+    )
 
     @model_validator(mode="after")
     def _validate_transformer_decoder_config(self):
