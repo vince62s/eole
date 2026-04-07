@@ -444,15 +444,16 @@ class SelfMHA(MultiHeadedAttention):
         self.position_encoding_type = model_config.position_encoding_type
         self.n_positions = model_config.n_positions
         super(SelfMHA, self).__init__(model_config, running_config, is_decoder)
-        # KV-shared layers (Gemma4-E2B cross-layer KV sharing): these layers compute
-        # their own Query but reuse Key/Value from a provider layer.  They have no
-        # linear_keys / linear_values weights in the checkpoint, so we remove the
-        # modules that were allocated by the parent __init__ to keep the model clean.
+        # KV-shared layers (Gemma4-E2B cross-layer KV sharing): at inference these
+        # layers compute their own Query but reuse Key/Value from the provider's
+        # pre-linked KV cache.  During training (no KV cache) they compute their
+        # own K/V using their own projection weights, just like any normal layer.
         self.is_kv_shared = is_kv_shared
         # NOTE: even when is_kv_shared=True we keep linear_keys / linear_values
         # because the HF checkpoint contains k_proj / v_proj weights for these
-        # layers.  The K/V projections are simply not used during the forward
-        # pass; instead the shared K/V from the provider layer are used.
+        # layers.  At inference (with KV cache) these projections are bypassed and
+        # the provider's cached K/V is used directly.  During training the
+        # projections are used normally.
 
     def _update_cache_w_inputs(
         self,
