@@ -970,9 +970,15 @@ class TransformerDecoder(DecoderBase):
                             rec_slice = layer.linear_attn.recurrent_state[b].clone()
                             kv_slices.append((conv_slice, rec_slice))
                         else:
-                            k_slice = layer.self_attn.kcache[b, start:end, :, :].clone()
-                            v_slice = layer.self_attn.vcache[b, start:end, :, :].clone()
-                            kv_slices.append((k_slice, v_slice))
+                            if layer.is_kv_shared:
+                                # Consumer layer: its cache is the same tensor as the
+                                # provider's.  The provider entry in kv_slices already
+                                # covers this data, so skip to avoid double-writes.
+                                kv_slices.append(None)
+                            else:
+                                k_slice = layer.self_attn.kcache[b, start:end, :, :].clone()
+                                v_slice = layer.self_attn.vcache[b, start:end, :, :].clone()
+                                kv_slices.append((k_slice, v_slice))
                     self._prefill_cache.put(cache_keys[b], emb_chunk_out[b].detach(), kv_slices)
 
             if cache_keys is not None:

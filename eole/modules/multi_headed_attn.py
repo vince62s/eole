@@ -575,7 +575,32 @@ class SelfMHA(MultiHeadedAttention):
                 # the provider's (shared) cache and corrupt it.
                 key = self.kcache  # full accumulated K from provider
                 value = self.vcache
-                attn_mask = attn_mask[..., : key.size(1)] if attn_mask is not None else None
+                if attn_mask is None and cache_seqlens is not None:
+                    # Flash decode/prefill path: no explicit mask was provided.
+                    # Build a causal + validity mask so the consumer only attends
+                    # to positions that have been filled by the provider and that
+                    # are causally reachable from the current query token(s).
+                    S_q = query.size(1)
+                    cache_len = key.size(1)
+                    device = key.device
+                    # Absolute position of each query token: for decode (S_q=1)
+                    # the query is at position cache_seqlens; for prefill the
+                    # queries span cache_seqlens .. cache_seqlens + S_q - 1.
+                    q_pos = cache_seqlens.unsqueeze(1) + torch.arange(
+                        S_q, device=device
+                    ).unsqueeze(0)  # [B, S_q]
+                    k_pos = torch.arange(cache_len, device=device)  # [cache_len]
+                    # Causal constraint: key position <= query position
+                    valid = k_pos.view(1, 1, cache_len) <= q_pos.unsqueeze(2)  # [B, S_q, cache_len]
+                    if self.sliding_window > 0:
+                        start = (q_pos - self.sliding_window + 1).clamp(min=0)  # [B, S_q]
+                        valid = valid & (k_pos.view(1, 1, cache_len) >= start.unsqueeze(2))
+                    if self.cache_leftpad is not None:
+                        # Exclude left-padded positions that were never filled.
+                        valid = valid & (k_pos.view(1, 1, cache_len) >= self.cache_leftpad.view(-1, 1, 1))
+                    attn_mask = valid.unsqueeze(1)  # [B, 1, S_q, cache_len]
+                else:
+                    attn_mask = attn_mask[..., : key.size(1)] if attn_mask is not None else None
             else:
                 # Training / no-cache path: use K/V passed from the decoder.
                 assert shared_kv is not None, (
