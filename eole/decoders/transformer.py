@@ -619,11 +619,25 @@ class TransformerDecoder(DecoderBase):
                     if layer.context_attn.kcache is not None:
                         layer.context_attn.kcache = fn(layer.context_attn.kcache)
                         layer.context_attn.vcache = fn(layer.context_attn.vcache)
-                if layer.self_attn.kcache is not None:
+                # KV-shared consumer layers share the provider's cache tensor.
+                # Skip them here to avoid applying fn twice (once via the provider
+                # entry and once via the now-stale consumer reference), which would
+                # break the link.  They are re-linked to the (already mapped)
+                # provider cache in the step below.
+                if layer.self_attn.kcache is not None and not layer.is_kv_shared:
                     layer.self_attn.kcache = fn(layer.self_attn.kcache)
                     layer.self_attn.vcache = fn(layer.self_attn.vcache)
-                if layer.self_attn.cache_leftpad is not None:
+                if layer.self_attn.cache_leftpad is not None and not layer.is_kv_shared:
                     layer.self_attn.cache_leftpad = fn(layer.self_attn.cache_leftpad)
+        # Re-link KV-shared consumer layers to the (now mapped) provider caches.
+        if self.kv_providers:
+            for consumer_idx, provider_idx in self.kv_providers.items():
+                consumer_attn = self.transformer_layers[consumer_idx].self_attn
+                provider_attn = self.transformer_layers[provider_idx].self_attn
+                if consumer_attn is not None:
+                    consumer_attn.kcache = provider_attn.kcache
+                    consumer_attn.vcache = provider_attn.vcache
+                    consumer_attn.cache_leftpad = provider_attn.cache_leftpad
 
     def update_dropout(self, dropout, attention_dropout):
         for layer in self.transformer_layers:
