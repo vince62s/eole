@@ -587,7 +587,10 @@ class TransformerDecoder(DecoderBase):
             # Combine: (token_emb + normed_model_proj) * sqrt(0.5)
             return (token_emb + model_proj) * self.per_layer_input_combine_scale
         else:
-            # src_ids not available: fall back to model-projection only (scaled).
+            # src_ids not available (e.g. training without raw token IDs, or
+            # non-inference code paths).  Fall back to model-projection only.
+            # During inference, inference.py always supplies src_ids (decoder_in)
+            # so this branch should not be reached in normal predict flows.
             return model_proj * self.per_layer_input_combine_scale
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
