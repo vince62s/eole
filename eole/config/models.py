@@ -450,8 +450,9 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
     )
     use_double_wide_mlp: bool = Field(
         default=False,
-        description="When True, KV-shared consumer layers (see num_kv_shared_layers) use an MLP "
+        description="When True and num_kv_shared_layers > 0, KV-shared consumer layers use an MLP "
         "with twice the normal intermediate size (2 × transformer_ff). "
+        "Has no effect when num_kv_shared_layers is 0 (KV sharing disabled). "
         "This matches HF Gemma4-E2B where consumer layers have a wider FFN block to compensate "
         "for reusing the provider's key/value projections.",
     )

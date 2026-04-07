@@ -125,6 +125,7 @@ class TransformerDecoderLayer(nn.Module):
             )
         # Gemma4-E2B: consumer (KV-shared) layers use a double-wide MLP
         # (2 × transformer_ff) to compensate for reusing the provider's K/V.
+        # The factor of 2 matches HF Gemma4TextMLP: intermediate_size * (2 if use_double_wide_mlp else 1).
         consumer_ff = None
         if is_kv_shared and getattr(decoder_config, "use_double_wide_mlp", False):
             consumer_ff = decoder_config.transformer_ff * 2
