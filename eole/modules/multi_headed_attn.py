@@ -449,9 +449,10 @@ class SelfMHA(MultiHeadedAttention):
         # linear_keys / linear_values weights in the checkpoint, so we remove the
         # modules that were allocated by the parent __init__ to keep the model clean.
         self.is_kv_shared = is_kv_shared
-        if is_kv_shared:
-            del self.linear_keys
-            del self.linear_values
+        # NOTE: even when is_kv_shared=True we keep linear_keys / linear_values
+        # because the HF checkpoint contains k_proj / v_proj weights for these
+        # layers.  The K/V projections are simply not used during the forward
+        # pass; instead the shared K/V from the provider layer are used.
 
     def _update_cache_w_inputs(
         self,

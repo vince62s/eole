@@ -389,8 +389,10 @@ def _build_gemma4_config(config, model_config):
 
     # --- 7. num_kv_shared_layers (Gemma4-E2B cross-layer KV sharing) ---
     # The last num_kv_shared_layers decoder layers act as KV consumers: they
-    # compute their own Query but reuse the Key/Value from the provider layer.
-    # These layers have no k_proj / v_proj weights in the HF checkpoint.
+    # compute their own Query but reuse Key/Value from a type-matched provider
+    # layer (the last non-shared layer of the same attention type).  Consumer
+    # layers DO have k_proj / v_proj weights in the HF checkpoint; they are
+    # simply not used during inference (replaced by the shared provider K/V).
     num_kv_shared = config.get("num_kv_shared_layers", 0)
     if num_kv_shared:
         model_config.setdefault("decoder", {})["num_kv_shared_layers"] = num_kv_shared
