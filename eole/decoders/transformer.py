@@ -351,9 +351,7 @@ class TransformerDecoderLayer(nn.Module):
         cache_seqlens = kwargs.pop("cache_seqlens", None)
         cache_slice = kwargs.pop("cache_slice", None)
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
-        # shared_kv: (key, value) tensors from the provider layer, passed by
-        # TransformerDecoder for KV-shared layers during training (no KV cache).
-        shared_kv = kwargs.pop("shared_kv", None)
+        kwargs.pop("shared_kv", None)  # no longer used; kept for backward compat
         norm_layer_in = self.input_layernorm(layer_in)
 
         if self.layer_type == "linear_attention":
@@ -368,7 +366,6 @@ class TransformerDecoderLayer(nn.Module):
                 cache_seqlens=cache_seqlens,
                 cache_slice=cache_slice,
                 pos_ids_2d=pos_ids_2d,
-                shared_kv=shared_kv,
             )
 
         if self.dropout_p > 0:
@@ -1242,13 +1239,6 @@ class TransformerDecoder(DecoderBase):
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
         attn_aligns = []
 
-        # For KV-shared layers (Gemma4-E2B): track the provider's K/V tensors so
-        # they can be forwarded to consumer layers during training (no KV cache).
-        # Each consumer shares from the last non-shared layer of its own type.
-        # During inference the shared layers' caches are pre-linked to the type-matched
-        # provider's cache by _init_cache, so no explicit passing is needed here.
-        provider_kvs: dict = {}  # provider_idx -> (key, value) tensors in blhd format
-
         for i, (layer, pos_emb) in enumerate(zip(self.transformer_layers, pos_emb_list)):
             if lin_attn_mask is not None and layer.layer_type == "linear_attention":
                 layer_attn_mask = lin_attn_mask
@@ -1262,18 +1252,6 @@ class TransformerDecoder(DecoderBase):
             # Slice per-layer input for this specific layer (Gemma4 only; None for others).
             per_layer_input_i = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
 
-            # Determine whether to pass/capture provider K/V (training only; kcache=None).
-            shared_kv_i = None
-            if self.kv_provider_set and self.cache_seqlens is None:
-                if i in self.kv_provider_set:
-                    # Provider layer: after the call we capture its K/V from the
-                    # self_attn module's internal _captured_kv attribute.
-                    layer.self_attn._capture_kv = True
-                elif layer.is_kv_shared:
-                    provider_idx = self.kv_providers.get(i)
-                    if provider_idx is not None:
-                        shared_kv_i = provider_kvs.get(provider_idx)
-
             emb, attn = layer(
                 emb.clone() if (EOLE_COMPILE_MODE == "2" and EOLE_TORCH_COMPILE) else emb,
                 enc_out=enc_out,
@@ -1285,15 +1263,8 @@ class TransformerDecoder(DecoderBase):
                 cache_slice=cache_slice,
                 pos_ids_2d=pos_ids_2d,
                 per_layer_input=per_layer_input_i,
-                shared_kv=shared_kv_i,
             )
 
-            # Retrieve the captured K/V from provider layers (training only).
-            if self.kv_provider_set and i in self.kv_provider_set and self.cache_seqlens is None:
-                kv = getattr(layer.self_attn, "_captured_kv", None)
-                if kv is not None:
-                    provider_kvs[i] = kv
-                layer.self_attn._capture_kv = False
             if all_cross_attns is not None and attn is not None:
                 all_cross_attns.append(attn)
             if with_align:

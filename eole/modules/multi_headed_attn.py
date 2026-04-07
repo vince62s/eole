@@ -553,60 +553,47 @@ class SelfMHA(MultiHeadedAttention):
             cache_seqlens: current sequence lengths for KV cache ``(B,)``.
             cache_slice: position indices for cache update.
             pos_ids_2d: 2-D position IDs for vision RoPE.
-            shared_kv: ``(key, value)`` tensors in head format
-                ``(B, S_k, H_kv, D)`` from the provider layer.  Used by
-                KV-shared layers that have no own K/V projections.
-                For inference the shared layers' KV caches are pre-linked to
-                the provider's caches by ``_init_cache``, so ``shared_kv`` is
-                only needed during training (no KV cache).
+            shared_kv: unused, kept for backward compatibility.
         """
-        if self.is_kv_shared:
+        if self.is_kv_shared and self.kcache is not None:
             # -----------------------------------------------------------------
-            # KV-shared layer: compute Q only, borrow K/V from provider.
+            # KV-shared layer at inference: compute Q only, borrow K/V from
+            # the provider's pre-linked cache.
+            # The cache for this layer was pre-linked to the provider's cache
+            # in _init_cache.  The provider already wrote the current token's
+            # K/V there.  We read from it without any cache write.  Always use
+            # SDPA (_compute_attention) to avoid flash_attn_with_kvcache, which
+            # would try to write new K/V to the provider's (shared) cache and
+            # corrupt it.
             # -----------------------------------------------------------------
             query = self._prepare_query_only(query, position_embeddings=position_embeddings, pos_ids_2d=pos_ids_2d)
-
-            if self.kcache is not None:
-                # Inference: the cache for this layer is pre-linked to the
-                # provider's cache in _init_cache.  The provider already wrote
-                # the current token's K/V there.  We read from it without any
-                # cache write.  Always use SDPA (_compute_attention) to avoid
-                # flash_attn_with_kvcache, which would try to write new K/V to
-                # the provider's (shared) cache and corrupt it.
-                key = self.kcache  # full accumulated K from provider
-                value = self.vcache
-                if attn_mask is None and cache_seqlens is not None:
-                    # Flash decode/prefill path: no explicit mask was provided.
-                    # Build a causal + validity mask so the consumer only attends
-                    # to positions that have been filled by the provider and that
-                    # are causally reachable from the current query token(s).
-                    S_q = query.size(1)
-                    cache_len = key.size(1)
-                    device = key.device
-                    # Absolute position of each query token: for decode (S_q=1)
-                    # the query is at position cache_seqlens; for prefill the
-                    # queries span cache_seqlens .. cache_seqlens + S_q - 1.
-                    q_pos = cache_seqlens.unsqueeze(1) + torch.arange(
-                        S_q, device=device
-                    ).unsqueeze(0)  # [B, S_q]
-                    k_pos = torch.arange(cache_len, device=device)  # [cache_len]
-                    # Causal constraint: key position <= query position
-                    valid = k_pos.view(1, 1, cache_len) <= q_pos.unsqueeze(2)  # [B, S_q, cache_len]
-                    if self.sliding_window > 0:
-                        start = (q_pos - self.sliding_window + 1).clamp(min=0)  # [B, S_q]
-                        valid = valid & (k_pos.view(1, 1, cache_len) >= start.unsqueeze(2))
-                    if self.cache_leftpad is not None:
-                        # Exclude left-padded positions that were never filled.
-                        valid = valid & (k_pos.view(1, 1, cache_len) >= self.cache_leftpad.view(-1, 1, 1))
-                    attn_mask = valid.unsqueeze(1)  # [B, 1, S_q, cache_len]
-                else:
-                    attn_mask = attn_mask[..., : key.size(1)] if attn_mask is not None else None
+            key = self.kcache  # full accumulated K from provider
+            value = self.vcache
+            if attn_mask is None and cache_seqlens is not None:
+                # Flash decode/prefill path: no explicit mask was provided.
+                # Build a causal + validity mask so the consumer only attends
+                # to positions that have been filled by the provider and that
+                # are causally reachable from the current query token(s).
+                S_q = query.size(1)
+                cache_len = key.size(1)
+                device = key.device
+                # Absolute position of each query token: for decode (S_q=1)
+                # the query is at position cache_seqlens; for prefill the
+                # queries span cache_seqlens .. cache_seqlens + S_q - 1.
+                q_pos = cache_seqlens.unsqueeze(1) + torch.arange(
+                    S_q, device=device
+                ).unsqueeze(0)  # [B, S_q]
+                k_pos = torch.arange(cache_len, device=device)  # [cache_len]
+                # Causal constraint: key position <= query position
+                valid = k_pos.view(1, 1, cache_len) <= q_pos.unsqueeze(2)  # [B, S_q, cache_len]
+                if self.sliding_window > 0:
+                    start = (q_pos - self.sliding_window + 1).clamp(min=0)  # [B, S_q]
+                    valid = valid & (k_pos.view(1, 1, cache_len) >= start.unsqueeze(2))
+                if self.cache_leftpad is not None:
+                    # Exclude left-padded positions that were never filled.
+                    valid = valid & (k_pos.view(1, 1, cache_len) >= self.cache_leftpad.view(-1, 1, 1))
+                attn_mask = valid.unsqueeze(1)  # [B, 1, S_q, cache_len]
             else:
-                # Training / no-cache path: use K/V passed from the decoder.
-                assert shared_kv is not None, (
-                    "KV-shared layer requires shared_kv=(key, value) during training"
-                )
-                key, value = shared_kv
                 attn_mask = attn_mask[..., : key.size(1)] if attn_mask is not None else None
 
             return super()._compute_attention(
@@ -627,13 +614,6 @@ class SelfMHA(MultiHeadedAttention):
             position_embeddings=position_embeddings,
             pos_ids_2d=pos_ids_2d,
         )
-
-        # KV provider: capture the projected K/V *before* the cache update so
-        # that KV-shared consumer layers receive the raw per-step K/V tensors.
-        # _capture_kv is set by TransformerDecoder._forward_eager for the
-        # provider layer during training (no KV cache).
-        if getattr(self, "_capture_kv", False):
-            self._captured_kv = (key, value)
 
         if self.kcache is not None:
 
