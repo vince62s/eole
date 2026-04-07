@@ -1251,7 +1251,8 @@ class TransformerDecoder(DecoderBase):
                     layer.self_attn._capture_kv = True
                 elif layer.is_kv_shared:
                     provider_idx = self.kv_providers.get(i)
-                    shared_kv_i = provider_kvs.get(provider_idx)
+                    if provider_idx is not None:
+                        shared_kv_i = provider_kvs.get(provider_idx)
 
             emb, attn = layer(
                 emb.clone() if (EOLE_COMPILE_MODE == "2" and EOLE_TORCH_COMPILE) else emb,
