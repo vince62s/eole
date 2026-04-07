@@ -123,6 +123,12 @@ class TransformerDecoderLayer(nn.Module):
             self.post_attention_layernorm = LayerNorm[decoder_config.layer_norm](
                 decoder_config.hidden_size, eps=decoder_config.norm_eps
             )
+        # Gemma4-E2B: consumer (KV-shared) layers use a double-wide MLP
+        # (2 × transformer_ff) to compensate for reusing the provider's K/V.
+        consumer_ff = None
+        if is_kv_shared and getattr(decoder_config, "use_double_wide_mlp", False):
+            consumer_ff = decoder_config.transformer_ff * 2
+
         if decoder_config.num_experts > 0:
             if idx >= decoder_config.first_k_dense_replace:
                 self.mlp = MoE(decoder_config, running_config)
@@ -130,11 +136,13 @@ class TransformerDecoderLayer(nn.Module):
                 self.mlp = MLP(
                     decoder_config,
                     running_config=running_config,
+                    moe_transformer_ff=consumer_ff,
                 )
         else:
             self.mlp = MLP(
                 decoder_config,
                 running_config=running_config,
+                moe_transformer_ff=consumer_ff,
             )
 
         if self.layer_type == "linear_attention":

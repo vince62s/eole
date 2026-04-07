@@ -448,6 +448,13 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
         "(num_hidden_layers - num_kv_shared_layers - 1). "
         "These layers have no k_proj/v_proj weights in the checkpoint.",
     )
+    use_double_wide_mlp: bool = Field(
+        default=False,
+        description="When True, KV-shared consumer layers (see num_kv_shared_layers) use an MLP "
+        "with twice the normal intermediate size (2 × transformer_ff). "
+        "This matches HF Gemma4-E2B where consumer layers have a wider FFN block to compensate "
+        "for reusing the provider's key/value projections.",
+    )
 
     @model_validator(mode="after")
     def _validate_transformer_decoder_config(self):
