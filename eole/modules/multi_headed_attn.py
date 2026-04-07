@@ -440,10 +440,18 @@ class MultiHeadedAttention(torch.nn.Module):
 
 
 class SelfMHA(MultiHeadedAttention):
-    def __init__(self, model_config, running_config=None, is_decoder: bool = True) -> None:
+    def __init__(self, model_config, running_config=None, is_decoder: bool = True, is_kv_shared: bool = False) -> None:
         self.position_encoding_type = model_config.position_encoding_type
         self.n_positions = model_config.n_positions
         super(SelfMHA, self).__init__(model_config, running_config, is_decoder)
+        # KV-shared layers (Gemma4-E2B cross-layer KV sharing): these layers compute
+        # their own Query but reuse Key/Value from a provider layer.  They have no
+        # linear_keys / linear_values weights in the checkpoint, so we remove the
+        # modules that were allocated by the parent __init__ to keep the model clean.
+        self.is_kv_shared = is_kv_shared
+        if is_kv_shared:
+            del self.linear_keys
+            del self.linear_values
 
     def _update_cache_w_inputs(
         self,
@@ -468,6 +476,61 @@ class SelfMHA(MultiHeadedAttention):
 
         return (self.kcache, self.vcache, query)
 
+    def _prepare_query_only(
+        self,
+        query: Tensor,
+        position_embeddings=None,
+        pos_ids_2d=None,
+    ) -> Tensor:
+        """Compute only the query projection for KV-shared layers.
+
+        KV-shared layers reuse K/V from a provider layer, so we only need to
+        project and rotate the query.
+
+        Args:
+            query (Tensor): input hidden states ``(B, S, hidden_size)``.
+            position_embeddings: RoPE (cos, sin) table, or ``None``.
+            pos_ids_2d: 2-D position IDs for 2D RoPE (vision), or ``None``.
+
+        Returns:
+            Tensor: query in head format ``(B, S, heads, dim_per_head)``.
+        """
+        query = self.maybe_ckpt(self.linear_query, query)
+
+        if self.q_gating:
+            num_heads_local = self.heads // self.parallel_gpu
+            q_g = query.view(query.shape[0], query.shape[1], num_heads_local, 2, self.dim_per_head)
+            query = q_g[:, :, :, 0, :].reshape(query.shape[0], query.shape[1], -1)
+            self._attn_gate = torch.sigmoid(q_g[:, :, :, 1, :].reshape(query.shape[0], query.shape[1], -1))
+
+        query = bld_to_blhd(query, self.dim_per_head)
+
+        if not self.qk_norm_post_rope:
+            if hasattr(self, "q_norm"):
+                query = self.q_norm(query)
+
+        if self.position_encoding_type == PositionEncodingType.Rotary:
+            if self.xdrope_section is not None and pos_ids_2d is not None:
+                # Use a zero dummy key so the function rotates only the query portion
+                dummy_key = query.new_zeros(query.size(0), query.size(1), self.heads_kv, self.dim_per_head)
+                query, _ = apply_rotary_pos_emb_xdrope(
+                    query,
+                    dummy_key,
+                    position_embeddings,
+                    pos_ids_2d,
+                    self.xdrope_section,
+                    interleave=self.rotary_interleave,
+                )
+            else:
+                # Use a zero dummy key – the key rotation result is discarded.
+                dummy_key = query.new_zeros(query.size(0), query.size(1), self.heads_kv, self.dim_per_head)
+                query, _ = apply_rotary_emb(query, dummy_key, position_embeddings, self.rotary_interleave)
+            if self.qk_norm_post_rope:
+                if hasattr(self, "q_norm"):
+                    query = self.q_norm(query)
+
+        return query
+
     def forward(
         self,
         query: Tensor,
@@ -477,8 +540,60 @@ class SelfMHA(MultiHeadedAttention):
         cache_seqlens=None,
         cache_slice=None,
         pos_ids_2d=None,
+        shared_kv=None,
     ) -> Tuple[Tensor, Tensor]:
+        """Forward pass for self-attention.
 
+        Args:
+            query: input hidden states ``(B, S, hidden_size)``.
+            attn_mask: boolean attention mask ``(B, 1, S_q, S_k)``.
+            return_attn: whether to return attention weights.
+            position_embeddings: RoPE table.
+            cache_seqlens: current sequence lengths for KV cache ``(B,)``.
+            cache_slice: position indices for cache update.
+            pos_ids_2d: 2-D position IDs for vision RoPE.
+            shared_kv: ``(key, value)`` tensors in head format
+                ``(B, S_k, H_kv, D)`` from the provider layer.  Used by
+                KV-shared layers that have no own K/V projections.
+                For inference the shared layers' KV caches are pre-linked to
+                the provider's caches by ``_init_cache``, so ``shared_kv`` is
+                only needed during training (no KV cache).
+        """
+        if self.is_kv_shared:
+            # -----------------------------------------------------------------
+            # KV-shared layer: compute Q only, borrow K/V from provider.
+            # -----------------------------------------------------------------
+            query = self._prepare_query_only(query, position_embeddings=position_embeddings, pos_ids_2d=pos_ids_2d)
+
+            if self.kcache is not None:
+                # Inference: the cache for this layer is pre-linked to the
+                # provider's cache in _init_cache.  The provider already wrote
+                # the current token's K/V there.  We read from it without any
+                # cache write.  Always use SDPA (_compute_attention) to avoid
+                # flash_attn_with_kvcache, which would try to write new K/V to
+                # the provider's (shared) cache and corrupt it.
+                key = self.kcache  # full accumulated K from provider
+                value = self.vcache
+                attn_mask = attn_mask[..., : key.size(1)] if attn_mask is not None else None
+            else:
+                # Training / no-cache path: use K/V passed from the decoder.
+                assert shared_kv is not None, (
+                    "KV-shared layer requires shared_kv=(key, value) during training"
+                )
+                key, value = shared_kv
+                attn_mask = attn_mask[..., : key.size(1)] if attn_mask is not None else None
+
+            return super()._compute_attention(
+                key,
+                value,
+                query,
+                attn_mask=attn_mask,
+                return_attn=return_attn,
+            )
+
+        # -----------------------------------------------------------------
+        # Normal (non-shared) self-attention
+        # -----------------------------------------------------------------
         key, value, query = super()._prepare_inputs(
             query,
             query,
@@ -486,6 +601,14 @@ class SelfMHA(MultiHeadedAttention):
             position_embeddings=position_embeddings,
             pos_ids_2d=pos_ids_2d,
         )
+
+        # KV provider: capture the projected K/V *before* the cache update so
+        # that KV-shared consumer layers receive the raw per-step K/V tensors.
+        # _capture_kv is set by TransformerDecoder._forward_eager for the
+        # provider layer during training (no KV cache).
+        if getattr(self, "_capture_kv", False):
+            self._captured_kv = (key, value)
+
         if self.kcache is not None:
 
             if cache_slice is not None:

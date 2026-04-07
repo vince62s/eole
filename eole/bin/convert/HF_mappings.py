@@ -343,6 +343,7 @@ MODEL_OVERRIDES = {
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
+                "attn_scaling": 1.0,
                 # rope_config defaults are filled by convert_HF.py from rope_parameters
                 "max_position_embeddings": 131072,
             },
@@ -496,6 +497,7 @@ MODEL_OVERRIDES = {
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
+                "attn_scaling": 1.0,
                 # rope_config defaults are filled by convert_HF.py from rope_parameters
                 "max_position_embeddings": 131072,
             },

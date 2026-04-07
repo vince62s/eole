@@ -387,6 +387,14 @@ def _build_gemma4_config(config, model_config):
     # Both text and vision Gemma4 attention apply RMSNorm (no scale) to value states.
     model_config.setdefault("decoder", {})["value_norm"] = True
 
+    # --- 7. num_kv_shared_layers (Gemma4-E2B cross-layer KV sharing) ---
+    # The last num_kv_shared_layers decoder layers act as KV consumers: they
+    # compute their own Query but reuse the Key/Value from the provider layer.
+    # These layers have no k_proj / v_proj weights in the HF checkpoint.
+    num_kv_shared = config.get("num_kv_shared_layers", 0)
+    if num_kv_shared:
+        model_config.setdefault("decoder", {})["num_kv_shared_layers"] = num_kv_shared
+
     return model_config
 
 

@@ -6,7 +6,6 @@ from eole.inputters.inputter import vocabs_to_dict
 from sentencepiece import SentencePieceProcessor
 import os
 from safetensors.torch import save_file
-from eole.constants import DefaultTokens
 
 # from transformers import T5ForConditionalGeneration
 
@@ -234,7 +233,7 @@ class T5Converter(BaseBin):
 
         with open(os.path.join(args.output, "vocab.txt"), "w", encoding="utf-8") as vocabfile:
             for tok in vocab_dict["src"]:
-                vocabfile.write(tok.replace("\n", DefaultTokens.SEP) + "\n")
+                vocabfile.write(tok + "\n")
 
         position_encoding = {
             "position_encoding_type": "Relative",

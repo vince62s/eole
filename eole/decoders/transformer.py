@@ -54,7 +54,7 @@ class TransformerDecoderLayer(nn.Module):
         running_config (TrainingConfig / InferenceConfig)
     """
 
-    def __init__(self, decoder_config, idx: int, running_config=None):
+    def __init__(self, decoder_config, idx: int, running_config=None, is_kv_shared: bool = False):
         super(TransformerDecoderLayer, self).__init__()
         self.parallel_residual = decoder_config.parallel_residual
         self.shared_layer_norm = decoder_config.shared_layer_norm
@@ -62,6 +62,8 @@ class TransformerDecoderLayer(nn.Module):
         self.full_context_alignment = decoder_config.full_context_alignment
         self.alignment_heads = decoder_config.alignment_heads
         self.ffn_layernorm = decoder_config.ffn_layernorm
+        # Whether this layer borrows K/V from a provider layer (Gemma4-E2B).
+        self.is_kv_shared = is_kv_shared
 
         # Determine the layer type for hybrid architectures (e.g. Qwen3.5, Gemma4).
         layer_types = getattr(decoder_config, "layer_types", None)
@@ -90,6 +92,7 @@ class TransformerDecoderLayer(nn.Module):
             self.self_attn = SelfMHA(
                 attn_config,
                 running_config=running_config,
+                is_kv_shared=is_kv_shared,
             )
         if decoder_config.with_cross_attn:
             self.precontext_layernorm = LayerNorm[decoder_config.layer_norm](
@@ -348,6 +351,9 @@ class TransformerDecoderLayer(nn.Module):
         cache_seqlens = kwargs.pop("cache_seqlens", None)
         cache_slice = kwargs.pop("cache_slice", None)
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
+        # shared_kv: (key, value) tensors from the provider layer, passed by
+        # TransformerDecoder for KV-shared layers during training (no KV cache).
+        shared_kv = kwargs.pop("shared_kv", None)
         norm_layer_in = self.input_layernorm(layer_in)
 
         if self.layer_type == "linear_attention":
@@ -362,6 +368,7 @@ class TransformerDecoderLayer(nn.Module):
                 cache_seqlens=cache_seqlens,
                 cache_slice=cache_slice,
                 pos_ids_2d=pos_ids_2d,
+                shared_kv=shared_kv,
             )
 
         if self.dropout_p > 0:
@@ -431,14 +438,23 @@ class TransformerDecoder(DecoderBase):
         else:
             self.rope_local = None
         self.interleave_local = getattr(decoder_config.rope_config, "interleave_local", 0) or 1
+
+        # KV-sharing (Gemma4-E2B): the last num_kv_shared_layers layers are "consumers"
+        # that borrow K/V from the provider layer just before them.
+        num_kv_shared = getattr(decoder_config, "num_kv_shared_layers", 0)
+        n_total = decoder_config.layers
+        # provider_idx = index of the last non-shared layer; -1 when disabled.
+        self.kv_provider_idx = (n_total - num_kv_shared - 1) if num_kv_shared > 0 else -1
+
         self.transformer_layers = nn.ModuleList(
             [
                 TransformerDecoderLayer(
                     decoder_config,
                     running_config=running_config,
                     idx=i,
+                    is_kv_shared=(num_kv_shared > 0 and i > self.kv_provider_idx),
                 )
-                for i in range(decoder_config.layers)
+                for i in range(n_total)
             ]
         )
         self.layer_norm = LayerNorm[decoder_config.layer_norm](decoder_config.hidden_size, eps=decoder_config.norm_eps)
@@ -518,6 +534,11 @@ class TransformerDecoder(DecoderBase):
         Mirrors ``Gemma4TextModel.get_per_layer_inputs`` +
         ``Gemma4TextModel.project_per_layer_inputs``.
 
+        The HF implementation combines token embeddings and the model projection
+        first, then applies ``per_layer_projection_norm`` to the combined result:
+            combined = (token_emb + model_proj) * sqrt(0.5)
+            return per_layer_projection_norm(combined)
+
         Args:
             emb (Tensor): decoder input embeddings ``(B, S, hidden_size)``.
             src_ids (Tensor | None): token IDs ``(B, S)``, or ``None``.
@@ -531,16 +552,17 @@ class TransformerDecoder(DecoderBase):
         # Model-level projection from embeddings (always available)
         model_proj = self.per_layer_model_projection(emb) * self.per_layer_model_projection_scale
         model_proj = model_proj.reshape(*emb.shape[:-1], n_layers, hidden_pli)
-        model_proj = self.per_layer_projection_norm(model_proj)
 
         if src_ids is not None:
             token_emb = self.embed_tokens_per_layer(src_ids) * self.embed_tokens_per_layer_scale
             token_emb = token_emb.reshape(*src_ids.shape, n_layers, hidden_pli)
-            return (model_proj + token_emb) * self.per_layer_input_combine_scale
+            # Combine token embedding and model projection, then normalize (HF order).
+            combined = (token_emb + model_proj) * self.per_layer_input_combine_scale
+        else:
+            # src_ids not available: fall back to model-projection only.
+            combined = model_proj
 
-        # src_ids not available (e.g. non-Gemma4 callers that don't supply token IDs):
-        # fall back to model-projection only (token embedding contribution omitted).
-        return model_proj
+        return self.per_layer_projection_norm(combined)
 
     def _compile_decoder(self, emb=None, enc_out=None, src_pad_mask=None, tgt_pad_mask=None, fn_tile=None):
 
@@ -1180,6 +1202,12 @@ class TransformerDecoder(DecoderBase):
         pos_ids_2d = kwargs.pop("pos_ids_2d", None)
         attn_aligns = []
 
+        # For KV-shared layers (Gemma4-E2B): track the provider's K/V tensors so
+        # they can be forwarded to consumer layers during training (no KV cache).
+        # During inference the shared layers' caches are pre-linked to the provider's
+        # cache by _init_cache, so no explicit passing is needed.
+        provider_kv = None  # (key, value) tensors in blhd format from the provider layer
+
         for i, (layer, pos_emb) in enumerate(zip(self.transformer_layers, pos_emb_list)):
             if lin_attn_mask is not None and layer.layer_type == "linear_attention":
                 layer_attn_mask = lin_attn_mask
@@ -1192,6 +1220,18 @@ class TransformerDecoder(DecoderBase):
                 layer_attn_mask = attn_mask
             # Slice per-layer input for this specific layer (Gemma4 only; None for others).
             per_layer_input_i = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+
+            # Determine whether to pass/capture provider K/V (training only; kcache=None).
+            shared_kv_i = None
+            if self.kv_provider_idx >= 0 and self.cache_seqlens is None:
+                if i == self.kv_provider_idx:
+                    # Provider layer: after the call we capture its K/V from the
+                    # self_attn module's internal _captured_kv attribute.
+                    layer.self_attn._capture_kv = True
+                    provider_kv = None  # will be set after the call
+                elif layer.is_kv_shared:
+                    shared_kv_i = provider_kv
+
             emb, attn = layer(
                 emb.clone() if (EOLE_COMPILE_MODE == "2" and EOLE_TORCH_COMPILE) else emb,
                 enc_out=enc_out,
@@ -1203,7 +1243,13 @@ class TransformerDecoder(DecoderBase):
                 cache_slice=cache_slice,
                 pos_ids_2d=pos_ids_2d,
                 per_layer_input=per_layer_input_i,
+                shared_kv=shared_kv_i,
             )
+
+            # Retrieve the captured K/V from the provider layer (training only).
+            if self.kv_provider_idx >= 0 and i == self.kv_provider_idx and self.cache_seqlens is None:
+                provider_kv = getattr(layer.self_attn, "_captured_kv", None)
+                layer.self_attn._capture_kv = False
             if all_cross_attns is not None and attn is not None:
                 all_cross_attns.append(attn)
             if with_align:
@@ -1286,7 +1332,10 @@ class TransformerDecoder(DecoderBase):
                     dtype=dtype,
                     device=device,
                 )
-            else:
+            elif not layer.is_kv_shared:
+                # Normal layer: allocate its own K/V cache.
+                # KV-shared layers are intentionally skipped here; they will
+                # have their kcache/vcache set by the linking step below.
                 heads_kv = layer.self_attn.heads_kv
                 dph = layer.self_attn.dim_per_head
                 layer.self_attn.kcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
@@ -1296,10 +1345,24 @@ class TransformerDecoder(DecoderBase):
                     # prefill context KV with encoder out
                     layer.context_attn._prefill_cache(enc_out)
 
+        # KV-shared layers: link their caches to the provider's cache so that
+        # they always see the up-to-date K/V without any additional cache write.
+        if self.kv_provider_idx >= 0:
+            provider_attn = self.transformer_layers[self.kv_provider_idx].self_attn
+            for layer in self.transformer_layers:
+                if layer.is_kv_shared and layer.self_attn is not None:
+                    layer.self_attn.kcache = provider_attn.kcache
+                    layer.self_attn.vcache = provider_attn.vcache
+                    layer.self_attn.cache_leftpad = provider_attn.cache_leftpad
+
     def _extend_cache(self, threshold=1, addzeros=32):
         if self.dynamic_shapes and (self.cache_len_tgt - self.cache_seqlens[0].item()) < threshold:
             for layer in self.transformer_layers:
                 if layer.layer_type == "linear_attention":
+                    continue
+                if layer.is_kv_shared:
+                    # Shared layers' cache is the same tensor as the provider's;
+                    # it will be replaced when the provider layer is extended.
                     continue
                 b, l, h, d = layer.self_attn.kcache.shape
                 extend = torch.zeros(
@@ -1312,6 +1375,13 @@ class TransformerDecoder(DecoderBase):
             b, _ = self.left_pad_attn_mask.shape
             extend = torch.ones(b, addzeros, device=self.left_pad_attn_mask.device, dtype=torch.bool)
             self.left_pad_attn_mask = torch.cat([self.left_pad_attn_mask, extend], dim=1)
+            # Re-link shared layers to the (now new) provider cache tensors.
+            if self.kv_provider_idx >= 0:
+                provider_attn = self.transformer_layers[self.kv_provider_idx].self_attn
+                for layer in self.transformer_layers:
+                    if layer.is_kv_shared and layer.self_attn is not None:
+                        layer.self_attn.kcache = provider_attn.kcache
+                        layer.self_attn.vcache = provider_attn.vcache
 
     def _disable_cache(self):
         self.left_pad_attn_mask = None
@@ -1321,8 +1391,17 @@ class TransformerDecoder(DecoderBase):
             if layer.layer_type == "linear_attention":
                 layer.linear_attn.conv_state = None
                 layer.linear_attn.recurrent_state = None
-            else:
+            elif not layer.is_kv_shared:
                 layer.self_attn.kcache, layer.self_attn.vcache = None, None
                 layer.self_attn.cache_leftpad = None
                 if layer.context_attn:
                     layer.context_attn.kcache, layer.context_attn.vcache = None, None
+            else:
+                # KV-shared layer: its kcache/vcache attributes are Python
+                # references that point to the provider's tensors.  The
+                # provider's branch above already set those tensors to None, but
+                # each Python attribute is independent, so we must null them out
+                # here too to release the reference to the tensor.
+                layer.self_attn.kcache = None
+                layer.self_attn.vcache = None
+                layer.self_attn.cache_leftpad = None

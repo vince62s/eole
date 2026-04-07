@@ -439,6 +439,15 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
         description="Vocabulary size for the per-layer input embedding table (Gemma4). "
         "Only used when hidden_size_per_layer_input > 0.",
     )
+    num_kv_shared_layers: int = Field(
+        default=0,
+        description="Number of trailing decoder layers that share their Key/Value projections "
+        "with the provider layer (Gemma4-E2B cross-layer KV sharing). "
+        "When > 0, the last num_kv_shared_layers layers act as 'KV consumers': they compute "
+        "their own Query but reuse the Key/Value tensors from the provider layer at index "
+        "(num_hidden_layers - num_kv_shared_layers - 1). "
+        "These layers have no k_proj/v_proj weights in the checkpoint.",
+    )
 
     @model_validator(mode="after")
     def _validate_transformer_decoder_config(self):
