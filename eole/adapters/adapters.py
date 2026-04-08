@@ -239,6 +239,58 @@ class Gemma3MultiModalProjector(BaseVisionAdapter):
         return self.w_in(self.norm(x)).type_as(x)
 
 
+class Gemma4MultiModalProjector(BaseVisionAdapter):
+    """
+    Multi-modal projector used in Gemma 4 models.
+
+    Downsamples the vision encoder patch grid using average pooling with a
+    fixed kernel size (pooling_kernel_size, typically 3 for Gemma4), followed
+    by RMS normalization (no learnable scale) and a linear projection.
+    Unlike Gemma3MultiModalProjector this uses pooling_kernel_size directly
+    from the config instead of deriving it from image_size, supporting
+    variable-resolution inputs.
+    """
+
+    def __init__(self, model_config, running_config=None):
+        super().__init__()
+        in_dim = model_config.encoder.hidden_size
+        out_dim = model_config.decoder.hidden_size
+        kernel = model_config.encoder.pooling_kernel_size
+
+        self.w_in = nn.Linear(in_dim, out_dim, bias=False)
+        self.norm = LayerNorm["rms"](in_dim)
+        self.pool = nn.AvgPool2d(kernel, stride=kernel)
+
+    def forward(self, x, image_sizes=None):
+        """
+        Args:
+            x: Vision encoder output of shape (B, N, D). N must be H*W where
+               H and W are the number of patches in each spatial dimension.
+               For variable-resolution inputs image_sizes (B, 2) provides
+               (height_px, width_px) to recover non-square grids; when
+               image_sizes is None a square grid is assumed.
+            image_sizes: Optional tensor of shape (B, 2) with (H_px, W_px).
+
+        Returns:
+            Tensor of shape (B, tokens_after_pool, decoder_hidden_size).
+        """
+        b, n, d = x.shape
+        if image_sizes is not None:
+            # image_sizes holds pixel dimensions; we infer the patch grid from
+            # the total patch count N and the pixel aspect ratio.
+            h_px, w_px = image_sizes[0, 0].item(), image_sizes[0, 1].item()
+            aspect = w_px / h_px if h_px > 0 else 1.0
+            # h_patches * w_patches == n and w_patches / h_patches ~= aspect
+            h_patches = int(round((n / aspect) ** 0.5))
+            w_patches = n // h_patches
+        else:
+            h_patches = int(n**0.5)
+            w_patches = h_patches
+        x = x.transpose(1, 2).view(b, d, h_patches, w_patches)
+        x = self.pool(x).flatten(2).transpose(1, 2).contiguous()
+        return self.w_in(self.norm(x)).type_as(x)
+
+
 class DeepSeekOCRProjector(BaseVisionAdapter):
     """
     Projector used in DeepSeek OCR models.

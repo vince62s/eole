@@ -497,7 +497,7 @@ MODEL_OVERRIDES = {
             "embeddings": {
                 "normalize": True,
             },
-            "adapter": "gemma3",
+            "adapter": "gemma4",
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
@@ -531,6 +531,8 @@ MODEL_OVERRIDES = {
                 "patch_conv_bias": False,
                 # Each Gemma4VisionEncoderLayer has pre/post_feedforward_layernorm
                 "ffn_layernorm": True,
+                # Gemma4 uses avg-pool with kernel_size=3 in the multimodal projector
+                "pooling_kernel_size": 3,
                 # position_embedding_size and standardize are set dynamically in convert_HF.py
                 # from vision_config (position_embedding_size and standardize fields).
             },

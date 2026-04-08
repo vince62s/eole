@@ -537,6 +537,7 @@ class VisionEncoderConfig(TransformerConfig, EncoderConfig):
 
     encoder_sam: bool = False  # True for DeepSeekOCR (Segment Anything Model as 1st step)
     use_class_embedding: bool = False
+    pooling_kernel_size: int = 1  # avg-pool kernel for vision adapter (1=no pool, 3=Gemma4)
 
     # Qwen3.5 VL / Qwen3 VL style options
     temporal_patch_size: int = Field(

@@ -163,6 +163,7 @@ class DynamicDatasetIter(torch.utils.data.IterableDataset):
         image_patch_size=16,
         image_size=1024,
         adapter="llava",
+        pooling_kernel_size=1,
         sample_rate=16000,
         num_mel_bins=80,
         n_fft=400,
@@ -204,6 +205,7 @@ class DynamicDatasetIter(torch.utils.data.IterableDataset):
         self.image_patch_size = image_patch_size
         self.image_size = image_size
         self.adapter = adapter
+        self.pooling_kernel_size = pooling_kernel_size
         self.sample_rate = sample_rate
         self.num_mel_bins = num_mel_bins
         self.n_fft = n_fft
@@ -264,6 +266,7 @@ class DynamicDatasetIter(torch.utils.data.IterableDataset):
             image_size = config.model.encoder.image_size
         except AttributeError:
             image_size = 0
+        pooling_kernel_size = getattr(getattr(config.model, "encoder", None), "pooling_kernel_size", 1)
         # Audio model params (e.g. Whisper)
         _encoder = getattr(config.model, "encoder", None)
         sample_rate = getattr(_encoder, "sample_rate", 16000)
@@ -294,6 +297,7 @@ class DynamicDatasetIter(torch.utils.data.IterableDataset):
             image_patch_size=image_patch_size,
             image_size=image_size,
             adapter=getattr(config.model, "adapter", None),
+            pooling_kernel_size=pooling_kernel_size,
             sample_rate=sample_rate,
             num_mel_bins=num_mel_bins,
             n_fft=n_fft,
@@ -318,6 +322,7 @@ class DynamicDatasetIter(torch.utils.data.IterableDataset):
             image_patch_size=self.image_patch_size,
             image_size=self.image_size,
             adapter=self.adapter,
+            pooling_kernel_size=self.pooling_kernel_size,
             sample_rate=self.sample_rate,
             num_mel_bins=self.num_mel_bins,
             n_fft=self.n_fft,
