@@ -576,6 +576,11 @@ def build_config_dict(hf):
                     ),
                     # Gemma4VisionAttention applies RMSNorm (no scale) to value states
                     "value_norm": True,
+                    # Gemma4VisionPatchEmbedder has a learnable 2D position embedding table
+                    # [2, position_embedding_size, hidden_size] added to patch embeddings.
+                    "position_embedding_size": _v_pos_emb_size or None,
+                    # Gemma4VisionModel may apply output standardization (std_bias/std_scale)
+                    "standardize": vision_config.get("standardize", False),
                 }
             )
 

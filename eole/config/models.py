@@ -551,6 +551,18 @@ class VisionEncoderConfig(TransformerConfig, EncoderConfig):
         "position_encoding_type=Rotary both absolute embeddings and "
         "2D RoPE are applied.",
     )
+    position_embedding_size: int | None = Field(
+        default=None,
+        description="Size of the learnable 2D position embedding table per axis "
+        "(Gemma4 uses 10240). When set, a parameter of shape "
+        "[2, position_embedding_size, hidden_size] is created and added to "
+        "patch embeddings using (x, y) patch coordinates.",
+    )
+    standardize: bool = Field(
+        default=False,
+        description="When True, apply learned std_bias/std_scale normalization "
+        "to the encoder output (Gemma4 31B dense model).",
+    )
 
 
 # use Field with default= + description would be more readable

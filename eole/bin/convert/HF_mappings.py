@@ -462,8 +462,12 @@ MODEL_OVERRIDES = {
         ),
         # No patch_conv bias (input_proj has bias=False).
         # No post_layernorm at Gemma4VisionModel level.
-        # Gemma4 vision uses a 2D position table (position_embedding_table [2,P,H]) rather
-        # than a 1D Embedding; EOLE uses 2D RoPE (PositionEncodingType.Rotary) instead.
+        # Gemma4 vision uses a 2D learnable position embedding table [2, P, H] in
+        # Gemma4VisionPatchEmbedder; mapped to encoder.position_embedding_table.
+        "encoder.position_embedding_table": "model.vision_tower.patch_embedder.position_embedding_table",
+        # Gemma4VisionModel optional output standardization buffers (standardize=True).
+        "encoder.std_bias": "model.vision_tower.std_bias",
+        "encoder.std_scale": "model.vision_tower.std_scale",
         "encoder": {
             ".self_attn.linear_query.": ".self_attn.q_proj.linear.",
             ".self_attn.linear_keys.": ".self_attn.k_proj.linear.",
@@ -478,9 +482,9 @@ MODEL_OVERRIDES = {
             ".mlp.up_proj.": ".mlp.up_proj.linear.",
             ".input_layernorm.": ".input_layernorm.",
             ".post_attention_layernorm.": ".post_attention_layernorm.",
-            # Note: Gemma4 vision layers also have pre/post_feedforward_layernorm but
-            # EOLE's TransformerEncoderLayer only has 2 layernorms (no ffn_layernorm
-            # support in the encoder), so those HF weights are intentionally skipped.
+            # Gemma4 vision ffn layernorms (pre/post feedforward)
+            ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
+            ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
         },
         # --- multimodal adapter (Gemma4MultimodalEmbedder inside Gemma4Model.embed_vision) ---
         # embedding_projection is nn.Linear(multimodal_hidden, text_hidden), no transpose.
@@ -525,6 +529,10 @@ MODEL_OVERRIDES = {
                 # post_attention_layernorm is handled inside each encoder layer.
                 "layernorm_post": False,
                 "patch_conv_bias": False,
+                # Each Gemma4VisionEncoderLayer has pre/post_feedforward_layernorm
+                "ffn_layernorm": True,
+                # position_embedding_size and standardize are set dynamically in convert_HF.py
+                # from vision_config (position_embedding_size and standardize fields).
             },
         },
     },

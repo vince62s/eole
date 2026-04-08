@@ -213,6 +213,17 @@ class VisionEncoder(EncoderBase):
         else:
             self.pos_embed = None
 
+        # Gemma4: learnable 2D position embedding table of shape
+        # [2, position_embedding_size, hidden_size] added to patch embeddings.
+        # Each axis (x and y) is looked up independently via one-hot and summed.
+        pos_emb_size = getattr(encoder_config, "position_embedding_size", None)
+        if pos_emb_size:
+            self.position_embedding_table = nn.Parameter(
+                torch.ones(2, pos_emb_size, encoder_config.hidden_size)
+            )
+        else:
+            self.position_embedding_table = None
+
         # Patch conv: Conv3D when temporal_patch_size > 1, Conv2D otherwise
         if encoder_config.temporal_patch_size > 1:
             self.patch_conv = nn.Conv3d(
@@ -260,6 +271,14 @@ class VisionEncoder(EncoderBase):
         else:
             self.post_layernorm = None
 
+        # Gemma4: optional output standardization: out = (out - std_bias) * std_scale
+        if getattr(encoder_config, "standardize", False):
+            self.register_buffer("std_bias", torch.zeros(encoder_config.hidden_size))
+            self.register_buffer("std_scale", torch.ones(encoder_config.hidden_size))
+        else:
+            self.std_bias = None
+            self.std_scale = None
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -306,6 +325,10 @@ class VisionEncoder(EncoderBase):
         # Post-processing
         if self.post_layernorm is not None:
             out = self.post_layernorm(out)
+
+        # Gemma4: optional standardization: (out - std_bias) * std_scale
+        if self.std_bias is not None:
+            out = (out - self.std_bias) * self.std_scale
 
         return out, None
 
@@ -497,6 +520,21 @@ class VisionEncoder(EncoderBase):
                 [self._interp_pos_embed(p.shape[-2], p.shape[-1]) for p in patch_embeds_list],
                 dim=0,
             )
+            patch_embeds = patch_embeds + pos_emb
+
+        # Gemma4: add learned 2D position embeddings via position_embedding_table.
+        # positions is a list of (N, 2) tensors with (x, y) coordinates per image.
+        # The table has shape [2, P, H] where axis 0 = x, axis 1 = y.
+        if self.position_embedding_table is not None:
+            all_pos = torch.cat(positions, dim=0).to(self.device)  # (total_patches, 2)
+            P = self.position_embedding_table.shape[1]
+            x_hot = F.one_hot(all_pos[:, 0].clamp(min=0), num_classes=P).to(
+                self.position_embedding_table.dtype
+            )  # (N, P)
+            y_hot = F.one_hot(all_pos[:, 1].clamp(min=0), num_classes=P).to(
+                self.position_embedding_table.dtype
+            )  # (N, P)
+            pos_emb = x_hot @ self.position_embedding_table[0] + y_hot @ self.position_embedding_table[1]
             patch_embeds = patch_embeds + pos_emb
 
         # Add batch dimension
