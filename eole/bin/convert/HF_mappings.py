@@ -458,7 +458,11 @@ MODEL_OVERRIDES = {
         "encoder_layer_prefix": "model.vision_tower.encoder.layers.",
         "encoder.patch_conv.weight": (
             "model.vision_tower.patch_embedder.input_proj.weight",
-            ".view(w.shape[0], 3, int(round((w.shape[1]/3)**0.5)), int(round((w.shape[1]/3)**0.5)))",
+            # HF input_proj.weight is (H, P_h*P_w*C) where the patch pixels are in
+            # (P_h, P_w, C) order (channel-last per pixel).  EOLE's Conv2d kernel
+            # expects (H, C, P_h, P_w) — channel-first.  We must reshape+permute, not
+            # just view, to correctly re-order channels within each patch.
+            ".reshape(w.shape[0], int(round((w.shape[1]/3)**0.5)), int(round((w.shape[1]/3)**0.5)), 3).permute(0, 3, 1, 2).contiguous()",
         ),
         # No patch_conv bias (input_proj has bias=False).
         # No post_layernorm at Gemma4VisionModel level.

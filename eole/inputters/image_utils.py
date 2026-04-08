@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from PIL import Image, ImageOps
 from typing import Optional, Union
@@ -9,7 +10,7 @@ from eole.utils.logging import logger
 DATASET_MEAN = {
     "llava": (0.48145466, 0.4578275, 0.40821073),
     "gemma3": (0.5, 0.5, 0.5),
-    "gemma4": (0, 0, 0),
+    "gemma4": (0.5, 0.5, 0.5),
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.48145466, 0.4578275, 0.40821073),
     # Qwen3VL / Qwen3.5VL: from preprocessor_config.json image_mean
@@ -19,7 +20,7 @@ DATASET_MEAN = {
 DATASET_STD = {
     "llava": (0.26862954, 0.26130258, 0.27577711),
     "gemma3": (0.5, 0.5, 0.5),
-    "gemma4": (1, 1, 1),
+    "gemma4": (0.5, 0.5, 0.5),
     "deepseekocr": (0.5, 0.5, 0.5),
     "hunyuanocr": (0.26862954, 0.26130258, 0.27577711),
     # Qwen3VL / Qwen3.5VL: from preprocessor_config.json image_std
@@ -301,14 +302,16 @@ def process_image(image_path, adapter="llava", image_patch_size=16, image_size=1
     elif adapter == "gemma4":
         # Aspect-ratio-preserving resize: dimensions must be divisible by
         # patch_size * pooling_kernel_size (e.g. 16 * 3 = 48 for Gemma4).
+        # Use floor() to ensure we never exceed image_size (which determines
+        # the position_embedding_table bounds).
         stride = image_patch_size * pooling_kernel_size
         orig_w, orig_h = PILimage.size
         if image_size and image_size > 0:
             ratio = min(image_size / orig_w, image_size / orig_h)
         else:
             ratio = 1.0
-        new_w = max(stride, round(orig_w * ratio / stride) * stride)
-        new_h = max(stride, round(orig_h * ratio / stride) * stride)
+        new_w = max(stride, int(math.floor(orig_w * ratio / stride)) * stride)
+        new_h = max(stride, int(math.floor(orig_h * ratio / stride)) * stride)
         PILimage = PILimage.resize((new_w, new_h), resample=RESAMPLE[adapter], reducing_gap=None)
         w = new_w // image_patch_size
         h = new_h // image_patch_size

@@ -402,15 +402,8 @@ class HFLoader:
                             if k_key in store and v_key not in store:
                                 store[v_key] = store.get_tensor(k_key)
 
-            # Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False): no learnable
-            # weight tensor (effectively scale=1).  EOLE's Gemma3MultiModalProjector uses
-            # GemmaRMSNorm which computes x*(1+weight), so weight=0 gives the correct
-            # identity scaling.  Set it explicitly to avoid torch.empty garbage.
-            adapter_norm_key = "adapter.norm.weight"
-            if adapter_norm_key not in store:
-                enc_hidden = model_config.get("encoder", {}).get("hidden_size", None)
-                if enc_hidden is not None:
-                    store[adapter_norm_key] = torch.zeros(enc_hidden)
+            # Gemma4MultiModalProjector uses RMSNormNoScale (no learnable weight):
+            # do NOT inject any adapter.norm.weight — the module has no such parameter.
 
 
 # ---------------------------------------------------------------------------

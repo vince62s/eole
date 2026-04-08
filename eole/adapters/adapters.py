@@ -1,5 +1,6 @@
 """Vision adapters for multimodal models."""
 
+import math
 import torch
 import torch.nn as nn
 
@@ -244,8 +245,10 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
     Multi-modal projector used in Gemma 4 models.
 
     Downsamples the vision encoder patch grid using average pooling with a
-    fixed kernel size (pooling_kernel_size, typically 3 for Gemma4), followed
-    by RMS normalization (no learnable scale) and a linear projection.
+    fixed kernel size (pooling_kernel_size, typically 3 for Gemma4), then
+    scales by sqrt(hidden_size) (matching Gemma4VisionPooler), followed by
+    RMS normalization (no learnable scale, matching Gemma4MultimodalEmbedder)
+    and a linear projection.
     Unlike Gemma3MultiModalProjector this uses pooling_kernel_size directly
     from the config instead of deriving it from image_size, supporting
     variable-resolution inputs.
@@ -253,13 +256,18 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
 
     def __init__(self, model_config, running_config=None):
         super().__init__()
+        from eole.modules.rmsnorm import RMSNormNoScale
+
         in_dim = model_config.encoder.hidden_size
         out_dim = model_config.decoder.hidden_size
         kernel = model_config.encoder.pooling_kernel_size
 
         self.w_in = nn.Linear(in_dim, out_dim, bias=False)
-        self.norm = LayerNorm["rms"](in_dim)
+        # HF Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False):
+        # plain RMS normalisation with no learnable scale weight.
+        self.norm = RMSNormNoScale(in_dim)
         self.pool = nn.AvgPool2d(kernel, stride=kernel)
+        self.root_hidden_size = math.sqrt(in_dim)
 
     def forward(self, x, image_sizes=None):
         """
@@ -287,14 +295,22 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
             # Adjust w_patches to make h_patches * w_patches == n exactly
             w_patches = n // h_patches
             if h_patches * w_patches != n:
-                # Fallback: brute-force search for the correct factorization
-                h_patches = int(n**0.5)
-                w_patches = h_patches
+                # Find the factor of n closest to sqrt(n / aspect).
+                best_h, best_diff = 1, float("inf")
+                for h in range(1, n + 1):
+                    if n % h == 0:
+                        diff = abs(h - (n / aspect) ** 0.5)
+                        if diff < best_diff:
+                            best_diff, best_h = diff, h
+                h_patches = best_h
+                w_patches = n // h_patches
         else:
             h_patches = int(n**0.5)
             w_patches = h_patches
         x = x.transpose(1, 2).view(b, d, h_patches, w_patches)
         x = self.pool(x).flatten(2).transpose(1, 2).contiguous()
+        # Scale by sqrt(hidden_size) to match HF Gemma4VisionPooler behaviour.
+        x = x * self.root_hidden_size
         return self.w_in(self.norm(x)).type_as(x)
 
 
