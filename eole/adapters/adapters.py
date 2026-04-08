@@ -269,6 +269,9 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
                For variable-resolution inputs image_sizes (B, 2) provides
                (height_px, width_px) to recover non-square grids; when
                image_sizes is None a square grid is assumed.
+
+               Note: all images in the batch are assumed to have the same
+               spatial dimensions (same h_patches, w_patches).
             image_sizes: Optional tensor of shape (B, 2) with (H_px, W_px).
 
         Returns:
@@ -276,13 +279,17 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
         """
         b, n, d = x.shape
         if image_sizes is not None:
-            # image_sizes holds pixel dimensions; we infer the patch grid from
-            # the total patch count N and the pixel aspect ratio.
+            # image_sizes holds pixel dimensions; derive patch grid from aspect ratio.
             h_px, w_px = image_sizes[0, 0].item(), image_sizes[0, 1].item()
             aspect = w_px / h_px if h_px > 0 else 1.0
             # h_patches * w_patches == n and w_patches / h_patches ~= aspect
-            h_patches = int(round((n / aspect) ** 0.5))
+            h_patches = max(1, int(round((n / aspect) ** 0.5)))
+            # Adjust w_patches to make h_patches * w_patches == n exactly
             w_patches = n // h_patches
+            if h_patches * w_patches != n:
+                # Fallback: brute-force search for the correct factorization
+                h_patches = int(n**0.5)
+                w_patches = h_patches
         else:
             h_patches = int(n**0.5)
             w_patches = h_patches
