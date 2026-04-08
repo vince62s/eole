@@ -525,18 +525,22 @@ class VisionEncoder(EncoderBase):
             patch_embeds = patch_embeds + pos_emb
 
         # Gemma4: add learned 2D position embeddings via position_embedding_table.
-        # positions is a list of (N, 2) tensors with (x, y) coordinates per image.
-        # The table has shape [2, P, H] where axis 0 = x, axis 1 = y.
+        # positions is a list of 1D tensors with flat indices (row * max_width + col)
+        # produced by position_ids_in_meshgrid.  Convert back to (row, col) coords
+        # so each axis can be looked up independently in the [2, P, H] table.
         if self.position_embedding_table is not None:
-            all_pos = torch.cat(positions, dim=0).to(self.device)  # (total_patches, 2)
+            all_flat = torch.cat(positions, dim=0).to(self.device)  # (total_patches,)
+            max_width = self.encoder_config.image_size // self.encoder_config.patch_size
             P = self.position_embedding_table.shape[1]
-            x_hot = F.one_hot(all_pos[:, 0].clamp(min=0), num_classes=P).to(
+            row = (all_flat // max_width).clamp(min=0)  # height / row coordinate
+            col = (all_flat % max_width).clamp(min=0)  # width / col coordinate
+            row_hot = F.one_hot(row, num_classes=P).to(
                 self.position_embedding_table.dtype
             )  # (N, P)
-            y_hot = F.one_hot(all_pos[:, 1].clamp(min=0), num_classes=P).to(
+            col_hot = F.one_hot(col, num_classes=P).to(
                 self.position_embedding_table.dtype
             )  # (N, P)
-            pos_emb = x_hot @ self.position_embedding_table[0] + y_hot @ self.position_embedding_table[1]
+            pos_emb = row_hot @ self.position_embedding_table[0] + col_hot @ self.position_embedding_table[1]
             patch_embeds = patch_embeds + pos_emb
 
         # Add batch dimension
