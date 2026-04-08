@@ -532,8 +532,8 @@ class VisionEncoder(EncoderBase):
             all_flat = torch.cat(positions, dim=0).to(self.device)  # (total_patches,)
             max_width = self.encoder_config.image_size // self.encoder_config.patch_size
             P = self.position_embedding_table.shape[1]
-            row = (all_flat // max_width).clamp(min=0)  # height / row coordinate
-            col = (all_flat % max_width).clamp(min=0)  # width / col coordinate
+            row = all_flat // max_width  # height / row coordinate
+            col = all_flat % max_width  # width / col coordinate
             row_hot = F.one_hot(row, num_classes=P).to(
                 self.position_embedding_table.dtype
             )  # (N, P)
