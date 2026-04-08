@@ -216,6 +216,8 @@ class VisionEncoder(EncoderBase):
         # Gemma4: learnable 2D position embedding table of shape
         # [2, position_embedding_size, hidden_size] added to patch embeddings.
         # Each axis (x and y) is looked up independently via one-hot and summed.
+        # Initialized with ones to match HF's Gemma4PreTrainedModel._init_weights
+        # (pre-trained weights will overwrite this at load time).
         pos_emb_size = getattr(encoder_config, "position_embedding_size", None)
         if pos_emb_size:
             self.position_embedding_table = nn.Parameter(
