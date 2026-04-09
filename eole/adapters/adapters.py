@@ -261,6 +261,8 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
         in_dim = model_config.encoder.hidden_size
         out_dim = model_config.decoder.hidden_size
         kernel = model_config.encoder.pooling_kernel_size
+        # patch_size needed for exact patch-grid recovery from pixel dimensions
+        self.patch_size = model_config.encoder.patch_size or 16
 
         self.w_in = nn.Linear(in_dim, out_dim, bias=False)
         # HF Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False):
@@ -272,46 +274,47 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
     def forward(self, x, image_sizes=None):
         """
         Args:
-            x: Vision encoder output of shape (B, N, D). N must be H*W where
-               H and W are the number of patches in each spatial dimension.
-               For variable-resolution inputs image_sizes (B, 2) provides
-               (height_px, width_px) to recover non-square grids; when
-               image_sizes is None a square grid is assumed.
-
-               Note: all images in the batch are assumed to have the same
-               spatial dimensions (same h_patches, w_patches).
-            image_sizes: Optional tensor of shape (B, 2) with (H_px, W_px).
+            x: Vision encoder output of shape (1, sum_i N_i, D) for packed
+               multi-image inputs, or (B, N, D) for uniform single images.
+               The encoder concatenates all images into a single sequence
+               dimension (batch=1), so we must split by image_sizes.
+            image_sizes: Tensor of shape (B, 2) with (H_px, W_px) per image.
 
         Returns:
             Tensor of shape (B, tokens_after_pool, decoder_hidden_size).
         """
-        b, n, d = x.shape
-        if image_sizes is not None:
-            # image_sizes holds pixel dimensions; derive patch grid from aspect ratio.
-            h_px, w_px = image_sizes[0, 0].item(), image_sizes[0, 1].item()
-            aspect = w_px / h_px if h_px > 0 else 1.0
-            # h_patches * w_patches == n and w_patches / h_patches ~= aspect
-            h_patches = max(1, int(round((n / aspect) ** 0.5)))
-            # Adjust w_patches to make h_patches * w_patches == n exactly
-            w_patches = n // h_patches
-            if h_patches * w_patches != n:
-                # Find the factor of n closest to sqrt(n / aspect).
-                best_h, best_diff = 1, float("inf")
-                for h in range(1, n + 1):
-                    if n % h == 0:
-                        diff = abs(h - (n / aspect) ** 0.5)
-                        if diff < best_diff:
-                            best_diff, best_h = diff, h
-                h_patches = best_h
-                w_patches = n // h_patches
+        _, _, d = x.shape
+        if image_sizes is not None and len(image_sizes) > 0:
+            # Packed input: split concatenated sequence into per-image slices.
+            # Use exact patch_size division (not aspect-ratio heuristic) to
+            # recover the correct patch grid for each image independently,
+            # matching HF Gemma4VisionPooler per-image pooling semantics.
+            seq = x.squeeze(0)  # (sum_N_i, D)
+            pooled_parts = []
+            for i in range(len(image_sizes)):
+                h_px = int(image_sizes[i, 0].item())
+                w_px = int(image_sizes[i, 1].item())
+                h_p = h_px // self.patch_size
+                w_p = w_px // self.patch_size
+                n_i = h_p * w_p
+                img_seq = seq[:n_i]
+                seq = seq[n_i:]
+                # (n_i, D) → (1, D, h_p, w_p) → pool → (1, tokens, D)
+                xi = img_seq.transpose(0, 1).view(1, d, h_p, w_p)
+                xi = self.pool(xi).flatten(2).transpose(1, 2)
+                pooled_parts.append(xi * self.root_hidden_size)
+            # (N_images, tokens_per_image, D)
+            pooled = torch.cat(pooled_parts, dim=0)
         else:
-            h_patches = int(n**0.5)
-            w_patches = h_patches
-        x = x.transpose(1, 2).view(b, d, h_patches, w_patches)
-        x = self.pool(x).flatten(2).transpose(1, 2).contiguous()
-        # Scale by sqrt(hidden_size) to match HF Gemma4VisionPooler behaviour.
-        x = x * self.root_hidden_size
-        return self.w_in(self.norm(x)).type_as(x)
+            # Fallback: single image, assume square patch grid.
+            b, n, d_in = x.shape
+            h_p = int(n**0.5)
+            w_p = h_p
+            xi = x.transpose(1, 2).view(b, d_in, h_p, w_p)
+            pooled = self.pool(xi).flatten(2).transpose(1, 2) * self.root_hidden_size
+        # Scale by sqrt(hidden_size) to match HF Gemma4VisionPooler behaviour,
+        # then apply RMS norm + linear projection.
+        return self.w_in(self.norm(pooled)).type_as(pooled)
 
 
 class DeepSeekOCRProjector(BaseVisionAdapter):
