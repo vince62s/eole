@@ -21,7 +21,7 @@ class TestGemma4MultiModalProjector(unittest.TestCase):
         projector = _build_projector(hidden_size=8, patch_size=2, pooling_kernel_size=2)
         # Two images, each 4x4 px -> 2x2 patches -> 4 tokens/image before pooling.
         image_sizes = torch.tensor([[4, 4], [4, 4]])
-        x = torch.randn(1, 8, 8)  # packed: (1, 4+4, D)
+        x = torch.randn(1, 8, 8)  # packed: (1, 8 total tokens, 8 hidden_size)
 
         y = projector(x, image_sizes=image_sizes)
         self.assertEqual(y.shape, (2, 1, 8))

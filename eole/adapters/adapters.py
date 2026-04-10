@@ -306,7 +306,7 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
                 # Packed: x = (1, sum_i N_i, D)
                 if sum(counts) != x.size(1):
                     raise ValueError(
-                        f"Packed vision sequence length mismatch: got {x.size(1)}, expected {sum(counts)} from image_sizes"
+                        f"Packed vision sequence length mismatch: got {x.size(1)}, expected {sum(counts)} (sum of {counts}) from image_sizes"
                     )
                 seq = x.squeeze(0)
                 start = 0
@@ -333,7 +333,7 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
             b, n, d_in = x.shape
             h_p = int(n**0.5)
             if h_p * h_p != n:
-                raise ValueError(f"Cannot infer square patch grid from sequence length {n}")
+                raise ValueError(f"Cannot infer square patch grid: sequence length {n} is not a perfect square")
             if h_p % self.pool_kernel_size != 0:
                 raise ValueError(f"Inferred patch grid ({h_p}, {h_p}) not divisible by pooling kernel {self.pool_kernel_size}")
             xi = x.transpose(1, 2).reshape(b, d_in, h_p, h_p)
