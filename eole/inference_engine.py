@@ -1,5 +1,6 @@
 import os
 import json
+import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 from time import time
 import torch
@@ -10,6 +11,36 @@ from eole.utils.logging import init_logger
 from eole.utils.misc import get_device_type, configure_cuda_backends
 from eole.transforms import get_transforms_cls, make_transforms, TransformPipe
 from eole.predict import build_predictor  # moved to top-level (faster)
+
+
+class _ImageInjectingIterator:
+    """Wraps an inference iterator to inject pre-processed images into batches.
+
+    When images are provided via the serving API (e.g. base64 data-URLs in
+    OpenAI ``image_url`` content blocks), they are decoded and processed in
+    ``serve.py`` *before* the inference iterator is built.  This thin wrapper
+    attaches those numpy arrays to each emitted batch so that the downstream
+    predictor finds them in ``batch["images"]``.
+    """
+
+    def __init__(self, inner_iter, images):
+        self.inner_iter = inner_iter
+        # images: list of numpy arrays (C, H, W)
+        self.images = images
+
+    # Delegate attributes to inner iterator (e.g. transforms)
+    def __getattr__(self, name):
+        return getattr(self.inner_iter, name)
+
+    def __iter__(self):
+        device = getattr(self.inner_iter, "device", torch.device("cpu"))
+        for batch, bucket_idx in self.inner_iter:
+            if self.images and batch.get("images") is None:
+                batch["images"] = [
+                    torch.tensor(np.asarray(img), device=device, dtype=torch.float32)
+                    for img in self.images
+                ]
+            yield batch, bucket_idx
 
 
 class InferenceEngine:
@@ -91,20 +122,23 @@ class InferenceEngine:
         )
 
     def infer_list(
-        self, src: List[str], settings: Optional[Dict[str, Any]] = None
+        self, src: List[str], settings: Optional[Dict[str, Any]] = None,
+        images: Optional[List[Any]] = None,
     ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
         """List of strings inference."""
         settings = settings or {}
 
         if self.config.world_size <= 1:
             infer_iter = self._build_inference_iterator(src=src)
+            if images:
+                infer_iter = _ImageInjectingIterator(infer_iter, images)
             scores, estims, preds = self._predict(infer_iter, settings=settings)
         else:
             scores, estims, preds = self.infer_list_parallel(src, settings=settings)
 
         return scores, estims, preds
 
-    def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None):
+    def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None, images=None):
         """Stream inference results for a single input string.
 
         This is a generator that yields decoded text chunks as they are
@@ -119,6 +153,8 @@ class InferenceEngine:
             src (str): Single input string to run inference on.
             settings (dict, optional): Override inference settings
                 (e.g. ``temperature``, ``max_length``).
+            images (list, optional): Pre-processed image arrays to inject
+                into the inference batch.
 
         Yields:
             str: Decoded text chunks, one per generated token (or
@@ -315,7 +351,7 @@ class InferenceEnginePY(InferenceEngine):
 
         return self.predictor._score(infer_iter)
 
-    def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None):
+    def infer_list_stream(self, src: str, settings: Optional[Dict[str, Any]] = None, images=None):
         """Stream inference results for a single input string.
 
         Runs inference in a persistent thread-pool worker and yields decoded
@@ -330,6 +366,8 @@ class InferenceEnginePY(InferenceEngine):
             src (str): A single input string.
             settings (dict, optional): Override inference settings such as
                 ``temperature``, ``max_length``, ``top_k``, ``top_p``.
+            images (list, optional): Pre-processed image arrays to inject
+                into the inference batch.
 
         Yields:
             str: Decoded text chunks produced by the model.
@@ -361,6 +399,8 @@ class InferenceEnginePY(InferenceEngine):
         def _run_inference():
             try:
                 infer_iter = self._build_inference_iterator(src=[src])
+                if images:
+                    infer_iter = _ImageInjectingIterator(infer_iter, images)
                 self._predict(infer_iter, settings=settings, streamer=streamer)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(f"Streaming inference failed: {exc}")
