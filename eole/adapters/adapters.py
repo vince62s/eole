@@ -263,6 +263,7 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
         kernel = model_config.encoder.pooling_kernel_size
         # patch_size needed for exact patch-grid recovery from pixel dimensions
         self.patch_size = model_config.encoder.patch_size or 16
+        self.pool_kernel_size = kernel
 
         self.w_in = nn.Linear(in_dim, out_dim, bias=False)
         # HF Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False):
@@ -284,36 +285,62 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
             Tensor of shape (B, tokens_after_pool, decoder_hidden_size).
         """
         _, _, d = x.shape
+
+        def _pool_single_image(img_seq: torch.Tensor, h_p: int, w_p: int) -> torch.Tensor:
+            if h_p <= 0 or w_p <= 0:
+                raise ValueError(f"Invalid patch grid ({h_p}, {w_p})")
+            if h_p % self.pool_kernel_size != 0 or w_p % self.pool_kernel_size != 0:
+                raise ValueError(
+                    f"Patch grid ({h_p}, {w_p}) not divisible by pooling kernel {self.pool_kernel_size}"
+                )
+            # (N, D) -> (1, D, H, W) -> pool -> (1, pooled_tokens, D)
+            xi = img_seq.transpose(0, 1).reshape(1, d, h_p, w_p)
+            return self.pool(xi).flatten(2).transpose(1, 2)
+
         if image_sizes is not None and len(image_sizes) > 0:
-            # Packed input: split concatenated sequence into per-image slices.
-            # Use exact patch_size division (not aspect-ratio heuristic) to
-            # recover the correct patch grid for each image independently,
-            # matching HF Gemma4VisionPooler per-image pooling semantics.
-            seq = x.squeeze(0)  # (sum_N_i, D)
+            grids = compute_patch_grid(image_sizes.tolist(), self.patch_size)
+            counts = [h_p * w_p for h_p, w_p in grids]
+
             pooled_parts = []
-            for i in range(len(image_sizes)):
-                h_px = int(image_sizes[i, 0].item())
-                w_px = int(image_sizes[i, 1].item())
-                h_p = h_px // self.patch_size
-                w_p = w_px // self.patch_size
-                n_i = h_p * w_p
-                img_seq = seq[:n_i]
-                seq = seq[n_i:]
-                # (n_i, D) → (1, D, h_p, w_p) → pool → (1, tokens, D)
-                xi = img_seq.transpose(0, 1).view(1, d, h_p, w_p)
-                xi = self.pool(xi).flatten(2).transpose(1, 2)
-                pooled_parts.append(xi * self.root_hidden_size)
-            # (N_images, tokens_per_image, D)
+            if x.size(0) == 1:
+                # Packed: x = (1, sum_i N_i, D)
+                if sum(counts) != x.size(1):
+                    raise ValueError(
+                        f"Packed vision sequence length mismatch: got {x.size(1)}, expected {sum(counts)} from image_sizes"
+                    )
+                seq = x.squeeze(0)
+                start = 0
+                for (h_p, w_p), n_i in zip(grids, counts):
+                    img_seq = seq[start : start + n_i]
+                    start += n_i
+                    pooled_parts.append(_pool_single_image(img_seq, h_p, w_p))
+            elif x.size(0) == len(grids):
+                # Non-packed: x = (B, N_i, D) with one image per batch row
+                for i, ((h_p, w_p), n_i) in enumerate(zip(grids, counts)):
+                    if x.size(1) != n_i:
+                        raise ValueError(
+                            f"Non-packed sequence length mismatch at image {i}: got {x.size(1)}, expected {n_i}"
+                        )
+                    pooled_parts.append(_pool_single_image(x[i], h_p, w_p))
+            else:
+                raise ValueError(
+                    f"Unexpected vision tensor shape {tuple(x.shape)} for {len(grids)} images"
+                )
+
             pooled = torch.cat(pooled_parts, dim=0)
         else:
-            # Fallback: single image, assume square patch grid.
+            # No image_sizes: fall back to square grids with validation.
             b, n, d_in = x.shape
             h_p = int(n**0.5)
-            w_p = h_p
-            xi = x.transpose(1, 2).view(b, d_in, h_p, w_p)
-            pooled = self.pool(xi).flatten(2).transpose(1, 2) * self.root_hidden_size
+            if h_p * h_p != n:
+                raise ValueError(f"Cannot infer square patch grid from sequence length {n}")
+            if h_p % self.pool_kernel_size != 0:
+                raise ValueError(f"Inferred patch grid ({h_p}, {h_p}) not divisible by pooling kernel {self.pool_kernel_size}")
+            xi = x.transpose(1, 2).reshape(b, d_in, h_p, h_p)
+            pooled = self.pool(xi).flatten(2).transpose(1, 2)
         # Scale by sqrt(hidden_size) to match HF Gemma4VisionPooler behaviour,
         # then apply RMS norm + linear projection.
+        pooled = pooled * self.root_hidden_size
         return self.w_in(self.norm(pooled)).type_as(pooled)
 
 
