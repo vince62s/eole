@@ -1,17 +1,14 @@
 import unittest
 import torch
+from types import SimpleNamespace
 
 from eole.adapters.adapters import Gemma4MultiModalProjector
 
 
-class _Obj:
-    pass
-
-
 def _build_projector(hidden_size=8, patch_size=2, pooling_kernel_size=2):
-    model_config = _Obj()
-    model_config.encoder = _Obj()
-    model_config.decoder = _Obj()
+    model_config = SimpleNamespace()
+    model_config.encoder = SimpleNamespace()
+    model_config.decoder = SimpleNamespace()
     model_config.encoder.hidden_size = hidden_size
     model_config.decoder.hidden_size = hidden_size
     model_config.encoder.patch_size = patch_size

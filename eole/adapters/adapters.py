@@ -288,7 +288,7 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
 
         def _pool_single_image(img_seq: torch.Tensor, h_p: int, w_p: int) -> torch.Tensor:
             if h_p <= 0 or w_p <= 0:
-                raise ValueError(f"Invalid patch grid ({h_p}, {w_p})")
+                raise ValueError(f"Patch grid dimensions must be positive, got ({h_p}, {w_p})")
             if h_p % self.pool_kernel_size != 0 or w_p % self.pool_kernel_size != 0:
                 raise ValueError(
                     f"Patch grid ({h_p}, {w_p}) not divisible by pooling kernel {self.pool_kernel_size}"
