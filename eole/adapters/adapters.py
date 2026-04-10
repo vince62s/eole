@@ -333,7 +333,9 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
             b, n, d_in = x.shape
             h_p = int(n**0.5)
             if h_p * h_p != n:
-                raise ValueError(f"Cannot infer square patch grid: sequence length {n} is not a perfect square")
+                raise ValueError(
+                    f"Cannot infer square patch grid: sequence length {n} is not a perfect square; provide image_sizes for non-square grids"
+                )
             if h_p % self.pool_kernel_size != 0:
                 raise ValueError(f"Inferred patch grid ({h_p}, {h_p}) not divisible by pooling kernel {self.pool_kernel_size}")
             xi = x.transpose(1, 2).reshape(b, d_in, h_p, h_p)
