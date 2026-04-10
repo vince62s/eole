@@ -377,6 +377,7 @@ class ImageTextCorpusIterator(object):
         image_size=1024,
         adapter="llava",
         pooling_kernel_size=1,
+        mm_tokens_per_image=280,
     ):
         self.cid = corpus.id
         self.corpus = corpus
@@ -391,6 +392,7 @@ class ImageTextCorpusIterator(object):
         self.image_size = image_size
         self.adapter = adapter
         self.pooling_kernel_size = pooling_kernel_size
+        self.mm_tokens_per_image = mm_tokens_per_image
 
     def _process(self, stream):
         from eole.inputters.image_utils import process_image
@@ -404,6 +406,7 @@ class ImageTextCorpusIterator(object):
                     image_patch_size=self.image_patch_size,
                     image_size=self.image_size,
                     pooling_kernel_size=self.pooling_kernel_size,
+                    mm_tokens_per_image=self.mm_tokens_per_image,
                 )
                 for k, v in example.get("images", {}).items()
             }
@@ -441,6 +444,7 @@ def build_corpora_iters(
     image_size=1024,
     adapter="llava",
     pooling_kernel_size=1,
+    mm_tokens_per_image=280,
     sample_rate=16000,
     num_mel_bins=80,
     n_fft=400,
@@ -487,6 +491,7 @@ def build_corpora_iters(
                 image_size=image_size,
                 adapter=adapter,
                 pooling_kernel_size=pooling_kernel_size,
+                mm_tokens_per_image=mm_tokens_per_image,
             )
         elif isinstance(corpus, AudioCorpus):
             corpus_iter = AudioCorpusIterator(

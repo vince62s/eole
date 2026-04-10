@@ -35,7 +35,7 @@ class _ImageInjectingIterator:
     def __iter__(self):
         device = getattr(self.inner_iter, "device", torch.device("cpu"))
         for batch, bucket_idx in self.inner_iter:
-            if self.images and batch.get("images") is None:
+            if self.images and (batch.get("images") is None or batch.get("images") == []):
                 batch["images"] = [
                     torch.tensor(np.asarray(img), device=device, dtype=torch.float32)
                     for img in self.images

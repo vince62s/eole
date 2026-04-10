@@ -622,7 +622,7 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
             continue
 
         # content is a list of blocks
-        text_parts: list = []
+        content_parts: list = []
         tool_calls: list = []
         pending_tool_results: list = []
 
@@ -637,7 +637,23 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
                 block = {"text": str(block)}
 
             if btype == "text":
-                text_parts.append(block.get("text", ""))
+                content_parts.append({"type": "text", "text": block.get("text", "")})
+            elif btype == "image":
+                # Anthropic image block → OpenAI image_url block
+                source = block.get("source", {})
+                media_type = source.get("media_type", "image/jpeg")
+                data = source.get("data", "")
+                source_type = source.get("type", "base64")
+                if source_type == "base64":
+                    url = f"data:{media_type};base64,{data}"
+                elif source_type == "url":
+                    url = source.get("url", data)
+                else:
+                    url = data
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
+            elif btype == "image_url":
+                # Already in OpenAI format — pass through
+                content_parts.append(block)
             elif btype == "tool_use":
                 tool_id = block.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
                 tool_name = block.get("name", "")
@@ -672,12 +688,18 @@ def _anthropic_messages_to_openai(messages: list, system=None) -> list:
         # Build the message for this turn.  When the assistant made tool calls
         # the content should be null (or the text prefix if any) and the
         # tool_calls array should be set.
+        has_images = any(p.get("type") == "image_url" for p in content_parts)
+        text_parts = [p.get("text", "") for p in content_parts if p.get("type") == "text"]
+
         if tool_calls:
             msg_out: dict = {"role": role}
             # Include any preceding text as content (or null if none)
             msg_out["content"] = "\n".join(text_parts) if text_parts else ""
             msg_out["tool_calls"] = tool_calls
             openai_messages.append(msg_out)
+        elif has_images:
+            # Preserve multimodal content blocks for downstream image processing.
+            openai_messages.append({"role": role, "content": content_parts})
         elif text_parts:
             openai_messages.append({"role": role, "content": "\n".join(text_parts)})
         # If only tool_result blocks were present (user turn), there is no
@@ -1115,6 +1137,7 @@ class Model(object):
         patch_size = getattr(_encoder, "patch_size", 16)
         image_size = getattr(_encoder, "image_size", 1024)
         pooling_kernel_size = getattr(_encoder, "pooling_kernel_size", 1)
+        mm_tokens_per_image = getattr(_encoder, "mm_tokens_per_image", 280)
 
         images_list = []
         updated_messages = []
@@ -1175,6 +1198,7 @@ class Model(object):
                             image_patch_size=patch_size,
                             image_size=image_size,
                             pooling_kernel_size=pooling_kernel_size,
+                            mm_tokens_per_image=mm_tokens_per_image,
                         )
                         images_list.append(result["image"])
                         # Replace the image_url block with a text block

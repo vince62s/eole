@@ -288,7 +288,10 @@ def to_channel_dimension_format(
     return image
 
 
-def process_image(image_path, adapter="llava", image_patch_size=16, image_size=1024, pooling_kernel_size=1):
+def process_image(
+    image_path, adapter="llava", image_patch_size=16, image_size=1024,
+    pooling_kernel_size=1, mm_tokens_per_image=280,
+):
     if isinstance(image_path, Image.Image):
         PILimage = image_path
     else:
@@ -300,18 +303,31 @@ def process_image(image_path, adapter="llava", image_patch_size=16, image_size=1
         # padding
         PILimage = ImageOps.pad(PILimage, (image_size, image_size), color=(127, 127, 127))
     elif adapter == "gemma4":
-        # Aspect-ratio-preserving resize: dimensions must be divisible by
-        # patch_size * pooling_kernel_size (e.g. 16 * 3 = 48 for Gemma4).
-        # Use floor() to ensure we never exceed image_size (which determines
-        # the position_embedding_table bounds).
+        # Aspect-ratio-preserving resize matching HF's
+        # get_aspect_ratio_preserving_size().
+        # The resize target is determined by a patch budget
+        # (mm_tokens_per_image * pooling_kernel_size²) rather than a max
+        # pixel dimension, so both small and large images are resized to
+        # fit within the budget while preserving the aspect ratio.
         stride = image_patch_size * pooling_kernel_size
         orig_w, orig_h = PILimage.size
-        if image_size and image_size > 0:
-            ratio = min(image_size / orig_w, image_size / orig_h)
-        else:
-            ratio = 1.0
-        new_w = max(stride, int(math.floor(orig_w * ratio / stride)) * stride)
-        new_h = max(stride, int(math.floor(orig_h * ratio / stride)) * stride)
+        max_soft_tokens = mm_tokens_per_image  # e.g. 280
+        max_patches = max_soft_tokens * (pooling_kernel_size**2)
+        target_px = max_patches * (image_patch_size**2)
+        total_px = orig_h * orig_w
+        factor = math.sqrt(target_px / total_px) if total_px > 0 else 1.0
+        ideal_h = factor * orig_h
+        ideal_w = factor * orig_w
+        new_h = max(stride, int(math.floor(ideal_h / stride)) * stride)
+        new_w = max(stride, int(math.floor(ideal_w / stride)) * stride)
+        # Clamp so we never exceed the max_patches budget.
+        max_side = (max_patches // (pooling_kernel_size**2)) * stride
+        if new_h == 0:
+            new_h = stride
+            new_w = min(int(math.floor(orig_w / orig_h)) * stride, max_side)
+        if new_w == 0:
+            new_w = stride
+            new_h = min(int(math.floor(orig_h / orig_w)) * stride, max_side)
         PILimage = PILimage.resize((new_w, new_h), resample=RESAMPLE[adapter], reducing_gap=None)
         w = new_w // image_patch_size
         h = new_h // image_patch_size
