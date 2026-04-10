@@ -540,7 +540,8 @@ class VisionEncoder(EncoderBase):
             col_hot = F.one_hot(col, num_classes=P).to(
                 self.position_embedding_table.dtype
             )  # (N, P)
-            pos_emb = row_hot @ self.position_embedding_table[0] + col_hot @ self.position_embedding_table[1]
+            # HF's position_embedding_table: index 0 = x/col, index 1 = y/row
+            pos_emb = col_hot @ self.position_embedding_table[0] + row_hot @ self.position_embedding_table[1]
             patch_embeds = patch_embeds + pos_emb
 
         # Add batch dimension

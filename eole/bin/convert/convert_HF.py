@@ -581,6 +581,16 @@ def build_config_dict(hf):
                     "position_embedding_size": _v_pos_emb_size or None,
                     # Gemma4VisionModel may apply output standardization (std_bias/std_scale)
                     "standardize": vision_config.get("standardize", False),
+                    # Gemma4 vision uses multidimensional RoPE (apply_multidimensional_rope)
+                    # which applies rotate_half within each spatial chunk of the head,
+                    # rather than pairing first-half/second-half as standard RoPE does.
+                    "rope_config": {
+                        "rotary_theta": vision_config.get(
+                            "rope_parameters", {}
+                        ).get("rope_theta", 100),
+                        "rotary_interleave": False,
+                        "multidimensional_rope": True,
+                    },
                 }
             )
 

@@ -214,6 +214,12 @@ class RotaryPositionConfig(Config):
         "cos/sin covers all global_head_dim dimensions (zero-freq dims get identity rotation). "
         "0.0 means standard full rotation (no partial rotation).",
     )
+    multidimensional_rope: bool = Field(
+        default=False,
+        description="Use multidimensional RoPE application matching HF's apply_multidimensional_rope "
+        "(Gemma4 vision encoder). Splits the head into spatial chunks and applies rotate_half "
+        "within each chunk, rather than pairing first-half/second-half as standard RoPE does.",
+    )
 
 
 class TransformerConfig(Config):

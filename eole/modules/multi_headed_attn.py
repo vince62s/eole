@@ -11,7 +11,7 @@ from torch.distributed import all_reduce
 from eole.constants import PositionEncodingType
 from .relative_position_bias import relative_matmul, gen_relative_positions, compute_bias
 from .alibi_position_bias import AlibiPositionalBias
-from .rope import apply_rotary_emb, apply_rotary_pos_emb_xdrope
+from .rope import apply_rotary_emb, apply_rotary_emb_multidim, apply_rotary_pos_emb_xdrope
 from eole.constants import LayerNorm
 
 
@@ -158,6 +158,7 @@ class MultiHeadedAttention(torch.nn.Module):
                 self.rotary_dim = model_config.rope_config.rotary_dim
             self.rotary_interleave = model_config.rope_config.rotary_interleave
             self.xdrope_section = model_config.rope_config.xdrope_section
+            self.multidimensional_rope = model_config.rope_config.multidimensional_rope
         elif self.position_encoding_type == PositionEncodingType.Alibi:
             self.alibi = AlibiPositionalBias(self.heads)
 
@@ -292,6 +293,8 @@ class MultiHeadedAttention(torch.nn.Module):
                     self.xdrope_section,
                     interleave=self.rotary_interleave,
                 )
+            elif getattr(self, "multidimensional_rope", False):
+                query, key = apply_rotary_emb_multidim(query, key, position_embeddings)
             else:
                 query, key = apply_rotary_emb(query, key, position_embeddings, interleave=self.rotary_interleave)
             if self.qk_norm_post_rope:
@@ -523,6 +526,9 @@ class SelfMHA(MultiHeadedAttention):
                     self.xdrope_section,
                     interleave=self.rotary_interleave,
                 )
+            elif getattr(self, "multidimensional_rope", False):
+                dummy_key = query.new_zeros(query.size(0), query.size(1), self.heads_kv, self.dim_per_head)
+                query, _ = apply_rotary_emb_multidim(query, dummy_key, position_embeddings)
             else:
                 # Use a zero dummy key – the key rotation result is discarded.
                 dummy_key = query.new_zeros(query.size(0), query.size(1), self.heads_kv, self.dim_per_head)
