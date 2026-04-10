@@ -324,10 +324,10 @@ def process_image(
         max_side = (max_patches // (pooling_kernel_size**2)) * stride
         if new_h == 0:
             new_h = stride
-            new_w = min(int(math.floor(orig_w / orig_h)) * stride, max_side)
+            new_w = min(int(math.floor(orig_w / max(orig_h, 1))) * stride, max_side) or stride
         if new_w == 0:
             new_w = stride
-            new_h = min(int(math.floor(orig_h / orig_w)) * stride, max_side)
+            new_h = min(int(math.floor(orig_h / max(orig_w, 1))) * stride, max_side) or stride
         PILimage = PILimage.resize((new_w, new_h), resample=RESAMPLE[adapter], reducing_gap=None)
         w = new_w // image_patch_size
         h = new_h // image_patch_size
