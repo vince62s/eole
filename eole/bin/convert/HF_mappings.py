@@ -474,8 +474,9 @@ MODEL_OVERRIDES = {
         # Gemma4VisionPatchEmbedder; mapped to encoder.position_embedding_table.
         "encoder.position_embedding_table": "model.vision_tower.patch_embedder.position_embedding_table",
         # Gemma4VisionModel optional output standardization buffers (standardize=True).
-        "encoder.std_bias": "model.vision_tower.std_bias",
-        "encoder.std_scale": "model.vision_tower.std_scale",
+        # HF applies these after the pooler, so they live in the adapter (projector).
+        "adapter.std_bias": "model.vision_tower.std_bias",
+        "adapter.std_scale": "model.vision_tower.std_scale",
         "encoder": {
             ".self_attn.linear_query.": ".self_attn.q_proj.linear.",
             ".self_attn.linear_keys.": ".self_attn.k_proj.linear.",

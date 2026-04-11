@@ -273,13 +273,8 @@ class VisionEncoder(EncoderBase):
         else:
             self.post_layernorm = None
 
-        # Gemma4: optional output standardization: out = (out - std_bias) * std_scale
-        if getattr(encoder_config, "standardize", False):
-            self.register_buffer("std_bias", torch.zeros(encoder_config.hidden_size))
-            self.register_buffer("std_scale", torch.ones(encoder_config.hidden_size))
-        else:
-            self.std_bias = None
-            self.std_scale = None
+        # Gemma4 standardization (std_bias/std_scale) is applied after pooling
+        # in the adapter (Gemma4MultiModalProjector), not here in the encoder.
 
     @property
     def device(self):
@@ -327,10 +322,6 @@ class VisionEncoder(EncoderBase):
         # Post-processing
         if self.post_layernorm is not None:
             out = self.post_layernorm(out)
-
-        # Gemma4: optional standardization: (out - std_bias) * std_scale
-        if self.std_bias is not None:
-            out = (out - self.std_bias) * self.std_scale
 
         return out, None
 

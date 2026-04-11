@@ -272,6 +272,15 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
         self.pool = nn.AvgPool2d(kernel, stride=kernel)
         self.root_hidden_size = math.sqrt(in_dim)
 
+        # Gemma4: optional output standardization (std_bias/std_scale).
+        # HF applies this after the pooler, before norm + linear projection.
+        if getattr(model_config.encoder, "standardize", False):
+            self.register_buffer("std_bias", torch.zeros(in_dim))
+            self.register_buffer("std_scale", torch.ones(in_dim))
+        else:
+            self.std_bias = None
+            self.std_scale = None
+
     def forward(self, x, image_sizes=None):
         """
         Args:
@@ -340,9 +349,12 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
                 raise ValueError(f"Inferred patch grid ({h_p}, {h_p}) not divisible by pooling kernel {self.pool_kernel_size}")
             xi = x.transpose(1, 2).reshape(b, d_in, h_p, h_p)
             pooled = self.pool(xi).flatten(2).transpose(1, 2)
-        # Scale by sqrt(hidden_size) to match HF Gemma4VisionPooler behaviour,
-        # then apply RMS norm + linear projection.
+        # Scale by sqrt(hidden_size) to match HF Gemma4VisionPooler behaviour.
         pooled = pooled * self.root_hidden_size
+        # Gemma4: optional standardization after pooler, matching HF order.
+        if self.std_bias is not None:
+            pooled = (pooled - self.std_bias) * self.std_scale
+        # Apply RMS norm + linear projection.
         return self.w_in(self.norm(pooled)).type_as(pooled)
 
 
