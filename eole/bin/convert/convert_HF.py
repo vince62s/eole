@@ -567,9 +567,11 @@ def build_config_dict(hf):
                     "n_positions": n_positions,
                     # Set image_size for 2D RoPE precomputation
                     "image_size": effective_image_size,
-                    # Gemma4 vision uses mm_tokens_per_image from the top-level config
+                    # Gemma4 vision uses mm_tokens_per_image from the top-level config.
+                    # HF Gemma4Config has no mm_tokens_per_image field; the image
+                    # processor uses max_soft_tokens=280 by default, so match that.
                     "mm_tokens_per_image": other_config.get(
-                        "mm_tokens_per_image", hf.config.get("mm_tokens_per_image", 256)
+                        "mm_tokens_per_image", hf.config.get("mm_tokens_per_image", 280)
                     ),
                     "image_token_id": other_config.get(
                         "image_token_id", hf.config.get("image_token_id", 258880)
