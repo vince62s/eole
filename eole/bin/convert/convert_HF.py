@@ -1380,28 +1380,9 @@ def build_shards(model_config, hf, args, params):
             eole_safetensor = build_first_shard(hf, eole_safetensor)
 
             # Gemma4MultimodalEmbedder uses Gemma4RMSNorm(with_scale=False): no learnable
-            # weight. EOLE's Gemma3MultiModalProjector uses GemmaRMSNorm (x*(1+weight)),
-            # so weight=0 gives the correct identity scaling.  Inject zeros explicitly so
-            # load_state_dict doesn't log a missing-key warning and leave it uninitialized.
-            if hf.arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
-                adapter_norm_key = "adapter.norm.weight"
-                if adapter_norm_key not in eole_safetensor.keys():
-                    enc_hidden = model_config.get("encoder", {}).get("hidden_size", None)
-                    if enc_hidden is not None:
-                        z = torch.zeros(enc_hidden)
-                        if target_dtype is not None:
-                            z = z.to(target_dtype)
-                        eole_safetensor[adapter_norm_key] = z
-                        conversion_details.append(
-                            {
-                                "shard_path": output_path,
-                                "eole_key": adapter_norm_key,
-                                "srckey": None,
-                                "srcmap": "[zeros: Gemma4RMSNorm with_scale=False]",
-                                "context": {},
-                                "special": "gemma4_adapter_norm_zeros",
-                            }
-                        )
+            # weight.  EOLE's Gemma4MultiModalProjector uses RMSNormNoScale (no parameters),
+            # so there is no adapter.norm.weight to inject.  Previously we created a zeros
+            # tensor which was then reported as "Extra key in checkpoint" at load time.
 
         # TODO: could we reverse the mapping and loop on params instead? (would reduce conditions)
         for ckpt in shard_checkpoints[shard]:

@@ -383,12 +383,12 @@ MODEL_OVERRIDES = {
         "adapter.norm.weight": "multi_modal_projector.mm_soft_emb_norm.weight",
         "config": {
             "share_decoder_embeddings": True,
-            "ffn_layernorm": True,
             "embeddings": {
                 "normalize": True,
             },
             "adapter": "gemma3",
             "decoder": {
+                "ffn_layernorm": True,
                 "query_norm": True,
                 "key_norm": True,
                 "rope_config": {
@@ -402,6 +402,10 @@ MODEL_OVERRIDES = {
                 "max_position_embeddings": 131072,
             },
             "encoder": {
+                "ffn_layernorm": False,
+                # SigLIP encoder uses default 1/sqrt(head_dim) scaling;
+                # prevent model-level query_pre_attn_scalar from propagating.
+                "attn_scaling": None,
                 "mlp_activation_fn": "gelu-tanh",
                 "position_encoding_type": PositionEncodingType.Learned,
                 "layer_norm": "standard",
@@ -497,12 +501,12 @@ MODEL_OVERRIDES = {
         # Gemma4RMSNorm(with_scale=False) for pre-projection norm — no learnable weight.
         "config": {
             "share_decoder_embeddings": True,
-            "ffn_layernorm": True,
             "embeddings": {
                 "normalize": True,
             },
             "adapter": "gemma4",
             "decoder": {
+                "ffn_layernorm": True,
                 "query_norm": True,
                 "key_norm": True,
                 "attn_scaling": 1.0,
