@@ -361,7 +361,7 @@ def process_image(
         # (pooling_kernel_size × pooling_kernel_size) vision patches.
         w_tokens = w // pooling_kernel_size
         h_tokens = h // pooling_kernel_size
-        image_tokens = "<start_of_image>" + "<image_soft_token>" * (w_tokens * h_tokens) + "<end_of_image>"
+        image_tokens = "<|image>" + "<|image|>" * (w_tokens * h_tokens) + "<image|>"
     elif adapter == "deepseekocr":
         # sam patches are 16 (hardcoded in original implementation)
         # for a 1024x1024 image it means patches of 64x64
