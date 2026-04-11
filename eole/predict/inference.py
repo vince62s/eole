@@ -592,9 +592,13 @@ class Inference(object):
             tgt_pad_mask=tgt_pad_mask,
             image_locations=image_locations,
             pos_ids_2d=pos_ids_2d,
-            # Pass raw token IDs so _forward_chunked_prefill can compute
-            # rolling cache keys for the prefill KV cache.
-            src_ids=decoder_in if step == 0 else None,
+            # Pass raw token IDs used for:
+            #   1. Gemma4 per-layer input: embed_tokens_per_layer is called at
+            #      every step (prefill and decoding) to contribute the token-level
+            #      signal to each layer's per-layer input tensor.
+            #   2. Prefill KV-cache key computation in _forward_chunked_prefill
+            #      (only active at step 0 when the prompt exceeds the chunk size).
+            src_ids=decoder_in,
         )
 
         # Generator forward.
