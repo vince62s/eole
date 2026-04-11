@@ -576,6 +576,8 @@ def build_config_dict(hf):
                     ),
                     # Gemma4VisionAttention applies RMSNorm (no scale) to value states
                     "value_norm": True,
+                    # Gemma4 vision rms_norm_eps (default 1e-6, different from text decoder)
+                    "norm_eps": vision_config.get("rms_norm_eps", 1e-6),
                     # Gemma4VisionPatchEmbedder has a learnable 2D position embedding table
                     # [2, position_embedding_size, hidden_size] added to patch embeddings.
                     "position_embedding_size": _v_pos_emb_size or None,

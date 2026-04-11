@@ -510,6 +510,8 @@ MODEL_OVERRIDES = {
                 "max_position_embeddings": 131072,
             },
             "encoder": {
+                # Gemma4VisionAttention explicitly sets scaling=1.0 (no 1/sqrt(head_dim))
+                "attn_scaling": 1.0,
                 # Gemma4 vision MLP is gated (act(gate_proj) * up_proj)
                 "mlp_activation_fn": "gated-gelu-tanh",
                 # Use 2D RoPE for vision encoder (replaces 2D factorised absolute PE)

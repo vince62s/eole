@@ -131,7 +131,12 @@ class MultiHeadedAttention(torch.nn.Module):
             bias=model_config.add_final_linear_bias,
         )
         self.is_decoder = is_decoder
-        self.scale = self.attn_scaling**-0.5 if self.is_decoder and self.attn_scaling is not None else None
+        # Compute attention scale: attn_scaling^(-0.5).
+        # For decoders this is typically query_pre_attn_scalar^(-0.5).
+        # For encoders (e.g. Gemma4 vision with attn_scaling=1.0) the same
+        # formula yields the correct direct scale value.
+        # When attn_scaling is None, SDPA uses its built-in 1/sqrt(head_dim).
+        self.scale = self.attn_scaling**-0.5 if self.attn_scaling is not None else None
         self.relative_positions_buckets = model_config.relative_positions_buckets
         self.kcache, self.vcache, self.cache_leftpad = None, None, None
         self.sliding_window = model_config.sliding_window
