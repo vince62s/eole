@@ -26,7 +26,7 @@ from tokenizers.processors import TemplateProcessing
 
 # Eole Imports
 from eole.bin import BaseBin, register_bin
-from eole.config import recursive_model_fields_set
+from eole.config import recursive_model_fields_set, recursive_update_dict
 from eole.constants import DefaultTokens, TORCH_DTYPES, PositionEncodingType
 from eole.inputters.inputter import vocabs_to_dict
 from eole.bin.convert.HF_mappings import (
