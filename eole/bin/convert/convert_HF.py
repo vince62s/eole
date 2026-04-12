@@ -31,6 +31,7 @@ from eole.constants import DefaultTokens, TORCH_DTYPES, PositionEncodingType
 from eole.inputters.inputter import vocabs_to_dict
 from eole.bin.convert.HF_mappings import (
     KEY_MAPS,
+    MODEL_OVERRIDES,
     ACT_TABLE,
     LN_TABLE,
 )
@@ -355,14 +356,13 @@ def build_config_dict(hf):
         }
 
     # Apply arch-specific config overrides via the unified config_from_hf callable.
-    # Each arch in KEY_MAPS may provide a config_from_hf(top, text, vis) -> dict
+    # Each arch in MODEL_OVERRIDES may provide a config_from_hf(top, text, vis) -> dict
     # function that returns a partial config dict to be deep-merged here.
-    if arch in KEY_MAPS:
-        config_fn = KEY_MAPS[arch].get("config_from_hf", None)
-        if config_fn is not None:
-            arch_config = config_fn(other_config, config, vision_config)
-            if arch_config:
-                model_config = recursive_update_dict(model_config, arch_config, {})
+    config_fn = MODEL_OVERRIDES.get(arch, {}).get("config_from_hf", None)
+    if config_fn is not None:
+        arch_config = config_fn(other_config, config, vision_config)
+        if arch_config:
+            model_config = recursive_update_dict(model_config, arch_config, {})
 
     # Whisper: remove rope_config (not used) and extract generation settings
     if arch == "WhisperForConditionalGeneration":
