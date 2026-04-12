@@ -1127,8 +1127,8 @@ def build_shards(model_config, hf, args, params):
                                                         "shard_path": output_path,
                                                         "eole_key": v_key,
                                                         "srckey": full_srckey,
-                                                        "srcmap": "[tied to linear_keys]",
-                                                        "context": {},
+                                                        "srcmap": srcmap,
+                                                        "context": context,
                                                         "special": "gemma4_kv_eq",
                                                     }
                                                 )
