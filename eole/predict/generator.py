@@ -196,16 +196,26 @@ class GeneratorLM(Inference):
             if EOLE_COMPILE_MODE in ["0", "1"]:
                 self.model.decoder._compile_decoder(emb=emb, tgt_pad_mask=tgt_pad_mask)
             elif EOLE_COMPILE_MODE in ["2", "3"]:
-                current_step = self.model.decoder.cache_seqlens[0]
-                pos_ids_1d = current_step + torch.arange(1, device=emb.device)
-                if self.model.decoder.rope.cos_sin is not None:
-                    position_embeddings = self.model.decoder.rope.cos_sin[pos_ids_1d]
+                if self.self_attn_backend != "flash":
+                    # Layer-level compile (modes 2/3) explicit warmup uses the
+                    # flash_attn_with_kvcache fast path (cache_slice=None), so
+                    # it requires flash attention.  With other backends the
+                    # layers compile just-in-time on the first actual decode
+                    # step instead.
+                    self._log(
+                        "EOLE_COMPILE_MODE in [2,3] with non-flash backend: "
+                        "skipping explicit layer warmup; layers will compile JIT."
+                    )
                 else:
-                    position_embeddings = None
-                assert self.self_attn_backend == "flash", "These compile modes work only with flash"
-                self.model.decoder.transformer_layers[0]._compile_decoder(
-                    emb, position_embeddings=position_embeddings, cache_seqlens=self.model.decoder.cache_seqlens
-                )
+                    current_step = self.model.decoder.cache_seqlens[0]
+                    pos_ids_1d = current_step + torch.arange(1, device=emb.device)
+                    if self.model.decoder.rope.cos_sin is not None:
+                        position_embeddings = self.model.decoder.rope.cos_sin[pos_ids_1d]
+                    else:
+                        position_embeddings = None
+                    self.model.decoder.transformer_layers[0]._compile_decoder(
+                        emb, position_embeddings=position_embeddings, cache_seqlens=self.model.decoder.cache_seqlens
+                    )
             self.warmup_time.append(time() - start_wu)
             self._log(f"Warmup lasted: {time() - start_wu:.1f} sec")
 

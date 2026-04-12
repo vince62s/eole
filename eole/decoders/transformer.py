@@ -1366,8 +1366,11 @@ class TransformerDecoder(DecoderBase):
                     layer.self_attn.kcache is not None
                     and layer.self_attn.vcache is not None
                     and layer.self_attn.kcache.shape == target_shape
+                    and layer.self_attn.vcache.shape == target_shape
                     and layer.self_attn.kcache.dtype == dtype
+                    and layer.self_attn.vcache.dtype == dtype
                     and layer.self_attn.kcache.device == device
+                    and layer.self_attn.vcache.device == device
                 ):
                     # Reuse the existing tensors in-place to avoid a second
                     # allocation while a previous cache is still live (e.g.
