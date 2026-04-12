@@ -313,13 +313,6 @@ MODEL_OVERRIDES = {
             },
         },
     },
-    # Gemma4 text-only model.  Weight names are identical to Gemma3 (the HF
-    # class inherits from Gemma3ForCausalLM) but the config differs: per-layer
-    # RoPE (proportional for full_attention, default for sliding_attention),
-    # per-layer head_dim (global_head_dim for full_attention layers) and an
-    # explicit layer_types list ("sliding_attention"/"full_attention").
-    # These are extracted dynamically in convert_HF.py; only the common
-    # weight-name overrides that match Gemma3 are listed here.
     "Gemma4ForCausalLM": {
         "decoder.embed_tokens_per_layer.weight": "model.embed_tokens_per_layer.weight",
         "decoder.per_layer_model_projection.weight": "model.per_layer_model_projection.weight",
@@ -466,7 +459,7 @@ MODEL_OVERRIDES = {
             # (P_h, P_w, C) order (channel-last per pixel).  EOLE's Conv2d kernel
             # expects (H, C, P_h, P_w) — channel-first.  We must reshape+permute, not
             # just view, to correctly re-order channels within each patch.
-            ".reshape(w.shape[0], int(round((w.shape[1]/3)**0.5)), int(round((w.shape[1]/3)**0.5)), 3).permute(0, 3, 1, 2).contiguous()",
+            ".reshape(w.shape[0], int(round((w.shape[1]/3)**0.5)), int(round((w.shape[1]/3)**0.5)), 3).permute(0, 3, 1, 2).contiguous()",  # noqaE501
         ),
         # No patch_conv bias (input_proj has bias=False).
         # No post_layernorm at Gemma4VisionModel level.

@@ -94,9 +94,7 @@ def apply_rotary_pos_emb_xdrope(
     return q_out, k_out
 
 
-def apply_rotary_emb_multidim(
-    query: Tensor, key: Tensor, cos_sin: Tensor, ndim: int = 2
-) -> Tuple[Tensor, Tensor]:
+def apply_rotary_emb_multidim(query: Tensor, key: Tensor, cos_sin: Tensor, ndim: int = 2) -> Tuple[Tensor, Tensor]:
     """Apply multidimensional RoPE matching HF's apply_multidimensional_rope.
 
     Each spatial dimension gets its own rotate_half within a contiguous chunk
@@ -279,9 +277,7 @@ class RotaryPosition(nn.Module):
             full_head_dim = getattr(model_config, "global_head_dim", 0) or self.dim_per_head
             rope_angles = int(partial_rotary_factor * full_head_dim / 2)
             nope_dim = full_head_dim // 2 - rope_angles
-            inv_freq_rotated = 1.0 / (
-                base ** (torch.arange(0, 2 * rope_angles, 2).float() / full_head_dim)
-            )
+            inv_freq_rotated = 1.0 / (base ** (torch.arange(0, 2 * rope_angles, 2).float() / full_head_dim))
             inv_freq = torch.cat([inv_freq_rotated, torch.zeros(nope_dim)], dim=0)
         else:
             inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))

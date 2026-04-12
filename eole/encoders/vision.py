@@ -220,9 +220,7 @@ class VisionEncoder(EncoderBase):
         # (pre-trained weights will overwrite this at load time).
         pos_emb_size = getattr(encoder_config, "position_embedding_size", None)
         if pos_emb_size:
-            self.position_embedding_table = nn.Parameter(
-                torch.ones(2, pos_emb_size, encoder_config.hidden_size)
-            )
+            self.position_embedding_table = nn.Parameter(torch.ones(2, pos_emb_size, encoder_config.hidden_size))
         else:
             self.position_embedding_table = None
 
@@ -525,12 +523,8 @@ class VisionEncoder(EncoderBase):
             P = self.position_embedding_table.shape[1]
             row = all_flat // max_width  # height / row coordinate
             col = all_flat % max_width  # width / col coordinate
-            row_hot = F.one_hot(row, num_classes=P).to(
-                self.position_embedding_table.dtype
-            )  # (N, P)
-            col_hot = F.one_hot(col, num_classes=P).to(
-                self.position_embedding_table.dtype
-            )  # (N, P)
+            row_hot = F.one_hot(row, num_classes=P).to(self.position_embedding_table.dtype)  # (N, P)
+            col_hot = F.one_hot(col, num_classes=P).to(self.position_embedding_table.dtype)  # (N, P)
             # HF's position_embedding_table: index 0 = x/col, index 1 = y/row
             pos_emb = col_hot @ self.position_embedding_table[0] + row_hot @ self.position_embedding_table[1]
             patch_embeds = patch_embeds + pos_emb

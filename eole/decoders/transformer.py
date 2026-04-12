@@ -519,9 +519,7 @@ class TransformerDecoder(DecoderBase):
             self.embed_tokens_per_layer = nn.Embedding(vocab_size_pli, n_layers * hidden_pli)
             # scale applied to embed_tokens_per_layer output (mirrors Gemma4TextScaledWordEmbedding)
             self.embed_tokens_per_layer_scale = hidden_pli**0.5
-            self.per_layer_model_projection = nn.Linear(
-                decoder_config.hidden_size, n_layers * hidden_pli, bias=False
-            )
+            self.per_layer_model_projection = nn.Linear(decoder_config.hidden_size, n_layers * hidden_pli, bias=False)
             # scale applied to per_layer_model_projection output
             self.per_layer_model_projection_scale = decoder_config.hidden_size**-0.5
             # normalization over the per-layer hidden dim (hidden_size_per_layer_input)
@@ -1045,9 +1043,7 @@ class TransformerDecoder(DecoderBase):
         # prefill_chunk_size is an optional performance knob for non-sliding models.
         effective_chunk = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
         if effective_chunk > 0 and S > effective_chunk and self.cache_seqlens is not None:
-            return self._forward_chunked_prefill(
-                emb, src_ids=src_ids, per_layer_inputs=per_layer_inputs, **kwargs
-            )
+            return self._forward_chunked_prefill(emb, src_ids=src_ids, per_layer_inputs=per_layer_inputs, **kwargs)
         return self._forward_eager(emb, per_layer_inputs=per_layer_inputs, **kwargs)
 
     def _forward_eager(self, emb, per_layer_inputs=None, **kwargs):

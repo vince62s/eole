@@ -289,8 +289,12 @@ def to_channel_dimension_format(
 
 
 def process_image(
-    image_path, adapter="llava", image_patch_size=16, image_size=1024,
-    pooling_kernel_size=1, mm_tokens_per_image=280,
+    image_path,
+    adapter="llava",
+    image_patch_size=16,
+    image_size=1024,
+    pooling_kernel_size=1,
+    mm_tokens_per_image=280,
 ):
     if isinstance(image_path, Image.Image):
         PILimage = image_path

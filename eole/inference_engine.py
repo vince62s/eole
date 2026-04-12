@@ -37,8 +37,7 @@ class _ImageInjectingIterator:
         for batch, bucket_idx in self.inner_iter:
             if self.images and (batch.get("images") is None or batch.get("images") == []):
                 batch["images"] = [
-                    torch.tensor(np.asarray(img), device=device, dtype=torch.float32)
-                    for img in self.images
+                    torch.tensor(np.asarray(img), device=device, dtype=torch.float32) for img in self.images
                 ]
             yield batch, bucket_idx
 
@@ -122,7 +121,9 @@ class InferenceEngine:
         )
 
     def infer_list(
-        self, src: List[str], settings: Optional[Dict[str, Any]] = None,
+        self,
+        src: List[str],
+        settings: Optional[Dict[str, Any]] = None,
         images: Optional[List[Any]] = None,
     ) -> Tuple[List[List[float]], Optional[List[List[float]]], List[List[str]]]:
         """List of strings inference."""

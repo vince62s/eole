@@ -304,7 +304,6 @@ def _build_gemma4_config(config, model_config):
     if global_head_dim is None:
         global_head_dim = head_dim  # fall back to same dim for all layers
 
-    num_heads = config.get("num_attention_heads", config.get("num_heads", None))
     heads_kv = config.get("num_key_value_heads", None)
     num_global_kv_heads = config.get("num_global_key_value_heads", None)
     if num_global_kv_heads is None:
@@ -573,9 +572,7 @@ def build_config_dict(hf):
                     "mm_tokens_per_image": other_config.get(
                         "mm_tokens_per_image", hf.config.get("mm_tokens_per_image", 280)
                     ),
-                    "image_token_id": other_config.get(
-                        "image_token_id", hf.config.get("image_token_id", 258880)
-                    ),
+                    "image_token_id": other_config.get("image_token_id", hf.config.get("image_token_id", 258880)),
                     # Gemma4VisionAttention applies RMSNorm (no scale) to value states
                     "value_norm": True,
                     # Gemma4 vision rms_norm_eps (default 1e-6, different from text decoder)
@@ -589,9 +586,7 @@ def build_config_dict(hf):
                     # which applies rotate_half within each spatial chunk of the head,
                     # rather than pairing first-half/second-half as standard RoPE does.
                     "rope_config": {
-                        "rotary_theta": vision_config.get(
-                            "rope_parameters", {}
-                        ).get("rope_theta", 100),
+                        "rotary_theta": vision_config.get("rope_parameters", {}).get("rope_theta", 100),
                         "rotary_interleave": False,
                         "multidimensional_rope": True,
                     },
@@ -1476,11 +1471,8 @@ def build_shards(model_config, hf, args, params):
                                     if (
                                         ".self_attn.linear_keys." in eole_key
                                         and section == "decoder"
-                                        and hf.arch
-                                        in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
-                                        and hf.config.get("text_config", hf.config).get(
-                                            "attention_k_eq_v", False
-                                        )
+                                        and hf.arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
+                                        and hf.config.get("text_config", hf.config).get("attention_k_eq_v", False)
                                     ):
                                         layer_types = model_config.get("decoder", {}).get("layer_types", [])
                                         if i < len(layer_types) and layer_types[i] == "full_attention":

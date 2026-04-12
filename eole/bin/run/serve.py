@@ -940,9 +940,7 @@ class Model(object):
                 images_arg = all_images if all_images else None
                 scores, _, preds = await asyncio.get_event_loop().run_in_executor(
                     self.engine._thread_pool,  # ← warmed thread
-                    lambda s=settings, imgs=images_arg: self.engine.infer_list(
-                        all_inputs, settings=s, images=imgs
-                    ),
+                    lambda s=settings, imgs=images_arg: self.engine.infer_list(all_inputs, settings=s, images=imgs),
                 )
 
                 # Distribute results back to individual requests using boundaries
@@ -1334,8 +1332,12 @@ class Model(object):
 
         future = asyncio.Future()
         req = QueuedRequest(
-            inputs=inputs, settings=settings, is_chat=is_chat,
-            future=future, timestamp=time.time(), images=images,
+            inputs=inputs,
+            settings=settings,
+            is_chat=is_chat,
+            future=future,
+            timestamp=time.time(),
+            images=images,
         )
         await self.request_queue.put(req)
         return await future

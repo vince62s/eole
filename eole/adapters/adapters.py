@@ -299,9 +299,7 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
             if h_p <= 0 or w_p <= 0:
                 raise ValueError(f"Patch grid dimensions must be positive, got ({h_p}, {w_p})")
             if h_p % self.pool_kernel_size != 0 or w_p % self.pool_kernel_size != 0:
-                raise ValueError(
-                    f"Patch grid ({h_p}, {w_p}) not divisible by pooling kernel {self.pool_kernel_size}"
-                )
+                raise ValueError(f"Patch grid ({h_p}, {w_p}) not divisible by pooling kernel {self.pool_kernel_size}")
             # (N, D) -> (1, D, H, W) -> pool -> (1, pooled_tokens, D)
             xi = img_seq.transpose(0, 1).reshape(1, d, h_p, w_p)
             return self.pool(xi).flatten(2).transpose(1, 2)
@@ -315,7 +313,8 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
                 # Packed: x = (1, sum_i N_i, D)
                 if sum(counts) != x.size(1):
                     raise ValueError(
-                        f"Packed vision sequence length mismatch: got {x.size(1)}, expected {sum(counts)} (sum of {counts}) from image_sizes"
+                        f"Packed vision sequence length mismatch: got {x.size(1)}"
+                        f"expected {sum(counts)} (sum of {counts}) from image_sizes"
                     )
                 seq = x.squeeze(0)
                 start = 0
@@ -332,9 +331,7 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
                         )
                     pooled_parts.append(_pool_single_image(x[i], h_p, w_p))
             else:
-                raise ValueError(
-                    f"Unexpected vision tensor shape {tuple(x.shape)} for {len(grids)} images"
-                )
+                raise ValueError(f"Unexpected vision tensor shape {tuple(x.shape)} for {len(grids)} images")
 
             pooled = torch.cat(pooled_parts, dim=0)
         else:
@@ -343,10 +340,13 @@ class Gemma4MultiModalProjector(BaseVisionAdapter):
             h_p = int(n**0.5)
             if h_p * h_p != n:
                 raise ValueError(
-                    f"Cannot infer square patch grid: sequence length {n} is not a perfect square; provide image_sizes for non-square grids"
+                    f"Cannot infer square patch grid: sequence length {n} is not a perfect square"
+                    f"provide image_sizes for non-square grids"
                 )
             if h_p % self.pool_kernel_size != 0:
-                raise ValueError(f"Inferred patch grid ({h_p}, {h_p}) not divisible by pooling kernel {self.pool_kernel_size}")
+                raise ValueError(
+                    f"Inferred patch grid ({h_p}, {h_p}) not divisible by pooling kernel {self.pool_kernel_size}"
+                )
             xi = x.transpose(1, 2).reshape(b, d_in, h_p, h_p)
             pooled = self.pool(xi).flatten(2).transpose(1, 2)
         # Scale by sqrt(hidden_size) to match HF Gemma4VisionPooler behaviour.

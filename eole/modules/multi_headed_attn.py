@@ -592,9 +592,7 @@ class SelfMHA(MultiHeadedAttention):
                 # Absolute position of each query token: for decode (S_q=1)
                 # the query is at position cache_seqlens; for prefill the
                 # queries span cache_seqlens .. cache_seqlens + S_q - 1.
-                q_pos = cache_seqlens.unsqueeze(1) + torch.arange(
-                    S_q, device=device
-                ).unsqueeze(0)  # [B, S_q]
+                q_pos = cache_seqlens.unsqueeze(1) + torch.arange(S_q, device=device).unsqueeze(0)  # [B, S_q]
                 k_pos = torch.arange(cache_len, device=device)  # [cache_len]
                 # Causal constraint: key position <= query position
                 valid = k_pos.view(1, 1, cache_len) <= q_pos.unsqueeze(2)  # [B, S_q, cache_len]
