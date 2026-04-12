@@ -331,7 +331,10 @@ def build_config_dict(hf):
             "rotary_interleave": False,
             "rotary_theta": config.get("rope_theta", config.get("rope_parameters", {}).get("rope_theta", 10000)),
         },
-        "embeddings": {},  # Populated later
+        "embeddings": {
+            "position_encoding_type": PositionEncodingType.Rotary,
+            "n_positions": 0,
+        },
     }
     if model_config["num_experts"] == 1 or model_config["num_experts"] is None:
         model_config["num_experts"] = 0
@@ -392,15 +395,6 @@ def build_config_dict(hf):
         }
     )
 
-    # Default position encoding configuration (skip for Whisper which sets its own)
-    if arch != "WhisperForConditionalGeneration":
-        model_config["embeddings"].update(
-            {
-                "position_encoding_type": PositionEncodingType.Rotary,
-                "n_positions": 0,
-            }
-        )
-
     # patch rotary dim (skip for models using learned positional embeddings)
     # partial_rotary_factor may live at the top level or inside rope_parameters (newer HF format)
     if "rope_config" in model_config:
@@ -435,17 +429,17 @@ def build_config_dict(hf):
             }
         )
 
-    # Handle rope_parameters (newer HF format, e.g. Qwen3.5 VL)
-    # Skip Gemma4's per-layer-type format ("sliding_attention"/"full_attention" keys)
-    # which is handled by _build_gemma4_decoder_patch inside config_from_hf.
+    # Handle rope_parameters (newer HF format, e.g. Qwen3.5 VL).
+    # Only apply mrope_section/mrope_interleaved when present; this naturally
+    # skips Gemma4's per-layer-type format (which lacks these keys and is
+    # handled by _build_gemma4_decoder_patch inside config_from_hf).
     if config.get("rope_parameters", None) is not None:
         rope_params = config["rope_parameters"]
-        if "sliding_attention" not in rope_params:
-            mrope_section = rope_params.get("mrope_section", None)
-            if mrope_section is not None:
-                model_config["rope_config"]["xdrope_section"] = mrope_section
-            if rope_params.get("mrope_interleaved", False):
-                model_config["rope_config"]["rotary_interleave"] = True
+        mrope_section = rope_params.get("mrope_section", None)
+        if mrope_section is not None:
+            model_config["rope_config"]["xdrope_section"] = mrope_section
+        if rope_params.get("mrope_interleaved", False):
+            model_config["rope_config"]["rotary_interleave"] = True
 
     # Validate required fields
     required_fields = {
