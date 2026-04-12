@@ -32,6 +32,505 @@ BASE_KEY_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Per-arch config helpers
+# ---------------------------------------------------------------------------
+# Each helper function follows the signature:
+#   config_from_hf(top_config, text_config, vision_config) -> dict
+# where
+#   top_config    = raw HF config.json (before text_config extraction)
+#   text_config   = HF text/language sub-config (or top_config for flat models)
+#   vision_config = HF vision sub-config dict, or None for text-only models
+# The returned dict is deep-merged into the model_config built by
+# build_config_dict in convert_HF.py.
+# ---------------------------------------------------------------------------
+
+
+def _norm_eps(text):
+    """Extract norm_eps from HF text config using standard fallback chain."""
+    return text.get("rms_norm_eps", text.get("layer_norm_epsilon", text.get("layer_norm_eps", 1e-5)))
+
+
+def _build_gemma4_decoder_patch(text):
+    """Build the Gemma4-specific decoder config patch from HF text config.
+
+    Returns a partial model_config dict to be deep-merged into the full config.
+    Handles layer_types, per-layer-type rope parameters, global_head_dim,
+    global_heads_kv, per-layer input embedding, value_norm, kv sharing,
+    and double-wide MLP.
+    """
+    patch = {"decoder": {}, "rope_config": {}}
+
+    # --- 1. layer_types ---
+    layer_types = text.get("layer_types", None)
+    if layer_types is None:
+        n_layers = text.get("num_hidden_layers", 0)
+        if n_layers:
+            sliding_window_pattern = 6
+            layer_types = [
+                "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
+                for i in range(n_layers)
+            ]
+            if layer_types and layer_types[-1] != "full_attention":
+                layer_types[-1] = "full_attention"
+    if layer_types is not None:
+        patch["decoder"]["layer_types"] = layer_types
+
+    # --- 2. rope_parameters (Gemma4 per-layer-type format) ---
+    rope_params = text.get("rope_parameters", None)
+    sliding_rope = None
+    full_rope = None
+    if isinstance(rope_params, dict) and "sliding_attention" in rope_params:
+        sliding_rope = rope_params.get("sliding_attention", {})
+        full_rope = rope_params.get("full_attention", {})
+
+    # Head dimensions
+    head_dim = text.get("head_dim", None)
+    global_head_dim = text.get("global_head_dim", None)
+    if global_head_dim is None:
+        global_head_dim = head_dim
+
+    heads_kv = text.get("num_key_value_heads", None)
+    num_global_kv_heads = text.get("num_global_key_value_heads", None)
+    if num_global_kv_heads is None:
+        num_global_kv_heads = heads_kv
+
+    # --- 3. Build rope_config ---
+    global_theta = 1_000_000
+    local_theta = 10_000
+    rotary_dim_global = 0
+    partial_rotary_factor = 0.0
+
+    if full_rope:
+        global_theta = int(full_rope.get("rope_theta", global_theta))
+        partial_factor = full_rope.get("partial_rotary_factor", None)
+        if partial_factor is not None and global_head_dim:
+            partial_rotary_factor = float(partial_factor)
+            rotary_dim_global = int(partial_factor * global_head_dim)
+    if sliding_rope:
+        local_theta = int(sliding_rope.get("rope_theta", local_theta))
+
+    interleave_local = 6
+    if layer_types:
+        n_full = sum(1 for lt in layer_types if lt == "full_attention")
+        n_total = len(layer_types)
+        if n_full > 0:
+            interleave_local = n_total // n_full
+
+    rope_config_update = {
+        "rotary_theta": global_theta,
+        "rotary_theta_local": local_theta,
+        "interleave_local": interleave_local,
+        "tmax_index": 0,
+        "rotary_interleave": False,
+    }
+    if partial_rotary_factor > 0.0:
+        rope_config_update["partial_rotary_factor"] = partial_rotary_factor
+    if rotary_dim_global > 0:
+        rope_config_update["rotary_dim_global"] = rotary_dim_global
+
+    patch["decoder"]["rope_config"] = rope_config_update
+    # Also set model-level rope_config so it propagates through _override_values
+    patch["rope_config"] = dict(rope_config_update)
+
+    # --- 4. global_head_dim / global_heads_kv ---
+    if global_head_dim and global_head_dim != head_dim:
+        patch["decoder"]["global_head_dim"] = global_head_dim
+    if num_global_kv_heads and num_global_kv_heads != heads_kv:
+        patch["decoder"]["global_heads_kv"] = num_global_kv_heads
+
+    # --- 5. per-layer input embedding ---
+    hidden_size_per_layer_input = text.get("hidden_size_per_layer_input", 0)
+    vocab_size_per_layer_input = text.get("vocab_size_per_layer_input", 0)
+    if hidden_size_per_layer_input:
+        patch["decoder"]["hidden_size_per_layer_input"] = hidden_size_per_layer_input
+        patch["decoder"]["vocab_size_per_layer_input"] = vocab_size_per_layer_input
+
+    # --- 6. value_norm ---
+    patch["decoder"]["value_norm"] = True
+
+    # --- 7. num_kv_shared_layers + use_double_wide_mlp ---
+    num_kv_shared = text.get("num_kv_shared_layers", 0)
+    if num_kv_shared:
+        patch["decoder"]["num_kv_shared_layers"] = num_kv_shared
+
+    use_double_wide_mlp = text.get("use_double_wide_mlp", False)
+    if use_double_wide_mlp:
+        patch["decoder"]["use_double_wide_mlp"] = True
+
+    return patch
+
+
+def _llava_config_from_hf(top, text, vis):
+    return {
+        "adapter_bias": top.get("multimodal_projector_bias", False),
+        "projector_activation_fn": top.get("projector_hidden_act", "gelu"),
+        "spatial_merge_size": top.get("spatial_merge_size", None),
+        "encoder": {
+            "mlp_activation_fn": ACT_TABLE["LlavaForConditionalGeneration"],
+            "layer_norm": LN_TABLE["LlavaForConditionalGeneration"],
+            "norm_eps": _norm_eps(text),
+            "rope_config": {
+                "rotary_theta": vis["rope_theta"],
+                "rotary_interleave": False,
+            },
+            # static encoder properties
+            "num_channels": 3,
+            "image_token_id": 10,
+            "layernorm_pre": True,
+            "patch_conv_bias": False,
+        },
+    }
+
+
+def _mistral3_config_from_hf(top, text, vis):
+    return {
+        "adapter_bias": top.get("multimodal_projector_bias", False),
+        "projector_activation_fn": top.get("projector_hidden_act", "gelu"),
+        "spatial_merge_size": top.get("spatial_merge_size", None),
+        "encoder": {
+            "mlp_activation_fn": ACT_TABLE["Mistral3ForConditionalGeneration"],
+            "layer_norm": LN_TABLE["Mistral3ForConditionalGeneration"],
+            "norm_eps": _norm_eps(text),
+            "rope_config": {
+                "rotary_theta": vis["rope_theta"],
+                "rotary_interleave": False,
+            },
+            # static encoder properties
+            "num_channels": 3,
+            "image_token_id": 10,
+            "layernorm_pre": True,
+            "patch_conv_bias": False,
+        },
+    }
+
+
+def _gemma3_multimodal_config_from_hf(top, text, vis):
+    return {
+        "head_dim": text.get("head_dim", 256),
+        "heads_kv": text.get("num_key_value_heads", 4),
+        "heads": text.get("num_attention_heads", 8),
+        "share_decoder_embeddings": True,
+        "embeddings": {"normalize": True},
+        "adapter": "gemma3",
+        "decoder": {
+            "ffn_layernorm": True,
+            "query_norm": True,
+            "key_norm": True,
+            "rope_config": {
+                "rotary_theta": 1000000,
+                "scaling_type": "gemma3",
+                "rotary_theta_local": 10000,
+                "interleave_local": 6,
+                "tmax_index": 1,
+                "rotary_interleave": False,
+            },
+            "max_position_embeddings": 131072,
+        },
+        "encoder": {
+            "n_positions": (vis["image_size"] // vis["patch_size"]) ** 2,
+            "mm_tokens_per_image": top["mm_tokens_per_image"],
+            "image_token_id": top["image_token_index"],
+            "ffn_layernorm": False,
+            "attn_scaling": None,
+            "mlp_activation_fn": "gelu-tanh",
+            "position_encoding_type": PositionEncodingType.Learned,
+            "layer_norm": "standard",
+            "add_ffnbias": True,
+            "add_final_linear_bias": True,
+            "add_qkvbias": True,
+            "layernorm_pre": False,
+            "layernorm_post": True,
+            "patch_conv_bias": True,
+        },
+    }
+
+
+def _gemma4_causal_config_from_hf(top, text, vis):
+    cfg = {
+        "share_decoder_embeddings": True,
+        "ffn_layernorm": True,
+        "embeddings": {"normalize": True},
+        "decoder": {
+            "query_norm": True,
+            "key_norm": True,
+            "attn_scaling": 1.0,
+            "max_position_embeddings": 131072,
+        },
+    }
+    return recursive_update_dict(cfg, _build_gemma4_decoder_patch(text), {})
+
+
+def _gemma4_multimodal_config_from_hf(top, text, vis):
+    _v_image_size = vis.get("image_size") if vis else None
+    _v_patch_size = (vis.get("patch_size", 16) if vis else 16) or 16
+    _v_pos_emb_size = vis.get("position_embedding_size", 0) if vis else 0
+    if _v_image_size is not None and _v_patch_size > 0:
+        n_positions = (_v_image_size // _v_patch_size) ** 2
+    else:
+        n_positions = _v_pos_emb_size
+    effective_image_size = _v_image_size or (_v_patch_size * 128)
+
+    cfg = {
+        "head_dim": text.get("head_dim", 256),
+        "heads_kv": text.get("num_key_value_heads", 4),
+        "heads": text.get("num_attention_heads", 8),
+        "share_decoder_embeddings": True,
+        "embeddings": {"normalize": True},
+        "adapter": "gemma4",
+        "decoder": {
+            "ffn_layernorm": True,
+            "query_norm": True,
+            "key_norm": True,
+            "attn_scaling": 1.0,
+            "max_position_embeddings": 131072,
+        },
+        "encoder": {
+            "attn_scaling": 1.0,
+            "mlp_activation_fn": "gated-gelu-tanh",
+            "position_encoding_type": PositionEncodingType.Rotary,
+            "rope_config": {
+                "rotary_theta": vis.get("rope_parameters", {}).get("rope_theta", 100.0) if vis else 100.0,
+                "rotary_interleave": False,
+                "multidimensional_rope": True,
+            },
+            "layer_norm": "rms",
+            "add_ffnbias": False,
+            "add_final_linear_bias": False,
+            "add_qkvbias": False,
+            "query_norm": True,
+            "key_norm": True,
+            "layernorm_pre": False,
+            "layernorm_post": False,
+            "patch_conv_bias": False,
+            "ffn_layernorm": True,
+            "pooling_kernel_size": 3,
+            "n_positions": n_positions,
+            "image_size": effective_image_size,
+            "mm_tokens_per_image": top.get("mm_tokens_per_image", 280),
+            "image_token_id": top.get("image_token_id", 258880),
+            "value_norm": True,
+            "norm_eps": vis.get("rms_norm_eps", 1e-6) if vis else 1e-6,
+            "position_embedding_size": _v_pos_emb_size or None,
+            "standardize": vis.get("standardize", False) if vis else False,
+        },
+    }
+    return recursive_update_dict(cfg, _build_gemma4_decoder_patch(text), {})
+
+
+def _deepseek_ocr_config_from_hf(top, text, vis):
+    clip_cfg = (vis or {}).get("width", {}).get("clip-l-14-224", {})
+    img_size = clip_cfg.get("image_size", 224)
+    patch_size = clip_cfg.get("patch_size", 14)
+    heads = clip_cfg.get("heads", None)
+    n_pos = (img_size // patch_size) ** 2 + 1
+    return {
+        "adapter": "deepseekocr",
+        "adapter_bias": True,
+        "decoder": {
+            "layer_norm": "rms",
+            "norm_eps": 1e-6,
+        },
+        "encoder": {
+            "mlp_activation_fn": "quick_gelu",
+            "layer_norm": "standard",
+            "norm_eps": 1e-5,
+            "position_encoding_type": PositionEncodingType.Learned,
+            "add_ffnbias": True,
+            "add_final_linear_bias": True,
+            "add_qkvbias": True,
+            "num_channels": 3,
+            "image_token_id": 128815,
+            "layernorm_pre": True,
+            "patch_conv_bias": False,
+            "encoder_sam": True,
+            "use_class_embedding": True,
+            "n_positions": n_pos,
+            "patch_size": patch_size,
+            "heads": heads,
+            "heads_kv": heads,
+        },
+    }
+
+
+def _hunyuan_vl_config_from_hf(top, text, vis):
+    return {
+        "spatial_merge_size": (vis or {}).get("spatial_merge_size", None),
+        "adapter": "hunyuanocr",
+        "decoder": {
+            "query_norm": True,
+            "key_norm": True,
+            "qk_norm_post_rope": True,
+        },
+        "encoder": {
+            "position_encoding_type": PositionEncodingType.Learned,
+            "interpolate_mode": "bilinear",
+            "n_positions": 16384,
+            "layer_norm": "standard",
+            "layernorm_pre": False,
+            "mlp_activation_fn": "gelu",
+            "add_ffnbias": True,
+            "add_qkvbias": True,
+            "patch_conv_bias": True,
+            "image_token_id": 120120,
+            "image_token_id_list": [120120, 120118, 120119],
+        },
+    }
+
+
+def _qwen3vl_encoder_patch(top, vis):
+    """Shared vision encoder patch for the Qwen3VL/Qwen3.5VL family."""
+    vis = vis or {}
+    num_pos_embed = vis.get("num_position_embeddings", 0)
+    patch_size = vis.get("patch_size", 16)
+    num_heads = vis.get("num_heads", 16)
+    img_size = int(num_pos_embed**0.5) * patch_size if num_pos_embed else 0
+    return {
+        "spatial_merge_size": vis.get("spatial_merge_size", 2),
+        "encoder": {
+            "heads": num_heads,
+            "heads_kv": num_heads,
+            "head_dim": vis.get("hidden_size", 0) // num_heads if num_heads else 0,
+            "layers": vis.get("depth", vis.get("num_hidden_layers", 27)),
+            "image_size": img_size,
+            "num_position_embeddings": num_pos_embed,
+            "position_encoding_type": PositionEncodingType.Rotary,
+            "rope_config": {
+                "rotary_interleave": False,
+                "rotary_theta": 10000,
+            },
+            "num_channels": vis.get("in_channels", 3),
+            "image_token_id": top.get("image_token_id", 151655),
+        },
+    }
+
+
+def _qwen3vl_config_from_hf(top, text, vis):
+    return _qwen3vl_encoder_patch(top, vis)
+
+
+def _qwen35_decoder_fields(text):
+    """Hybrid decoder fields (layer_types + GatedDeltaNet hyper-params) for Qwen3.5."""
+    decoder = {}
+    layer_types = text.get("layer_types")
+    if layer_types is not None:
+        decoder["layer_types"] = layer_types
+    for key in [
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+    ]:
+        val = text.get(key)
+        if val is not None:
+            decoder[key] = val
+    return decoder
+
+
+def _qwen35_vl_config_from_hf(top, text, vis):
+    decoder = {"query_norm": True, "key_norm": True, "q_gating": True}
+    decoder.update(_qwen35_decoder_fields(text))
+    cfg = {
+        "adapter": "qwen3_5vl",
+        "decoder": decoder,
+        "encoder": {
+            "layer_norm": "standard",
+            "mlp_activation_fn": "gelu-tanh",
+            "add_ffnbias": True,
+            "add_final_linear_bias": True,
+            "add_qkvbias": True,
+            "layernorm_pre": False,
+            "layernorm_post": False,
+            "temporal_patch_size": 2,
+            "patch_conv_bias": True,
+        },
+    }
+    return recursive_update_dict(cfg, _qwen3vl_encoder_patch(top, vis), {})
+
+
+def _qwen35_moe_vl_config_from_hf(top, text, vis):
+    decoder = {"query_norm": True, "key_norm": True, "q_gating": True, "shared_expert_gate": True, "moe_renormalize": True}
+    decoder.update(_qwen35_decoder_fields(text))
+    cfg = {
+        "adapter": "qwen3_5vl",
+        "decoder": decoder,
+        "encoder": {
+            "layer_norm": "standard",
+            "mlp_activation_fn": "gelu-tanh",
+            "add_ffnbias": True,
+            "add_final_linear_bias": True,
+            "add_qkvbias": True,
+            "layernorm_pre": False,
+            "layernorm_post": False,
+            "temporal_patch_size": 2,
+            "patch_conv_bias": True,
+        },
+    }
+    # Qwen3.5 MoE: use shared_expert_intermediate_size as shared expert FF size
+    if text.get("shared_expert_intermediate_size"):
+        moe_ff = text.get("moe_intermediate_size")
+        cfg["moe_transformer_ff"] = moe_ff
+        cfg["decoder"]["moe_transformer_ff"] = moe_ff
+    return recursive_update_dict(cfg, _qwen3vl_encoder_patch(top, vis), {})
+
+
+def _qwen35_text_config_from_hf(top, text, vis):
+    decoder = {"query_norm": True, "key_norm": True, "q_gating": True}
+    decoder.update(_qwen35_decoder_fields(text))
+    return {"decoder": decoder}
+
+
+def _qwen35_moe_text_config_from_hf(top, text, vis):
+    decoder = {"query_norm": True, "key_norm": True, "q_gating": True}
+    decoder.update(_qwen35_decoder_fields(text))
+    return {"decoder": decoder}
+
+
+def _whisper_config_from_hf(top, text, vis):
+    max_target_positions = text.get("max_target_positions", 448)
+    return {
+        # Core decoder fields (Whisper uses non-standard key names)
+        "layers": text.get("decoder_layers", text.get("num_hidden_layers")),
+        "hidden_size": text.get("d_model"),
+        "heads": text.get("decoder_attention_heads"),
+        "heads_kv": text.get("decoder_attention_heads"),
+        "transformer_ff": text.get("decoder_ffn_dim"),
+        # Embeddings
+        "embeddings": {
+            "position_encoding_type": "Learned",
+            "n_positions": max_target_positions,
+        },
+        # Static properties
+        "parallel_residual": False,
+        "add_qkvbias": True,
+        "add_key_bias": False,
+        "add_final_linear_bias": True,
+        "add_ffnbias": True,
+        "left_pad": False,
+        "share_decoder_embeddings": True,
+        "generator_bias": False,
+        # Encoder config
+        "encoder": {
+            "layers": text.get("encoder_layers"),
+            "hidden_size": text.get("d_model"),
+            "heads": text.get("encoder_attention_heads"),
+            "heads_kv": text.get("encoder_attention_heads"),
+            "transformer_ff": text.get("encoder_ffn_dim"),
+            "num_mel_bins": text.get("num_mel_bins", 80),
+            "max_source_positions": text.get("max_source_positions", 1500),
+            "layer_norm": "standard",
+            "norm_eps": 1e-5,
+            "mlp_activation_fn": "gelu",
+            "add_qkvbias": True,
+            "add_key_bias": False,
+            "add_final_linear_bias": True,
+            "add_ffnbias": True,
+            "position_encoding_type": None,
+        },
+    }
+
+
 # Model-specific overrides for key mappings and configurations
 # root keys are weights to be added in the first shard
 # encoder/decoder sections are modules of each encoder/decoder layer
@@ -39,17 +538,17 @@ MODEL_OVERRIDES = {
     "LlamaForCausalLM": {},  # default
     "MistralForCausalLM": {},
     "Qwen2ForCausalLM": {
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "add_qkvbias": True,
             "add_final_linear_bias": False,
-        }
+        },
     },
     "Qwen3ForCausalLM": {
         "decoder": {
             ".self_attn.q_norm.": ".self_attn.q_norm.",
             ".self_attn.k_norm.": ".self_attn.k_norm.",
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
@@ -65,7 +564,7 @@ MODEL_OVERRIDES = {
             **{f".mlp.experts.{i}.up_proj.": f".mlp.experts.{i}.up_proj." for i in range(128)},
             **{f".mlp.experts.{i}.down_proj.": f".mlp.experts.{i}.down_proj." for i in range(128)},
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
@@ -77,7 +576,7 @@ MODEL_OVERRIDES = {
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
             ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "share_decoder_embeddings": True,
             "ffn_layernorm": True,
             "embeddings": {
@@ -94,7 +593,7 @@ MODEL_OVERRIDES = {
                 for j, attr in enumerate(["gate_up_proj.", "down_proj.", "up_proj."])
             },
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "decoder": {"moe_transformer_ff": 14336},
             "moe_softmax_after": True,
             "shared_layer_norm": True,
@@ -110,7 +609,7 @@ MODEL_OVERRIDES = {
             ".mlp.down_proj.": ".mlp.fc2.",
             ".input_layernorm.": (".input_layernorm.", ""),
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "parallel_residual": True,
             "shared_layer_norm": True,
             "add_qkvbias": True,
@@ -139,7 +638,7 @@ MODEL_OVERRIDES = {
                 for j, attr in enumerate(["gate_up_proj.", "down_proj.", "up_proj."])
             },
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "decoder": {"moe_transformer_ff": 6400},
             "add_qkvbias": True,
             "add_final_linear_bias": True,
@@ -150,7 +649,7 @@ MODEL_OVERRIDES = {
             ".self_attn.q_norm.": ".self_attn.query_layernorm.",
             ".self_attn.k_norm.": ".self_attn.key_layernorm.",
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "query_norm": True,
             "key_norm": True,
             "qk_norm_post_rope": True,
@@ -176,7 +675,7 @@ MODEL_OVERRIDES = {
             ".input_layernorm.": ".ln_1.",
             ".post_attention_layernorm.": ".ln_2.",
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "parallel_residual": False,
             "shared_layer_norm": True,
             "add_qkvbias": True,
@@ -205,7 +704,7 @@ MODEL_OVERRIDES = {
             ".input_layernorm.": ".attention.self_attn_layer_norm.",
             ".post_attention_layernorm.": ".LayerNorm.",
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "add_qkvbias": True,
             "add_final_linear_bias": True,
             "add_ffnbias": True,
@@ -242,14 +741,7 @@ MODEL_OVERRIDES = {
         "adapter.w_in.bias": "multi_modal_projector.linear_1.bias",
         "adapter.w_out.weight": "multi_modal_projector.linear_2.weight",
         "adapter.w_out.bias": "multi_modal_projector.linear_2.bias",
-        "config": {
-            "encoder": {
-                "num_channels": 3,
-                "image_token_id": 10,
-                "layernorm_pre": True,
-                "patch_conv_bias": False,
-            },
-        },
+        "config_from_hf": _llava_config_from_hf,
     },
     "Mistral3ForConditionalGeneration": {
         "decoder_layer_prefix": "language_model.model.layers.",
@@ -277,14 +769,7 @@ MODEL_OVERRIDES = {
         "adapter.w_out.weight": "multi_modal_projector.linear_2.weight",
         "adapter.layernorm.weight": "multi_modal_projector.norm.weight",
         "adapter.patch_merger.merging_layer.weight": "multi_modal_projector.patch_merger.merging_layer.weight",
-        "config": {
-            "encoder": {
-                "num_channels": 3,
-                "image_token_id": 10,
-                "layernorm_pre": True,
-                "patch_conv_bias": False,
-            },
-        },
+        "config_from_hf": _mistral3_config_from_hf,
     },
     "Gemma3ForCausalLM": {
         "decoder": {
@@ -293,7 +778,7 @@ MODEL_OVERRIDES = {
             ".pre_feedforward_layernorm.": ".pre_feedforward_layernorm.",
             ".post_feedforward_layernorm.": ".post_feedforward_layernorm.",
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "share_decoder_embeddings": True,
             "ffn_layernorm": True,
             "embeddings": {
@@ -327,20 +812,7 @@ MODEL_OVERRIDES = {
             ".per_layer_projection.": ".per_layer_projection.",
             ".post_per_layer_input_norm.": ".post_per_layer_input_norm.",
         },
-        "config": {
-            "share_decoder_embeddings": True,
-            "ffn_layernorm": True,
-            "embeddings": {
-                "normalize": True,
-            },
-            "decoder": {
-                "query_norm": True,
-                "key_norm": True,
-                "attn_scaling": 1.0,
-                # rope_config defaults are filled by convert_HF.py from rope_parameters
-                "max_position_embeddings": 131072,
-            },
-        },
+        "config_from_hf": _gemma4_causal_config_from_hf,
     },
     "Gemma3ForConditionalGeneration": {
         "decoder_layer_prefix": "language_model.model.layers.",
@@ -374,42 +846,7 @@ MODEL_OVERRIDES = {
         },
         "adapter.w_in.weight": ("multi_modal_projector.mm_input_projection_weight", ".t()"),
         "adapter.norm.weight": "multi_modal_projector.mm_soft_emb_norm.weight",
-        "config": {
-            "share_decoder_embeddings": True,
-            "embeddings": {
-                "normalize": True,
-            },
-            "adapter": "gemma3",
-            "decoder": {
-                "ffn_layernorm": True,
-                "query_norm": True,
-                "key_norm": True,
-                "rope_config": {
-                    "rotary_theta": 1000000,
-                    "scaling_type": "gemma3",
-                    "rotary_theta_local": 10000,
-                    "interleave_local": 6,
-                    "tmax_index": 1,
-                    "rotary_interleave": False,
-                },
-                "max_position_embeddings": 131072,
-            },
-            "encoder": {
-                "ffn_layernorm": False,
-                # SigLIP encoder uses default 1/sqrt(head_dim) scaling;
-                # prevent model-level query_pre_attn_scalar from propagating.
-                "attn_scaling": None,
-                "mlp_activation_fn": "gelu-tanh",
-                "position_encoding_type": PositionEncodingType.Learned,
-                "layer_norm": "standard",
-                "add_ffnbias": True,
-                "add_final_linear_bias": True,
-                "add_qkvbias": True,
-                "layernorm_pre": False,
-                "layernorm_post": True,
-                "patch_conv_bias": True,
-            },
-        },
+        "config_from_hf": _gemma3_multimodal_config_from_hf,
     },
     # Gemma4 multimodal model (text + custom vision encoder + multimodal projector).
     #
@@ -493,54 +930,7 @@ MODEL_OVERRIDES = {
         "adapter.w_in.weight": "model.embed_vision.embedding_projection.weight",
         # adapter.norm.weight has no source: Gemma4MultimodalEmbedder uses
         # Gemma4RMSNorm(with_scale=False) for pre-projection norm — no learnable weight.
-        "config": {
-            "share_decoder_embeddings": True,
-            "embeddings": {
-                "normalize": True,
-            },
-            "adapter": "gemma4",
-            "decoder": {
-                "ffn_layernorm": True,
-                "query_norm": True,
-                "key_norm": True,
-                "attn_scaling": 1.0,
-                # rope_config defaults are filled by convert_HF.py from rope_parameters
-                "max_position_embeddings": 131072,
-            },
-            "encoder": {
-                # Gemma4VisionAttention explicitly sets scaling=1.0 (no 1/sqrt(head_dim))
-                "attn_scaling": 1.0,
-                # Gemma4 vision MLP is gated (act(gate_proj) * up_proj)
-                "mlp_activation_fn": "gated-gelu-tanh",
-                # Use 2D RoPE for vision encoder (replaces 2D factorised absolute PE)
-                # image_size for 2D RoPE precomputation is set dynamically in convert_HF.py
-                "position_encoding_type": PositionEncodingType.Rotary,
-                # RoPE config: Gemma4VisionConfig default_theta = 100.0
-                "rope_config": {
-                    "rotary_theta": 100.0,
-                    "rotary_interleave": False,
-                },
-                # Gemma4 uses RMSNorm throughout (Gemma4RMSNorm)
-                "layer_norm": "rms",
-                "add_ffnbias": False,
-                "add_final_linear_bias": False,
-                "add_qkvbias": False,
-                # Gemma4 vision attention has learnable q/k norms
-                "query_norm": True,
-                "key_norm": True,
-                "layernorm_pre": False,
-                # Gemma4VisionModel has no global post_layernorm; the per-layer
-                # post_attention_layernorm is handled inside each encoder layer.
-                "layernorm_post": False,
-                "patch_conv_bias": False,
-                # Each Gemma4VisionEncoderLayer has pre/post_feedforward_layernorm
-                "ffn_layernorm": True,
-                # Gemma4 uses avg-pool with kernel_size=3 in the multimodal projector
-                "pooling_kernel_size": 3,
-                # position_embedding_size and standardize are set dynamically in convert_HF.py
-                # from vision_config (position_embedding_size and standardize fields).
-            },
-        },
+        "config_from_hf": _gemma4_multimodal_config_from_hf,
     },
     "M2M100ForConditionalGeneration": {
         "decoder_layer_prefix": "model.decoder.layers.",
@@ -576,7 +966,7 @@ MODEL_OVERRIDES = {
             ".input_layernorm.": ".self_attn_layer_norm.",
             ".post_attention_layernorm.": ".final_layer_norm.",
         },
-        "config": {
+        "config_from_hf": lambda top, text, vis: {
             "parallel_residual": False,
             "add_qkvbias": True,
             "add_final_linear_bias": True,
@@ -629,16 +1019,7 @@ MODEL_OVERRIDES = {
             ".input_layernorm.": ".self_attn_layer_norm.",
             ".post_attention_layernorm.": ".final_layer_norm.",
         },
-        "config": {
-            "parallel_residual": False,
-            "add_qkvbias": True,
-            "add_key_bias": False,
-            "add_final_linear_bias": True,
-            "add_ffnbias": True,
-            "left_pad": False,
-            "share_decoder_embeddings": True,
-            "generator_bias": False,
-        },
+        "config_from_hf": _whisper_config_from_hf,
     },
     "DeepseekOCRForCausalLM": {
         "decoder": {
@@ -704,56 +1085,14 @@ MODEL_OVERRIDES = {
             ".norm1.": ".norm1.",
             ".norm2.": ".norm2.",
         },
-        "config": {
-            "adapter": "deepseekocr",
-            "adapter_bias": True,
-            "decoder": {
-                "layer_norm": "rms",
-                "norm_eps": 1e-6,
-            },
-            "encoder": {
-                "mlp_activation_fn": "quick_gelu",
-                "layer_norm": "standard",
-                "norm_eps": 1e-5,
-                "position_encoding_type": PositionEncodingType.Learned,
-                "add_ffnbias": True,
-                "add_final_linear_bias": True,
-                "add_qkvbias": True,
-                "num_channels": 3,
-                "image_token_id": 128815,
-                "layernorm_pre": True,
-                "patch_conv_bias": False,
-                "encoder_sam": True,
-                "use_class_embedding": True,
-            },
-        },
+        "config_from_hf": _deepseek_ocr_config_from_hf,
     },
     "HunYuanVLForConditionalGeneration": {
         "decoder": {
             ".self_attn.q_norm.": ".self_attn.query_layernorm.",
             ".self_attn.k_norm.": ".self_attn.key_layernorm.",
         },
-        "config": {
-            "adapter": "hunyuanocr",
-            "decoder": {
-                "query_norm": True,
-                "key_norm": True,
-                "qk_norm_post_rope": True,
-            },
-            "encoder": {
-                "position_encoding_type": PositionEncodingType.Learned,
-                "interpolate_mode": "bilinear",
-                "n_positions": 16384,
-                "layer_norm": "standard",
-                "layernorm_pre": False,
-                "mlp_activation_fn": "gelu",
-                "add_ffnbias": True,
-                "add_qkvbias": True,
-                "patch_conv_bias": True,
-                "image_token_id": 120120,
-                "image_token_id_list": [120120, 120118, 120119],
-            },
-        },
+        "config_from_hf": _hunyuan_vl_config_from_hf,
         "encoder_layer_prefix": "vit.layers.",
         "encoder.patch_conv.weight": "vit.embeddings.patch_embedding.weight",
         "encoder.patch_conv.bias": "vit.embeddings.patch_embedding.bias",
@@ -830,25 +1169,7 @@ MODEL_OVERRIDES = {
             ".linear_attn.norm.": ".linear_attn.norm.",
             ".linear_attn.out_proj.": ".linear_attn.out_proj.",
         },
-        "config": {
-            "adapter": "qwen3_5vl",
-            "decoder": {
-                "query_norm": True,
-                "key_norm": True,
-                "q_gating": True,
-            },
-            "encoder": {
-                "layer_norm": "standard",
-                "mlp_activation_fn": "gelu-tanh",
-                "add_ffnbias": True,
-                "add_final_linear_bias": True,
-                "add_qkvbias": True,
-                "layernorm_pre": False,
-                "layernorm_post": False,
-                "temporal_patch_size": 2,
-                "patch_conv_bias": True,
-            },
-        },
+        "config_from_hf": _qwen35_vl_config_from_hf,
     },
     "Qwen3_5MoeForConditionalGeneration": {
         "decoder_layer_prefix": "model.language_model.layers.",
@@ -920,27 +1241,18 @@ MODEL_OVERRIDES = {
             ".mlp.shared_experts.down_proj.": ".mlp.shared_expert.down_proj.",
             ".mlp.shared_expert_gate.weight": ".mlp.shared_expert_gate.weight",
         },
-        "config": {
-            "adapter": "qwen3_5vl",
-            "decoder": {
-                "query_norm": True,
-                "key_norm": True,
-                "q_gating": True,
-                "shared_expert_gate": True,
-                "moe_renormalize": True,
-            },
-            "encoder": {
-                "layer_norm": "standard",
-                "mlp_activation_fn": "gelu-tanh",
-                "add_ffnbias": True,
-                "add_final_linear_bias": True,
-                "add_qkvbias": True,
-                "layernorm_pre": False,
-                "layernorm_post": False,
-                "temporal_patch_size": 2,
-                "patch_conv_bias": True,
-            },
-        },
+        "config_from_hf": _qwen35_moe_vl_config_from_hf,
+    },
+    # Text-only Qwen3.5 variants (hybrid transformer+linear-attention decoder)
+    "Qwen3_5TextForCausalLM": {
+        "config_from_hf": _qwen35_text_config_from_hf,
+    },
+    "Qwen3_5MoeForCausalLM": {
+        "config_from_hf": _qwen35_moe_text_config_from_hf,
+    },
+    # Qwen3 VL (text-only Qwen3VL variant without Mamba layers)
+    "Qwen3VLForConditionalGeneration": {
+        "config_from_hf": _qwen3vl_config_from_hf,
     },
 }
 
@@ -982,6 +1294,8 @@ LN_TABLE = defaultdict(
         "Gemma4ForConditionalGeneration": "rms",
         "Qwen3_5ForConditionalGeneration": "gemma-rms",
         "Qwen3_5MoeForConditionalGeneration": "gemma-rms",
+        "Qwen3_5TextForCausalLM": "gemma-rms",
+        "Qwen3_5MoeForCausalLM": "gemma-rms",
     },
 )
 

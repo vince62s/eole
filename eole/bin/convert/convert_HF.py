@@ -258,151 +258,6 @@ def get_huggingface_model(args):
     return huggingface_model
 
 
-def _build_gemma4_config(config, model_config):
-    """Extract Gemma4-specific configuration into model_config.
-
-    Handles:
-    - ``layer_types``: list of "sliding_attention" / "full_attention" per layer.
-    - ``rope_parameters``: dict mapping layer-type names to rope settings.
-      Gemma4 uses ``{"sliding_attention": {...}, "full_attention": {...}}``
-      instead of the flat ``rope_scaling`` dict used by other models.
-    - ``global_head_dim`` / ``num_global_key_value_heads``: full_attention
-      layers may use a larger head_dim than sliding_attention layers.
-    - ``tmax_index``: Gemma4 uses tmax_index=0 (positions start at 0, unlike Gemma3 which uses 1).
-    """
-    from eole.config import recursive_update_dict
-
-    # --- 1. layer_types ---
-    layer_types = config.get("layer_types", None)
-    if layer_types is None:
-        # Build default 5:1 (sliding:full) pattern if not provided
-        n_layers = config.get("num_hidden_layers", 0)
-        if n_layers:
-            sliding_window_pattern = 6
-            layer_types = [
-                "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
-                for i in range(n_layers)
-            ]
-            # Ensure the last layer is always full_attention
-            if layer_types and layer_types[-1] != "full_attention":
-                layer_types[-1] = "full_attention"
-    if layer_types is not None:
-        model_config.setdefault("decoder", {})["layer_types"] = layer_types
-
-    # --- 2. rope_parameters (Gemma4 per-layer-type format) ---
-    rope_params = config.get("rope_parameters", None)
-    sliding_rope = None
-    full_rope = None
-    if isinstance(rope_params, dict) and "sliding_attention" in rope_params:
-        # Gemma4-style: keys are layer-type names
-        sliding_rope = rope_params.get("sliding_attention", {})
-        full_rope = rope_params.get("full_attention", {})
-
-    # Determine head dimensions
-    head_dim = config.get("head_dim", None)
-    global_head_dim = config.get("global_head_dim", None)
-    if global_head_dim is None:
-        global_head_dim = head_dim  # fall back to same dim for all layers
-
-    heads_kv = config.get("num_key_value_heads", None)
-    num_global_kv_heads = config.get("num_global_key_value_heads", None)
-    if num_global_kv_heads is None:
-        num_global_kv_heads = heads_kv
-
-    # --- 3. Build rope_config ---
-    # The global rope uses: full_attention params (theta=1_000_000, proportional factor)
-    # The local rope  uses: sliding_attention params (theta=10_000, default/full rotation)
-    global_theta = 1_000_000
-    local_theta = 10_000
-    rotary_dim_global = 0
-    partial_rotary_factor = 0.0
-
-    if full_rope:
-        global_theta = int(full_rope.get("rope_theta", global_theta))
-        partial_factor = full_rope.get("partial_rotary_factor", None)
-        if partial_factor is not None and global_head_dim:
-            partial_rotary_factor = float(partial_factor)
-            # Keep rotary_dim_global for backward compat (= effective rotary dims)
-            rotary_dim_global = int(partial_factor * global_head_dim)
-    if sliding_rope:
-        local_theta = int(sliding_rope.get("rope_theta", local_theta))
-
-    # Derive interleave_local from the layer_types list (for rope selection fallback)
-    interleave_local = 6  # default 5:1 pattern
-    if layer_types:
-        n_full = sum(1 for lt in layer_types if lt == "full_attention")
-        n_total = len(layer_types)
-        if n_full > 0:
-            interleave_local = n_total // n_full
-
-    rope_config_update = {
-        "rotary_theta": global_theta,
-        "rotary_theta_local": local_theta,
-        "interleave_local": interleave_local,
-        "tmax_index": 0,  # Gemma4 uses positions 0..N-1 (unlike Gemma3 which shifts by 1)
-        "rotary_interleave": False,
-    }
-    if partial_rotary_factor > 0.0:
-        rope_config_update["partial_rotary_factor"] = partial_rotary_factor
-    if rotary_dim_global > 0:
-        rope_config_update["rotary_dim_global"] = rotary_dim_global
-
-    model_config = recursive_update_dict(
-        model_config,
-        {"decoder": {"rope_config": rope_config_update}},
-        {},
-    )
-
-    # Also set the model-level rope_config so it propagates through _override_values
-    model_config_rope_update = {
-        "rotary_theta": global_theta,
-        "rotary_theta_local": local_theta,
-        "interleave_local": interleave_local,
-        "tmax_index": 0,
-        "rotary_interleave": False,
-    }
-    if partial_rotary_factor > 0.0:
-        model_config_rope_update["partial_rotary_factor"] = partial_rotary_factor
-    if rotary_dim_global > 0:
-        model_config_rope_update["rotary_dim_global"] = rotary_dim_global
-    model_config.setdefault("rope_config", {}).update(model_config_rope_update)
-
-    # --- 4. global_head_dim / global_heads_kv ---
-    if global_head_dim and global_head_dim != head_dim:
-        model_config.setdefault("decoder", {})["global_head_dim"] = global_head_dim
-    if num_global_kv_heads and num_global_kv_heads != heads_kv:
-        model_config.setdefault("decoder", {})["global_heads_kv"] = num_global_kv_heads
-
-    # --- 5. per-layer input embedding (hidden_size_per_layer_input) ---
-    # Gemma4 uses a separate embedding table + model projection to compute
-    # per-layer inputs injected into each decoder layer.  Default = 256.
-    hidden_size_per_layer_input = config.get("hidden_size_per_layer_input", 0)
-    vocab_size_per_layer_input = config.get("vocab_size_per_layer_input", 0)
-    if hidden_size_per_layer_input:
-        model_config.setdefault("decoder", {})["hidden_size_per_layer_input"] = hidden_size_per_layer_input
-        model_config.setdefault("decoder", {})["vocab_size_per_layer_input"] = vocab_size_per_layer_input
-
-    # --- 6. value_norm ---
-    # Both text and vision Gemma4 attention apply RMSNorm (no scale) to value states.
-    model_config.setdefault("decoder", {})["value_norm"] = True
-
-    # --- 7. num_kv_shared_layers + use_double_wide_mlp (Gemma4-E2B) ---
-    # The last num_kv_shared_layers decoder layers act as KV consumers: they
-    # compute their own Query but reuse Key/Value from a type-matched provider
-    # layer (the last non-shared layer of the same attention type).  Consumer
-    # layers DO have k_proj / v_proj weights in the HF checkpoint; they are
-    # simply not used during inference (replaced by the shared provider K/V).
-    # When use_double_wide_mlp=True (Gemma4-E2B), consumer layers also use a
-    # double-wide MLP (2 × intermediate_size) to compensate for K/V reuse.
-    num_kv_shared = config.get("num_kv_shared_layers", 0)
-    if num_kv_shared:
-        model_config.setdefault("decoder", {})["num_kv_shared_layers"] = num_kv_shared
-
-    use_double_wide_mlp = config.get("use_double_wide_mlp", False)
-    if use_double_wide_mlp:
-        model_config.setdefault("decoder", {})["use_double_wide_mlp"] = True
-
-    return model_config
 
 
 def build_config_dict(hf):
@@ -480,15 +335,7 @@ def build_config_dict(hf):
     if model_config["num_experts"] == 1 or model_config["num_experts"] is None:
         model_config["num_experts"] = 0
 
-    # For Qwen3.5 MoE: use shared_expert_intermediate_size as shared expert FF size
-    # (overrides the default moe_transformer_ff * num_shared_experts calculation in MoE.__init__)
-    if config.get("shared_expert_intermediate_size") and arch in [
-        "Qwen3_5MoeForConditionalGeneration",
-    ]:
-        model_config["moe_transformer_ff"] = config["moe_intermediate_size"]
-        model_config.setdefault("decoder", {})["moe_transformer_ff"] = config["moe_intermediate_size"]
-
-    # Vision encoder
+    # Vision encoder base fields (common to all VLMs with a vision_config)
     if vision_config is not None:
         model_config["encoder"] = {
             "layers": vision_config.get("num_hidden_layers", 24),  # hard-coded for mistral-community/pixtral-12b
@@ -506,147 +353,20 @@ def build_config_dict(hf):
                 "head_dim", vision_config.get("hidden_size", 0) // vision_config.get("num_attention_heads", 1)
             ),
         }
-    if arch in ["LlavaForConditionalGeneration", "Mistral3ForConditionalGeneration"]:
-        model_config["encoder"].update(
-            {
-                "mlp_activation_fn": model_config["mlp_activation_fn"],
-                "layer_norm": model_config["layer_norm"],
-                "norm_eps": model_config["norm_eps"],
-                "rope_config": {
-                    "rotary_theta": vision_config["rope_theta"],
-                    "rotary_interleave": False,
-                },
-            }
-        )
-        model_config["adapter_bias"] = other_config.get("multimodal_projector_bias", False)
-        model_config["projector_activation_fn"] = other_config.get("projector_hidden_act", "gelu")
-        model_config["spatial_merge_size"] = other_config.get("spatial_merge_size", None)
 
-    if arch == "Gemma3ForConditionalGeneration":
-        if model_config.get("head_dim", None) is None:
-            model_config["head_dim"] = 256  # src/transformers/models/gemma3/configuration_gemma3.py#L61
-        if model_config.get("heads_kv", None) is None:
-            model_config["heads_kv"] = 4
-        if model_config.get("heads", None) is None:
-            model_config["heads"] = 8
-        model_config["encoder"].update(
-            {
-                "n_positions": (vision_config["image_size"] // vision_config["patch_size"]) ** 2,
-                # head related stuff patched to match 1152 dim of siglip
-                # https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/modeling_siglip.py#L399-L402
-                "mm_tokens_per_image": hf.config["mm_tokens_per_image"],
-                "image_token_id": hf.config["image_token_index"],
-            }
-        )
+    # Apply arch-specific config overrides via the unified config_from_hf callable.
+    # Each arch in KEY_MAPS may provide a config_from_hf(top, text, vis) -> dict
+    # function that returns a partial config dict to be deep-merged here.
+    if arch in KEY_MAPS:
+        config_fn = KEY_MAPS[arch].get("config_from_hf", None)
+        if config_fn is not None:
+            arch_config = config_fn(other_config, config, vision_config)
+            if arch_config:
+                model_config = recursive_update_dict(model_config, arch_config, {})
 
-    if arch == "Gemma4ForConditionalGeneration":
-        if model_config.get("head_dim", None) is None:
-            model_config["head_dim"] = 256
-        if model_config.get("heads_kv", None) is None:
-            model_config["heads_kv"] = 4
-        if model_config.get("heads", None) is None:
-            model_config["heads"] = 8
-        if vision_config is not None:
-            # Gemma4VisionConfig has no `image_size` field; it uses
-            # `position_embedding_size` (maximum number of position embeddings per axis).
-            _v_image_size = vision_config.get("image_size")
-            _v_patch_size = vision_config.get("patch_size", 16)
-            _v_pos_emb_size = vision_config.get("position_embedding_size", 0)
-            if _v_image_size is not None and _v_patch_size > 0:
-                n_positions = (_v_image_size // _v_patch_size) ** 2
-            else:
-                n_positions = _v_pos_emb_size
-            # EOLE uses 2D RoPE (PositionEncodingType.Rotary) for the vision encoder.
-            # init_2d_inv_freq requires image_size to precompute the frequency table.
-            # Gemma4VisionConfig has no fixed image_size, so derive a practical maximum:
-            # 128 patches per side (= 2048 pixels for 16-pixel patches).
-            effective_image_size = _v_image_size or (_v_patch_size * 128)
-            model_config["encoder"].update(
-                {
-                    "n_positions": n_positions,
-                    # Set image_size for 2D RoPE precomputation
-                    "image_size": effective_image_size,
-                    # Gemma4 vision uses mm_tokens_per_image from the top-level config.
-                    # HF Gemma4Config has no mm_tokens_per_image field; the image
-                    # processor uses max_soft_tokens=280 by default, so match that.
-                    "mm_tokens_per_image": other_config.get(
-                        "mm_tokens_per_image", hf.config.get("mm_tokens_per_image", 280)
-                    ),
-                    "image_token_id": other_config.get("image_token_id", hf.config.get("image_token_id", 258880)),
-                    # Gemma4VisionAttention applies RMSNorm (no scale) to value states
-                    "value_norm": True,
-                    # Gemma4 vision rms_norm_eps (default 1e-6, different from text decoder)
-                    "norm_eps": vision_config.get("rms_norm_eps", 1e-6),
-                    # Gemma4VisionPatchEmbedder has a learnable 2D position embedding table
-                    # [2, position_embedding_size, hidden_size] added to patch embeddings.
-                    "position_embedding_size": _v_pos_emb_size or None,
-                    # Gemma4VisionModel may apply output standardization (std_bias/std_scale)
-                    "standardize": vision_config.get("standardize", False),
-                    # Gemma4 vision uses multidimensional RoPE (apply_multidimensional_rope)
-                    # which applies rotate_half within each spatial chunk of the head,
-                    # rather than pairing first-half/second-half as standard RoPE does.
-                    "rope_config": {
-                        "rotary_theta": vision_config.get("rope_parameters", {}).get("rope_theta", 100),
-                        "rotary_interleave": False,
-                        "multidimensional_rope": True,
-                    },
-                }
-            )
-
-    if arch in ["DeepseekOCRForCausalLM"]:
-        model_config["encoder"].update(
-            {
-                "n_positions": (
-                    vision_config["width"]["clip-l-14-224"]["image_size"]
-                    // vision_config["width"]["clip-l-14-224"]["patch_size"]
-                )
-                ** 2
-                + 1,
-                "patch_size": vision_config["width"]["clip-l-14-224"].get("patch_size", 14),
-                "heads": vision_config["width"]["clip-l-14-224"].get("heads"),
-                "heads_kv": vision_config["width"]["clip-l-14-224"].get("heads"),
-            }
-        )
-
-    if arch in ["HunYuanVLForConditionalGeneration"]:
-        model_config["encoder"].update({})
-        model_config["spatial_merge_size"] = vision_config.get("spatial_merge_size", None)
-
-    # Whisper encoder-decoder
+    # Whisper: remove rope_config (not used) and extract generation settings
     if arch == "WhisperForConditionalGeneration":
-        # Whisper uses separate encoder/decoder configs in a flat HF config
-        model_config["layers"] = config.get("decoder_layers", config.get("num_hidden_layers"))
-        model_config["hidden_size"] = config.get("d_model")
-        model_config["heads"] = config.get("decoder_attention_heads")
-        model_config["heads_kv"] = config.get("decoder_attention_heads")
-        model_config["transformer_ff"] = config.get("decoder_ffn_dim")
-        model_config["encoder"] = {
-            "layers": config.get("encoder_layers"),
-            "hidden_size": config.get("d_model"),
-            "heads": config.get("encoder_attention_heads"),
-            "heads_kv": config.get("encoder_attention_heads"),
-            "transformer_ff": config.get("encoder_ffn_dim"),
-            "num_mel_bins": config.get("num_mel_bins", 80),
-            "max_source_positions": config.get("max_source_positions", 1500),
-            "layer_norm": "standard",
-            "norm_eps": 1e-5,
-            "mlp_activation_fn": "gelu",
-            "add_qkvbias": True,
-            "add_key_bias": False,
-            "add_final_linear_bias": True,
-            "add_ffnbias": True,
-            "position_encoding_type": None,
-        }
-        max_target_positions = config.get("max_target_positions", 448)
-        model_config["embeddings"].update(
-            {
-                "position_encoding_type": "Learned",
-                "n_positions": max_target_positions,
-            }
-        )
-        # Whisper uses learned positional embeddings, not rotary
         model_config.pop("rope_config", None)
-        # Whisper-specific generation settings stored at model level
         if hf.generation_config is not None:
             audio_keys = ["suppress_tokens", "begin_suppress_tokens", "no_timestamps_token_id"]
             for key in audio_keys:
@@ -655,43 +375,6 @@ def build_config_dict(hf):
             # Rename to avoid collision with decoder's alignment_heads (int)
             if "alignment_heads" in hf.generation_config:
                 model_config["word_timestamp_heads"] = hf.generation_config["alignment_heads"]
-
-    if arch in [
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    ]:
-        # Vision config uses different key names from standard vision models
-        num_pos_embed = vision_config.get("num_position_embeddings", 0)
-        patch_size = vision_config.get("patch_size", 16)
-        num_heads = vision_config.get("num_heads", 16)
-        # image_size derived from num_position_embeddings: num_pos = (img_size / patch_size)^2
-        img_size = int(num_pos_embed**0.5) * patch_size if num_pos_embed else 0
-        model_config["encoder"].update(
-            {
-                # Qwen3.5 VL uses `num_heads` not `num_attention_heads`
-                "heads": num_heads,
-                "heads_kv": num_heads,
-                "head_dim": vision_config.get("hidden_size", 0) // num_heads,
-                # Override layers using `depth` key
-                "layers": vision_config.get("depth", model_config["encoder"].get("layers", 27)),
-                # No fixed image_size in HF config → derive from pos embed table size
-                "image_size": img_size,
-                # Absolute position embedding table size
-                "num_position_embeddings": num_pos_embed,
-                # Use 2D RoPE (pixtral-style) for vision attention
-                "position_encoding_type": PositionEncodingType.Rotary,
-                "rope_config": {
-                    "rotary_interleave": False,
-                    "rotary_theta": 10000,
-                },
-                # Number of input channels
-                "num_channels": vision_config.get("in_channels", 3),
-                # Image token id from top-level config
-                "image_token_id": other_config.get("image_token_id", 151655),
-            }
-        )
-        model_config["spatial_merge_size"] = vision_config.get("spatial_merge_size", 2)
 
     # patch transformer_ff
     if model_config["transformer_ff"] is None:
@@ -754,7 +437,7 @@ def build_config_dict(hf):
 
     # Handle rope_parameters (newer HF format, e.g. Qwen3.5 VL)
     # Skip Gemma4's per-layer-type format ("sliding_attention"/"full_attention" keys)
-    # which is handled separately by _build_gemma4_config.
+    # which is handled by _build_gemma4_decoder_patch inside config_from_hf.
     if config.get("rope_parameters", None) is not None:
         rope_params = config["rope_parameters"]
         if "sliding_attention" not in rope_params:
@@ -925,40 +608,6 @@ def build_config_dict(hf):
         params = ["weight", "bias"]
 
     model_config["share_decoder_embeddings"] = config.get("tie_word_embeddings", False)
-
-    # Update model_config based on architecture
-    if arch in KEY_MAPS:
-        arch_config = KEY_MAPS[arch].get("config", {})
-        if arch_config:
-            from eole.config import recursive_update_dict
-
-            model_config = recursive_update_dict(model_config, arch_config, {})
-
-    # Qwen3.5-specific: extract hybrid layer types and linear attention parameters
-    if arch in [
-        "Qwen3_5TextForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    ]:
-        layer_types = config.get("layer_types", None)
-        if layer_types is not None:
-            model_config.setdefault("decoder", {})["layer_types"] = layer_types
-        for key in [
-            "linear_conv_kernel_dim",
-            "linear_key_head_dim",
-            "linear_value_head_dim",
-            "linear_num_key_heads",
-            "linear_num_value_heads",
-        ]:
-            val = config.get(key, None)
-            if val is not None:
-                model_config.setdefault("decoder", {})[key] = val
-
-    # Gemma4-specific: extract layer_types, per-layer-type rope parameters,
-    # global_head_dim and global_heads_kv for full_attention layers.
-    if arch in ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"]:
-        model_config = _build_gemma4_config(config, model_config)
 
     return model_config, training_config, params
 
