@@ -181,11 +181,15 @@ class GeneratorLM(Inference):
         # we need proper set up to run the forward pass of the decoder or decoder layer
         if EOLE_TORCH_COMPILE:
             start_wu = time()
-            images = batch.get("images", None)
-            if images is not None:
-                emb, _ = self.model.embed_vision_language_features(src, images=images)
-            else:
-                emb = self.model.tgt_emb(src, step=0)
+            # For vision models we intentionally skip running the full vision
+            # encoder here.  The warmup only needs the embedding tensor for its
+            # device/dtype/batch-size metadata: _init_cache uses those three
+            # properties and _compile_decoder replaces it with a dummy tensor
+            # internally.  Running embed_vision_language_features would process
+            # the images a second time (step 0 will do so again), causing a
+            # memory spike that OOMs large quantised vision models such as
+            # gemma4-31B-int4 even when the model fits without torch.compile.
+            emb = self.model.tgt_emb(src, step=0)
             tgt_pad_mask = src.eq(self._tgt_pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
             self.model.decoder._init_cache(emb, tgt_pad_mask)
             self.model.decoder.map_state(fn_tile)

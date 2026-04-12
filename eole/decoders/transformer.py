@@ -1361,8 +1361,24 @@ class TransformerDecoder(DecoderBase):
                 # have their kcache/vcache set by the linking step below.
                 heads_kv = layer.self_attn.heads_kv
                 dph = layer.self_attn.dim_per_head
-                layer.self_attn.kcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
-                layer.self_attn.vcache = torch.zeros((b, self.cache_len_tgt, heads_kv, dph), dtype=dtype, device=device)
+                target_shape = (b, self.cache_len_tgt, heads_kv, dph)
+                if (
+                    layer.self_attn.kcache is not None
+                    and layer.self_attn.vcache is not None
+                    and layer.self_attn.kcache.shape == target_shape
+                    and layer.self_attn.kcache.dtype == dtype
+                    and layer.self_attn.kcache.device == device
+                ):
+                    # Reuse the existing tensors in-place to avoid a second
+                    # allocation while a previous cache is still live (e.g.
+                    # after torch.compile warmup).  In-place zeroing also
+                    # keeps the GPU-buffer addresses stable, which is required
+                    # for CUDA-graph correctness.
+                    layer.self_attn.kcache.zero_()
+                    layer.self_attn.vcache.zero_()
+                else:
+                    layer.self_attn.kcache = torch.zeros(target_shape, dtype=dtype, device=device)
+                    layer.self_attn.vcache = torch.zeros(target_shape, dtype=dtype, device=device)
                 layer.self_attn.cache_leftpad = cache_leftpad
                 if layer.context_attn:
                     # prefill context KV with encoder out
