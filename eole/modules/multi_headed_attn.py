@@ -350,21 +350,37 @@ class MultiHeadedAttention(torch.nn.Module):
 
             # Apply pytorch scaled_dot_product_attention (expects b, h, l, d)
             q_t = query.transpose(1, 2)
-            # Under torch.compile, inductor can produce a query with strideM < headDim
-            # (e.g. (B,H,1,D) with strides (H*D, D, 1, 1)) which violates
-            # _scaled_dot_product_efficient_attention's alignment requirement.
-            # Calling .contiguous() inside the compiled region forces correct
-            # memory layout; inductor fuses/eliminates the copy when possible.
-            if torch.compiler.is_compiling():
-                q_t = q_t.contiguous()
+            k_t = key.transpose(1, 2)
+            v_t = value.transpose(1, 2)
+            # When torch.compile specializes on S=1 (decode step), inductor assigns
+            # stride=1 to the size-1 sequence dimension via reinterpret_tensor.
+            # This violates _scaled_dot_product_efficient_attention's hard kernel
+            # requirement that strideM (stride of the S dim) >= headDim.
+            # .contiguous() / .clone() do not help because inductor considers any
+            # stride valid for a size-1 dimension and optimizes the copy away.
+            # Fix: torch.cat forces a new buffer allocation of shape (B, H, 2, D)
+            # which inductor cannot express as reinterpret_tensor; the resulting
+            # buffer is always contiguous with strideM = headDim >= headDim.
+            # We then slice back to the first token after the attention.
+            _mask = attn_mask
+            _sliced = False
+            if torch.compiler.is_compiling() and q_t.size(2) == 1:
+                _zero = q_t.new_zeros(q_t.shape[0], q_t.shape[1], 1, q_t.shape[3])
+                q_t = torch.cat([q_t, _zero], dim=2)  # (B, H, 2, D) – strideM = D
+                if _mask is not None:
+                    _mask = torch.cat([_mask, _mask], dim=-2)  # (B, 1, 2, L)
+                _sliced = True
             attn_output = F.scaled_dot_product_attention(
                 q_t,
-                key.transpose(1, 2),
-                value.transpose(1, 2),
-                attn_mask=attn_mask,
+                k_t,
+                v_t,
+                attn_mask=_mask,
                 dropout_p=self.dropout_p,
                 scale=self.scale,
-            ).transpose(1, 2)
+            )
+            if _sliced:
+                attn_output = attn_output[:, :, :1, :]
+            attn_output = attn_output.transpose(1, 2)
             # Transpose back to b, l, h, d
             attn = None
         else:
