@@ -349,8 +349,16 @@ class MultiHeadedAttention(torch.nn.Module):
         ):
 
             # Apply pytorch scaled_dot_product_attention (expects b, h, l, d)
+            q_t = query.transpose(1, 2)
+            # Under torch.compile, inductor can produce a query with strideM < headDim
+            # (e.g. (B,H,1,D) with strides (H*D, D, 1, 1)) which violates
+            # _scaled_dot_product_efficient_attention's alignment requirement.
+            # Calling .contiguous() inside the compiled region forces correct
+            # memory layout; inductor fuses/eliminates the copy when possible.
+            if torch.compiler.is_compiling():
+                q_t = q_t.contiguous()
             attn_output = F.scaled_dot_product_attention(
-                query.transpose(1, 2),
+                q_t,
                 key.transpose(1, 2),
                 value.transpose(1, 2),
                 attn_mask=attn_mask,
