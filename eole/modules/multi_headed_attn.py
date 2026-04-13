@@ -352,34 +352,39 @@ class MultiHeadedAttention(torch.nn.Module):
             q_t = query.transpose(1, 2)
             k_t = key.transpose(1, 2)
             v_t = value.transpose(1, 2)
-            # When torch.compile specializes on S=1 (decode step), inductor assigns
-            # stride=1 to the size-1 sequence dimension via reinterpret_tensor.
-            # This violates _scaled_dot_product_efficient_attention's hard kernel
-            # requirement that strideM (stride of the S dim) >= headDim.
-            # .contiguous() / .clone() do not help because inductor considers any
-            # stride valid for a size-1 dimension and optimizes the copy away.
-            # Fix: torch.cat forces a new buffer allocation of shape (B, H, 2, D)
-            # which inductor cannot express as reinterpret_tensor; the resulting
-            # buffer is always contiguous with strideM = headDim >= headDim.
-            # We then slice back to the first token after the attention.
-            _mask = attn_mask
-            _sliced = False
-            if torch.compiler.is_compiling() and q_t.size(2) == 1:
-                _zero = q_t.new_zeros(q_t.shape[0], q_t.shape[1], 1, q_t.shape[3])
-                q_t = torch.cat([q_t, _zero], dim=2)  # (B, H, 2, D) – strideM = D
-                if _mask is not None:
-                    _mask = torch.cat([_mask, _mask], dim=-2)  # (B, 1, 2, L)
-                _sliced = True
-            attn_output = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=_mask,
-                dropout_p=self.dropout_p,
-                scale=self.scale,
-            )
-            if _sliced:
-                attn_output = attn_output[:, :, :1, :]
+            if q_t.size(2) == 1:
+                # Single-token decode path: use manual dot-product attention.
+                #
+                # _scaled_dot_product_efficient_attention (mem_efficient backend)
+                # requires strideM (stride of the S dimension) >= headDim.
+                # Under torch.compile / inductor, the query transposed to
+                # (B, H, 1, D) can receive stride=1 on the S dim because
+                # inductor considers any stride valid for a size-1 dimension
+                # (it uses reinterpret_tensor).  .contiguous() and .clone()
+                # are both silently optimised away for the same reason.
+                # torch.cat works around inductor but fails fake-tensor
+                # validation inside torch.compile fullgraph=True (Mode 2).
+                #
+                # For a single query token mem_efficient SDPA provides no
+                # memory benefit anyway.  Plain matmul attention is correct,
+                # fast, and has no stride or fake-tensor constraints.
+                scale_val = self.dim_per_head**-0.5 if self.scale is None else self.scale
+                attn_scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale_val
+                if attn_mask is not None:
+                    attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
+                attn_weights = F.softmax(attn_scores, dim=-1)
+                if self.dropout_p > 0.0 and self.training:
+                    attn_weights = F.dropout(attn_weights, p=self.dropout_p)
+                attn_output = torch.matmul(attn_weights, v_t)
+            else:
+                attn_output = F.scaled_dot_product_attention(
+                    q_t,
+                    k_t,
+                    v_t,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout_p,
+                    scale=self.scale,
+                )
             attn_output = attn_output.transpose(1, 2)
             # Transpose back to b, l, h, d
             attn = None
