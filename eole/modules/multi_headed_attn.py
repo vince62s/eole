@@ -477,7 +477,7 @@ class SelfMHA(MultiHeadedAttention):
         key: Tensor,
         value: Tensor,
         cache_seqlens: Tensor,
-        cache_slice: Tensor | int,
+        cache_slice: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compile-friendly cache update without graph breaks.
@@ -486,20 +486,24 @@ class SelfMHA(MultiHeadedAttention):
           prefill: (B, S, H, D)
           decode:  (B, 1, H, D)
         cache_seqlens: (B,) - current position for each sequence (assumed uniform)
-        cache_slice: position index to update.
-            - At prefill (S > 1): a 1-D tensor of position indices.
-            - At decode  (S == 1): a plain Python int.
-              * Eager: int indexing ``kcache[:, int, :, :]`` avoids a scatter op.
-              * Compile: ``is_compiling()`` is True so slice notation
-                ``kcache[:, int:int+1, :, :]`` is used instead; this avoids
-                generating a scatter kernel while still writing to the correct
-                (dynamic) position because torch.compile treats the int as a
-                symbolic value when its value-guard has been filtered out by
-                guard_filter_fn.
+        cache_slice: position index(es) to update.
+            - At prefill (S > 1): a 1-D tensor of S position indices.
+            - At decode  (S == 1): a 1-element tensor ``tensor([N])``.
+
+        When compiling (``torch.compiler.is_compiling()``), slice notation is used
+        to avoid emitting a scatter kernel:
+            ``kcache[:, cache_slice[0] : cache_slice[0]+1, :, :]``
+        where ``cache_slice[0]`` is a 0-d (scalar) tensor treated as a dynamic
+        value by torch.compile.
+
+        In eager mode, fancy-index with the tensor directly:
+            ``kcache[:, cache_slice, :, :]``
+        For the single-token decode case this preserves the sequence dimension
+        (→ shape (B, 1, H, D)) and avoids the scatter entirely.
         """
         if torch.compiler.is_compiling():
-            self.kcache[:, cache_slice : cache_slice + 1, :, :] = key
-            self.vcache[:, cache_slice : cache_slice + 1, :, :] = value
+            self.kcache[:, cache_slice[0] : cache_slice[0] + 1, :, :] = key
+            self.vcache[:, cache_slice[0] : cache_slice[0] + 1, :, :] = value
         else:
             self.kcache[:, cache_slice, :, :] = key
             self.vcache[:, cache_slice, :, :] = value
