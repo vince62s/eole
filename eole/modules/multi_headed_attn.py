@@ -13,6 +13,7 @@ from .relative_position_bias import relative_matmul, gen_relative_positions, com
 from .alibi_position_bias import AlibiPositionalBias
 from .rope import apply_rotary_emb, apply_rotary_emb_multidim, apply_rotary_pos_emb_xdrope
 from eole.constants import LayerNorm
+from eole.ops import _sdpa
 
 
 # Help functions to split model dim per head
@@ -30,6 +31,13 @@ def blhd_to_bld(x: Tensor) -> Tensor:
     """
     x_0, x_1, x_2, x_3 = x.size()
     return x.reshape(x_0, x_1, x_2 * x_3)
+
+
+def _make_contiguous_bhld(x):
+    b, l, h, d = x.shape
+    out = x.new_empty(b, h, l, d)  # fresh allocation, compiler can't elide
+    out.copy_(x.permute(0, 2, 1, 3))
+    return out
 
 
 class MultiHeadedAttention(torch.nn.Module):
@@ -349,15 +357,20 @@ class MultiHeadedAttention(torch.nn.Module):
         ):
 
             # Apply pytorch scaled_dot_product_attention (expects b, h, l, d)
+            # using a fake wrapper since torch.compile need contiguous() tensors
+            # transpose done in the custom_op
+            # but compiler bypass the contiguous op
+            qt = _make_contiguous_bhld(query)
+            kt = key.transpose(1, 2)
+            vt = value.transpose(1, 2)
             attn_output = F.scaled_dot_product_attention(
-                query.transpose(1, 2),
-                key.transpose(1, 2),
-                value.transpose(1, 2),
+                qt,
+                kt,
+                vt,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout_p,
                 scale=self.scale,
             ).transpose(1, 2)
-            # Transpose back to b, l, h, d
             attn = None
         else:
             # Manual attention computation
@@ -464,7 +477,7 @@ class SelfMHA(MultiHeadedAttention):
         key: Tensor,
         value: Tensor,
         cache_seqlens: Tensor,
-        cache_slice: Tensor,
+        cache_slice: Tensor | int,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compile-friendly cache update without graph breaks.
@@ -475,7 +488,6 @@ class SelfMHA(MultiHeadedAttention):
         cache_seqlens: (B,) - current position for each sequence (assumed uniform)
         cache_slice: tensor of position indices to update
         """
-
         self.kcache[:, cache_slice, :, :] = key
         self.vcache[:, cache_slice, :, :] = value
 
