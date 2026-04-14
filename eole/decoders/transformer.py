@@ -599,7 +599,7 @@ class TransformerDecoder(DecoderBase):
             if (B, S) not in self.compiled_shapes:
                 dummy_emb = torch.randn(B, 1, self.hidden_size, device=emb.device, dtype=emb.dtype)
                 dummy_pad_mask = torch.zeros((B, 1), dtype=torch.bool, device=emb.device).unsqueeze(1)
-                self._forward_compile(
+                self.forward(
                     dummy_emb,
                     enc_out=enc_out,
                     src_pad_mask=src_pad_mask,
@@ -804,7 +804,21 @@ class TransformerDecoder(DecoderBase):
 
         return mask.unsqueeze(1)  # (B, 1, chunk_size, cache_len)
 
-    def _forward_chunked_prefill(self, emb, src_ids=None, per_layer_inputs=None, **kwargs):
+    def _forward_chunked_prefill(
+        self,
+        emb,
+        src_ids=None,
+        per_layer_inputs=None,
+        enc_out=None,
+        src_pad_mask=None,
+        tgt_pad_mask_full=None,
+        image_locations=None,
+        prefix_len=None,
+        with_align=False,
+        return_attn=False,
+        collect_cross_attns=False,
+        pos_ids_2d=None,
+    ):
         """Process a long prefill sequence in chunks.
 
         When ``sliding_window > 0`` and the input sequence is longer than the
@@ -855,13 +869,18 @@ class TransformerDecoder(DecoderBase):
             src_ids (Tensor, optional): ``(B, S)`` integer token IDs
                 corresponding to *emb*.  Required for cache key computation;
                 if ``None``, caching is skipped for the entire prefill.
-            **kwargs: forwarded to ``_forward_eager`` unchanged except that
-                ``tgt_pad_mask`` is sliced per chunk, ``image_locations`` is
-                always passed as the full ``(B, S_full)`` tensor so that
-                ``_update_causal_mask`` (called inside ``_forward_eager``) can
-                correctly compute cross-chunk image-to-image attention using
-                absolute query positions, and ``prefix_len`` is forwarded to
-                every chunk unchanged.
+            enc_out (Tensor, optional): Encoder outputs.
+            src_pad_mask (Tensor, optional): Source padding mask (already
+                unsqueezed for cross-attention if applicable).
+            tgt_pad_mask_full (Tensor): Full target padding mask ``(B, 1, S)``.
+            image_locations (Tensor, optional): Full ``(B, S_full)`` image
+                token location mask for cross-chunk image-to-image attention.
+            prefix_len (int, optional): Prefix length forwarded unchanged to
+                every chunk for mask computation.
+            with_align (bool): Whether to return alignment attention.
+            return_attn (bool): Whether to return attention weights.
+            collect_cross_attns (bool): Whether to collect cross-attentions.
+            pos_ids_2d (Tensor, optional): 2-D position ids for vision models.
 
         Returns:
             (Tensor, dict): concatenated hidden-state output over all chunks
@@ -873,13 +892,6 @@ class TransformerDecoder(DecoderBase):
         # Sliding window takes priority as the chunk size because it is a
         # correctness constraint; prefill_chunk_size is an optional knob.
         chunk_size = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
-
-        tgt_pad_mask_full = kwargs.pop("tgt_pad_mask")
-        # Extract image_locations and prefix_len so we can distribute them
-        # correctly to each chunk (see per-chunk handling below).
-        image_locations = kwargs.pop("image_locations", None)
-        prefix_len = kwargs.pop("prefix_len", None)
-        return_attn = kwargs.get("return_attn", False) or kwargs.get("with_align", False)
 
         # Caching is disabled only when image tokens are present (their
         # attention patterns depend on pixel-layout info not captured by
@@ -950,26 +962,103 @@ class TransformerDecoder(DecoderBase):
             emb_chunk = emb[:, start:end, :]
             pad_mask_chunk = tgt_pad_mask_full[:, :, start:end]
 
-            chunk_kwargs = dict(kwargs)
-            chunk_kwargs["tgt_pad_mask"] = pad_mask_chunk
+            # Compute per-chunk setup (current_step advances after each chunk).
+            current_step = self.cache_seqlens[0]
+            pos_ids_1d = current_step + torch.arange(chunk_len, device=emb.device)
 
-            if image_locations is not None:
-                # Always pass the full image_locations tensor; _forward_eager
-                # will slice query positions using absolute indices when it
-                # calls _update_causal_mask for cross-chunk image-to-image
-                # attention.
-                chunk_kwargs["image_locations"] = image_locations
+            position_embeddings = self.rope.cos_sin
+            if self.rope_local is not None:
+                position_embeddings_local = self.rope_local.cos_sin
+                if self.has_sliding_attn:
+                    pos_emb_list = [
+                        (
+                            position_embeddings_local[pos_ids_1d]
+                            if layer.layer_type == "sliding_attention"
+                            else position_embeddings[pos_ids_1d]
+                        )
+                        for layer in self.transformer_layers
+                    ]
+                else:
+                    pos_emb_list = [
+                        (
+                            position_embeddings_local[pos_ids_1d]
+                            if (i + 1) % self.interleave_local
+                            else position_embeddings[pos_ids_1d]
+                        )
+                        for i in range(len(self.transformer_layers))
+                    ]
+            elif position_embeddings is not None:
+                pos_emb_list = [position_embeddings[pos_ids_1d]] * len(self.transformer_layers)
+            else:
+                pos_emb_list = [None] * len(self.transformer_layers)
 
-            if prefix_len is not None:
-                # prefix_len is passed to every chunk unchanged; _chunk_attn_mask
-                # uses absolute positions so prefix tokens beyond the first chunk
-                # are handled correctly in all chunks.
-                chunk_kwargs["prefix_len"] = prefix_len
+            attn_mask_full = None
+            if not self.flash:
+                # Prefill chunks always use a tensor cache_slice.
+                cache_slice = pos_ids_1d
+                attn_mask = self._chunk_attn_mask(
+                    chunk_len, current_step, pad_mask_chunk, prefix_len=prefix_len
+                )
+                if self.has_sliding_attn:
+                    attn_mask_full = self._chunk_attn_mask(
+                        chunk_len,
+                        current_step,
+                        pad_mask_chunk,
+                        prefix_len=prefix_len,
+                        use_sliding_window=False,
+                    )
+                if image_locations is not None:
+                    # Always use the full image_locations tensor so that
+                    # _update_causal_mask can compute cross-chunk
+                    # image-to-image attention using absolute positions.
+                    cache_len = self.cache_len_tgt
+                    q_abs_positions = current_step + torch.arange(
+                        chunk_len, device=pad_mask_chunk.device
+                    )
+                    k_positions = torch.arange(cache_len, device=pad_mask_chunk.device)
+                    filled_mask = k_positions < (current_step + chunk_len)
+                    img_loc_len = image_locations.size(1)
+                    if img_loc_len < cache_len:
+                        k_img_full = torch.zeros(
+                            image_locations.size(0),
+                            cache_len,
+                            dtype=torch.bool,
+                            device=image_locations.device,
+                        )
+                        k_img_full[:, :img_loc_len] = image_locations
+                    else:
+                        k_img_full = image_locations[:, :cache_len]
+                    attn_mask = self._update_causal_mask(
+                        attn_mask,
+                        image_locations[:, q_abs_positions],
+                        k_img_full & filled_mask,
+                    )
+                    if self.has_sliding_attn:
+                        attn_mask_full = self._update_causal_mask(
+                            attn_mask_full,
+                            image_locations[:, q_abs_positions],
+                            k_img_full & filled_mask,
+                        )
+                lin_attn_mask = ~pad_mask_chunk[:, 0, :] if self.has_linear_attn else None
+            else:
+                attn_mask = None
+                cache_slice = None
+                lin_attn_mask = ~pad_mask_chunk[:, 0, :] if self.has_linear_attn else None
 
             emb_chunk_out, chunk_attns = self._forward_eager(
                 emb_chunk,
                 per_layer_inputs=per_layer_inputs[:, start:end] if per_layer_inputs is not None else None,
-                **chunk_kwargs,
+                enc_out=enc_out,
+                src_pad_mask=src_pad_mask,
+                with_align=with_align,
+                return_attn=return_attn,
+                collect_cross_attns=collect_cross_attns,
+                pos_emb_list=pos_emb_list,
+                cache_slice=cache_slice,
+                attn_mask=attn_mask,
+                attn_mask_full=attn_mask_full,
+                lin_attn_mask=lin_attn_mask,
+                pos_ids_2d=pos_ids_2d,
             )
             all_emb_chunks.append(emb_chunk_out)
 
@@ -1036,57 +1125,9 @@ class TransformerDecoder(DecoderBase):
         if self.hidden_size_per_layer_input:
             per_layer_inputs = self._compute_per_layer_inputs(emb, src_ids)
 
-        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["0", "1"] and S == 1:
-            return self._forward_compile(emb, **kwargs)
-        # Determine the effective chunk size for chunked prefill.
-        # Sliding window takes precedence (it is a correctness requirement);
-        # prefill_chunk_size is an optional performance knob for non-sliding models.
-        effective_chunk = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
-        if effective_chunk > 0 and S > effective_chunk and self.cache_seqlens is not None:
-            return self._forward_chunked_prefill(emb, src_ids=src_ids, per_layer_inputs=per_layer_inputs, **kwargs)
-        return self._forward_eager(emb, per_layer_inputs=per_layer_inputs, **kwargs)
-
-    def _forward_eager(self, emb, per_layer_inputs=None, **kwargs):
-        """
-        Decode a sequence using transformer layers.
-
-        Args:
-            emb (Tensor):
-                Target embeddings of shape
-                ``(batch_size, tgt_len, hidden_size)``.
-            per_layer_inputs (Tensor | None):
-                Optional Gemma4 per-layer inputs of shape
-                ``(batch_size, tgt_len, num_layers, hidden_size_per_layer_input)``.
-                ``None`` for all other models.
-
-            **kwargs:
-                enc_out (Tensor, optional):
-                    Encoder outputs.
-                tgt_pad_mask (Tensor):
-                    Target padding mask.
-                src_pad_mask (Tensor, optional):
-                    Source padding mask.
-                with_align (bool, optional):
-                    Whether to return alignment attention.
-
-        Returns:
-            (Tensor, Dict[str, Tensor]):
-
-            * dec_outs:
-                Decoder outputs of shape
-                ``(batch_size, tgt_len, hidden_size)``.
-
-            * attns:
-                Dictionary of attention tensors.
-
-                - ``attns["std"]``:
-                  Standard attention of shape
-                  ``(batch_size, tgt_len, src_len)``.
-                - ``attns["align"]`` (optional):
-                  Alignment attention of shape
-                  ``(batch_size, tgt_len, src_len)``.
-        """
-        _, S, _ = emb.size()
+        # Extract all kwargs outside the compile region so that setup work
+        # (mask building, position-embedding indexing, cache-slice selection)
+        # stays in eager mode regardless of which execution path is taken.
         enc_out = kwargs.pop("enc_out", None)
         tgt_pad_mask = kwargs.pop("tgt_pad_mask", None)
         assert tgt_pad_mask is not None, "TransformerDecoder requires a tgt pad mask"
@@ -1099,8 +1140,32 @@ class TransformerDecoder(DecoderBase):
         with_align = kwargs.pop("with_align", False)
         return_attn = with_align or kwargs.pop("return_attn", False)
         collect_cross_attns = kwargs.pop("collect_cross_attns", False)
-        all_cross_attns = [] if (return_attn and collect_cross_attns) else None
+        pos_ids_2d = kwargs.pop("pos_ids_2d", None)
+        image_locations = kwargs.pop("image_locations", None)
+        prefix_len = kwargs.pop("prefix_len", None)
 
+        # Chunked prefill: route before computing per-step position embeddings
+        # because current_step advances with each chunk.
+        # Sliding window takes precedence (it is a correctness requirement);
+        # prefill_chunk_size is an optional performance knob for non-sliding models.
+        effective_chunk = self.sliding_window if self.sliding_window > 0 else self.prefill_chunk_size
+        if effective_chunk > 0 and S > effective_chunk and self.cache_seqlens is not None:
+            return self._forward_chunked_prefill(
+                emb,
+                src_ids=src_ids,
+                per_layer_inputs=per_layer_inputs,
+                enc_out=enc_out,
+                src_pad_mask=src_pad_mask,
+                tgt_pad_mask_full=tgt_pad_mask,
+                image_locations=image_locations,
+                prefix_len=prefix_len,
+                with_align=with_align,
+                return_attn=return_attn,
+                collect_cross_attns=collect_cross_attns,
+                pos_ids_2d=pos_ids_2d,
+            )
+
+        # Compute current_step and position embeddings outside the compile region.
         if self.cache_seqlens is not None:
             # prefill & decoding
             current_step = self.cache_seqlens[0]
@@ -1139,13 +1204,17 @@ class TransformerDecoder(DecoderBase):
         else:
             pos_emb_list = [None] * len(self.transformer_layers)
 
+        # Compute cache_slice and attention masks outside the compile region so
+        # that:
+        #   - prefill (S > 1, eager):  cache_slice is a tensor of position indices.
+        #   - decode  (S == 1, compile): cache_slice is a plain Python int, which
+        #     avoids a data-dependent tensor in the compiled graph and lets
+        #     torch.compile reuse the same cached kernel across steps.
+        attn_mask_full = None
         if not self.flash:
-            cache_slice = pos_ids_1d  # tensor of position indices to update
             if S > 1:
-                # training or prefill decoding, combine pad and causal mask
-                image_locations = kwargs.pop("image_locations", None)
-                prefix_len = kwargs.pop("prefix_len", None)
-
+                # training or prefill: cache_slice is a tensor
+                cache_slice = pos_ids_1d
                 if self.cache_seqlens is not None:
                     # Prefill with KV cache (including chunked prefill chunk 0):
                     # use an absolute-position mask so the key dimension always
@@ -1222,6 +1291,10 @@ class TransformerDecoder(DecoderBase):
                             attn_mask_full = self._update_causal_mask(attn_mask_full, image_locations)
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
+                # Decode step (S == 1): use a plain int for cache_slice so that
+                # the compiled graph sees a static value rather than a 1-element
+                # tensor, avoiding unnecessary recompilations.
+                cache_slice = int(current_step.item()) if hasattr(current_step, "item") else int(current_step)
                 # at decoding _init_cache must be called and init these
                 valid = self.position_indices <= self.cache_seqlens.view(-1, 1)
                 valid = valid & self.left_pad_attn_mask
@@ -1237,14 +1310,119 @@ class TransformerDecoder(DecoderBase):
                 lin_attn_mask = None
         else:
             attn_mask = None
-            attn_mask_full = None
             cache_slice = None  # triggers flash decoding
             if S > 1 and self.has_linear_attn:
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :]
             else:
                 lin_attn_mask = None
 
-        pos_ids_2d = kwargs.pop("pos_ids_2d", None)
+        if EOLE_TORCH_COMPILE and EOLE_COMPILE_MODE in ["0", "1"] and S == 1:
+            return self._forward_compile(
+                emb,
+                per_layer_inputs=per_layer_inputs,
+                enc_out=enc_out,
+                src_pad_mask=src_pad_mask,
+                with_align=with_align,
+                return_attn=return_attn,
+                collect_cross_attns=collect_cross_attns,
+                pos_emb_list=pos_emb_list,
+                cache_slice=cache_slice,
+                attn_mask=attn_mask,
+                attn_mask_full=attn_mask_full,
+                lin_attn_mask=lin_attn_mask,
+                pos_ids_2d=pos_ids_2d,
+            )
+        return self._forward_eager(
+            emb,
+            per_layer_inputs=per_layer_inputs,
+            enc_out=enc_out,
+            src_pad_mask=src_pad_mask,
+            with_align=with_align,
+            return_attn=return_attn,
+            collect_cross_attns=collect_cross_attns,
+            pos_emb_list=pos_emb_list,
+            cache_slice=cache_slice,
+            attn_mask=attn_mask,
+            attn_mask_full=attn_mask_full,
+            lin_attn_mask=lin_attn_mask,
+            pos_ids_2d=pos_ids_2d,
+        )
+
+    def _forward_eager(
+        self,
+        emb,
+        per_layer_inputs=None,
+        enc_out=None,
+        src_pad_mask=None,
+        with_align=False,
+        return_attn=False,
+        collect_cross_attns=False,
+        pos_emb_list=None,
+        cache_slice=None,
+        attn_mask=None,
+        attn_mask_full=None,
+        lin_attn_mask=None,
+        pos_ids_2d=None,
+    ):
+        """
+        Decode a sequence using transformer layers.
+
+        All setup (mask computation, position-embedding indexing, cache-slice
+        selection) is performed by the caller (``forward`` or
+        ``_forward_chunked_prefill``) before this method is invoked.  This
+        keeps the body of ``_forward_eager`` free of data-dependent branches
+        and host-device synchronisations so that ``torch.compile`` can trace
+        it without graph breaks.
+
+        Args:
+            emb (Tensor):
+                Target embeddings of shape
+                ``(batch_size, tgt_len, hidden_size)``.
+            per_layer_inputs (Tensor | None):
+                Optional Gemma4 per-layer inputs of shape
+                ``(batch_size, tgt_len, num_layers, hidden_size_per_layer_input)``.
+                ``None`` for all other models.
+            enc_out (Tensor, optional): Encoder outputs.
+            src_pad_mask (Tensor, optional): Source padding mask (already
+                unsqueezed to ``(B, 1, 1, src_len)`` for cross-attention).
+            with_align (bool): Whether to return alignment attention.
+            return_attn (bool): Whether to return attention weights.
+            collect_cross_attns (bool): Whether to collect per-layer
+                cross-attention tensors.
+            pos_emb_list (list[Tensor | None]): Per-layer positional embeddings
+                pre-indexed to the current query positions.
+            cache_slice (Tensor | int | None): Position indices for the KV
+                cache update.  A tensor for prefill, a plain ``int`` for the
+                single-token decode step (compile-friendly), ``None`` for the
+                flash-attention path.
+            attn_mask (Tensor | None): Pre-computed causal/padding attention
+                mask for standard (non-full_attention) layers.
+            attn_mask_full (Tensor | None): Pre-computed mask for
+                ``full_attention`` layers in hybrid models (Gemma4).
+                ``None`` for non-hybrid models or the flash path.
+            lin_attn_mask (Tensor | None): Padding mask for linear-attention
+                layers.  ``None`` when not applicable.
+            pos_ids_2d (Tensor | None): 2-D position ids for vision models.
+
+        Returns:
+            (Tensor, Dict[str, Tensor]):
+
+            * dec_outs:
+                Decoder outputs of shape
+                ``(batch_size, tgt_len, hidden_size)``.
+
+            * attns:
+                Dictionary of attention tensors.
+
+                - ``attns["std"]``:
+                  Standard attention of shape
+                  ``(batch_size, tgt_len, src_len)``.
+                - ``attns["align"]`` (optional):
+                  Alignment attention of shape
+                  ``(batch_size, tgt_len, src_len)``.
+        """
+        _, S, _ = emb.size()
+        all_cross_attns = [] if (return_attn and collect_cross_attns) else None
         attn_aligns = []
 
         for i, (layer, pos_emb) in enumerate(zip(self.transformer_layers, pos_emb_list)):
