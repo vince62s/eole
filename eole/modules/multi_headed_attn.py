@@ -486,27 +486,21 @@ class SelfMHA(MultiHeadedAttention):
           prefill: (B, S, H, D)
           decode:  (B, 1, H, D)
         cache_seqlens: (B,) - current position for each sequence (assumed uniform)
-        cache_slice: position index(es) to update.
-            - At prefill (S > 1): a 1-D tensor of S position indices.
-            - At decode  (S == 1): a 1-element tensor ``tensor([N])``.
+        cache_slice: 1-D tensor of contiguous position indices to update.
+            - prefill (S > 1): ``[current_step, ..., current_step + S - 1]``
+            - decode  (S == 1): ``tensor([current_step])``
 
-        When compiling (``torch.compiler.is_compiling()``), slice notation is used
-        to avoid emitting a scatter kernel:
-            ``kcache[:, cache_slice[0] : cache_slice[0]+1, :, :]``
-        where ``cache_slice[0]`` is a 0-d (scalar) tensor treated as a dynamic
-        value by torch.compile.
-
-        In eager mode, fancy-index with the tensor directly:
-            ``kcache[:, cache_slice, :, :]``
-        For the single-token decode case this preserves the sequence dimension
-        (→ shape (B, 1, H, D)) and avoids the scatter entirely.
+        ``torch.narrow`` is used for the update in both eager and compiled mode.
+        Its output shape is determined solely by ``length = key.size(1)``
+        (statically known from the input tensor shape), while ``start =
+        cache_slice[0]`` remains a dynamic value — avoiding the data-dependent
+        symbolic-shape guard that slice notation ``start : start+1`` would
+        trigger inside ``torch.compile``.
         """
-        if torch.compiler.is_compiling():
-            self.kcache[:, cache_slice[0] : cache_slice[0] + 1, :, :] = key
-            self.vcache[:, cache_slice[0] : cache_slice[0] + 1, :, :] = value
-        else:
-            self.kcache[:, cache_slice, :, :] = key
-            self.vcache[:, cache_slice, :, :] = value
+        start = cache_slice[0]
+        length = key.size(1)
+        self.kcache.narrow(1, start, length).copy_(key)
+        self.vcache.narrow(1, start, length).copy_(value)
 
         return (self.kcache, self.vcache, query)
 

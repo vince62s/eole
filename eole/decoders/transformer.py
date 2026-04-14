@@ -1302,13 +1302,9 @@ class TransformerDecoder(DecoderBase):
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
                 # Decode step (S == 1): cache_slice is a 1-element tensor.
-                # _update_cache_w_inputs branches on torch.compiler.is_compiling():
-                #   - compile path: kcache[:, cache_slice[0]:cache_slice[0]+1, :, :]
-                #     Slice notation avoids a scatter kernel; cache_slice[0] is a
-                #     0-d (scalar) tensor treated as a dynamic value by torch.compile.
-                #   - eager path: kcache[:, cache_slice, :, :]
-                #     1-element tensor fancy-index preserves the seq dimension
-                #     → shape (B, 1, H, D) matching key/value, no scatter needed.
+                # _update_cache_w_inputs uses torch.narrow(1, cache_slice[0], 1)
+                # which accepts a dynamic tensor start while keeping the output
+                # shape statically known — no data-dependent guard in compile.
                 cache_slice = pos_ids_1d  # shape [1], value = current step
                 # at decoding _init_cache must be called and init these
                 valid = self.position_indices <= self.cache_seqlens.view(-1, 1)
