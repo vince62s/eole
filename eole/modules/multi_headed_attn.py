@@ -486,21 +486,19 @@ class SelfMHA(MultiHeadedAttention):
           prefill: (B, S, H, D)
           decode:  (B, 1, H, D)
         cache_seqlens: (B,) - current position for each sequence (assumed uniform)
-        cache_slice: 1-D tensor of contiguous position indices to update.
-            - prefill (S > 1): ``[current_step, ..., current_step + S - 1]``
+        cache_slice: 1-D int64 tensor of position indices to update.
+            - prefill (S > 1): ``[start, start+1, ..., start+S-1]``
             - decode  (S == 1): ``tensor([current_step])``
 
-        ``torch.narrow`` is used for the update in both eager and compiled mode.
-        Its output shape is determined solely by ``length = key.size(1)``
-        (statically known from the input tensor shape), while ``start =
-        cache_slice[0]`` remains a dynamic value — avoiding the data-dependent
-        symbolic-shape guard that slice notation ``start : start+1`` would
-        trigger inside ``torch.compile``.
+        ``scatter_`` is used so that position indices are treated as pure data
+        by the compiler.  Unlike ``torch.narrow`` (which extracts the start
+        offset via ``.item()`` and creates an unbacked symbol that has no
+        corresponding output shape), ``scatter_`` keeps everything as tensors,
+        producing no data-dependent symbolic-shape guards.
         """
-        start = cache_slice[0]
-        length = key.size(1)
-        self.kcache.narrow(1, start, length).copy_(key)
-        self.vcache.narrow(1, start, length).copy_(value)
+        idx = cache_slice.view(1, -1, 1, 1).expand_as(key)
+        self.kcache.scatter_(1, idx, key)
+        self.vcache.scatter_(1, idx, value)
 
         return (self.kcache, self.vcache, query)
 
