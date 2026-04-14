@@ -599,6 +599,11 @@ class TransformerDecoder(DecoderBase):
             if (B, S) not in self.compiled_shapes:
                 dummy_emb = torch.randn(B, 1, self.hidden_size, device=emb.device, dtype=emb.dtype)
                 dummy_pad_mask = torch.zeros((B, 1), dtype=torch.bool, device=emb.device).unsqueeze(1)
+                # self.forward() computes all setup in eager mode and then
+                # routes to self._forward_compile() (which is
+                # torch.compile(self._forward_eager)) because S == 1 and
+                # EOLE_TORCH_COMPILE / EOLE_COMPILE_MODE are active.
+                # There is no recursion: forward() never calls _compile_decoder.
                 self.forward(
                     dummy_emb,
                     enc_out=enc_out,
@@ -962,7 +967,12 @@ class TransformerDecoder(DecoderBase):
             emb_chunk = emb[:, start:end, :]
             pad_mask_chunk = tgt_pad_mask_full[:, :, start:end]
 
-            # Compute per-chunk setup (current_step advances after each chunk).
+            # Per-chunk position and mask setup.  current_step, pos_ids_1d,
+            # pos_emb_list, cache_slice and attn_mask must be recomputed for
+            # each chunk because self.cache_seqlens advances (via
+            # cache_seqlens.add_(chunk_len) at the end of _forward_eager)
+            # after every chunk, changing the absolute token positions.
+            # This mirrors the logic in forward() but scoped to chunk_len.
             current_step = self.cache_seqlens[0]
             pos_ids_1d = current_step + torch.arange(chunk_len, device=emb.device)
 
@@ -1294,7 +1304,9 @@ class TransformerDecoder(DecoderBase):
                 # Decode step (S == 1): use a plain int for cache_slice so that
                 # the compiled graph sees a static value rather than a 1-element
                 # tensor, avoiding unnecessary recompilations.
-                cache_slice = int(current_step.item()) if hasattr(current_step, "item") else int(current_step)
+                # current_step is self.cache_seqlens[0], a 0-d CUDA tensor, in
+                # this path (S == 1 decode always has an active cache).
+                cache_slice = int(current_step.item())
                 # at decoding _init_cache must be called and init these
                 valid = self.position_indices <= self.cache_seqlens.view(-1, 1)
                 valid = valid & self.left_pad_attn_mask
