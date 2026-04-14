@@ -1301,19 +1301,16 @@ class TransformerDecoder(DecoderBase):
                             attn_mask_full = self._update_causal_mask(attn_mask_full, image_locations)
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
-                # Decode step (S == 1): keep cache_slice as a 1-element tensor
-                # (pos_ids_1d) so that:
-                #   - _update_cache_w_inputs gets a tensor index, preserving
-                #     the (B, 1, H, D) shape of key/value for the assignment
-                #     kcache[:, cache_slice, :, :] = key.
-                #   - torch.compile receives a tensor with a stable
-                #     shape/dtype/device, matched by the TENSOR_MATCH guard
-                #     that guard_filter_fn keeps.  Python int arguments are
-                #     NOT covered by TENSOR_MATCH guards, so the int would be
-                #     baked as a compile-time constant; the step-0 graph would
-                #     be reused forever (guard discarded) → all writes go to
-                #     position 0 → garbage KV cache.
-                cache_slice = pos_ids_1d  # 1-element tensor: [current_step]
+                # Decode step (S == 1): use a plain Python int for cache_slice.
+                # _update_cache_w_inputs branches on torch.compiler.is_compiling():
+                #   - compile path: kcache[:, cache_slice:cache_slice+1, :, :]
+                #     (slice notation avoids a scatter op; the int is treated as a
+                #     dynamic symbolic value because the int-value guard is
+                #     filtered out by guard_filter_fn, so no recompilation and no
+                #     constant-folding of the position).
+                #   - eager path:   kcache[:, cache_slice, :, :]
+                #     (plain int indexing, fastest for single-token decode).
+                cache_slice = int(current_step.item())
                 # at decoding _init_cache must be called and init these
                 valid = self.position_indices <= self.cache_seqlens.view(-1, 1)
                 valid = valid & self.left_pad_attn_mask
