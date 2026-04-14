@@ -1301,12 +1301,19 @@ class TransformerDecoder(DecoderBase):
                             attn_mask_full = self._update_causal_mask(attn_mask_full, image_locations)
                 lin_attn_mask = ~tgt_pad_mask[:, 0, :] if self.has_linear_attn else None
             else:
-                # Decode step (S == 1): use a plain int for cache_slice so that
-                # the compiled graph sees a static value rather than a 1-element
-                # tensor, avoiding unnecessary recompilations.
-                # current_step is self.cache_seqlens[0], a 0-d CUDA tensor, in
-                # this path (S == 1 decode always has an active cache).
-                cache_slice = int(current_step.item())
+                # Decode step (S == 1): keep cache_slice as a 1-element tensor
+                # (pos_ids_1d) so that:
+                #   - _update_cache_w_inputs gets a tensor index, preserving
+                #     the (B, 1, H, D) shape of key/value for the assignment
+                #     kcache[:, cache_slice, :, :] = key.
+                #   - torch.compile receives a tensor with a stable
+                #     shape/dtype/device, matched by the TENSOR_MATCH guard
+                #     that guard_filter_fn keeps.  Python int arguments are
+                #     NOT covered by TENSOR_MATCH guards, so the int would be
+                #     baked as a compile-time constant; the step-0 graph would
+                #     be reused forever (guard discarded) → all writes go to
+                #     position 0 → garbage KV cache.
+                cache_slice = pos_ids_1d  # 1-element tensor: [current_step]
                 # at decoding _init_cache must be called and init these
                 valid = self.position_indices <= self.cache_seqlens.view(-1, 1)
                 valid = valid & self.left_pad_attn_mask
