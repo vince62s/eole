@@ -364,116 +364,6 @@ MODEL_OVERRIDES["Gemma3ForCausalLM"] = {
 }
 
 
-def _build_gemma4_decoder_patch(text):
-    """Build the Gemma4-specific decoder config patch from HF text config.
-
-    Returns a partial model_config dict to be deep-merged into the full config.
-    Handles layer_types, per-layer-type rope parameters, global_head_dim,
-    global_heads_kv, per-layer input embedding, value_norm, kv sharing,
-    and double-wide MLP.
-    """
-    patch = {"decoder": {}, "rope_config": {}}
-
-    # --- 1. layer_types ---
-    layer_types = text.get("layer_types", None)
-    if layer_types is None:
-        n_layers = text.get("num_hidden_layers", 0)
-        if n_layers:
-            sliding_window_pattern = 6
-            layer_types = [
-                "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
-                for i in range(n_layers)
-            ]
-            if layer_types and layer_types[-1] != "full_attention":
-                layer_types[-1] = "full_attention"
-    if layer_types is not None:
-        patch["decoder"]["layer_types"] = layer_types
-
-    # --- 2. rope_parameters (Gemma4 per-layer-type format) ---
-    rope_params = text.get("rope_parameters", None)
-    sliding_rope = None
-    full_rope = None
-    if isinstance(rope_params, dict) and "sliding_attention" in rope_params:
-        sliding_rope = rope_params.get("sliding_attention", {})
-        full_rope = rope_params.get("full_attention", {})
-
-    # Head dimensions
-    head_dim = text.get("head_dim", None)
-    global_head_dim = text.get("global_head_dim", None)
-    if global_head_dim is None:
-        global_head_dim = head_dim
-
-    heads_kv = text.get("num_key_value_heads", None)
-    num_global_kv_heads = text.get("num_global_key_value_heads", None)
-    if num_global_kv_heads is None:
-        num_global_kv_heads = heads_kv
-
-    # --- 3. Build rope_config ---
-    global_theta = 1_000_000
-    local_theta = 10_000
-    rotary_dim_global = 0
-    partial_rotary_factor = 0.0
-
-    if full_rope:
-        global_theta = int(full_rope.get("rope_theta", global_theta))
-        partial_factor = full_rope.get("partial_rotary_factor", None)
-        if partial_factor is not None and global_head_dim:
-            partial_rotary_factor = float(partial_factor)
-            rotary_dim_global = int(partial_factor * global_head_dim)
-    if sliding_rope:
-        local_theta = int(sliding_rope.get("rope_theta", local_theta))
-
-    interleave_local = 6
-    if layer_types:
-        n_full = sum(1 for lt in layer_types if lt == "full_attention")
-        n_total = len(layer_types)
-        if n_full > 0:
-            interleave_local = n_total // n_full
-
-    rope_config_update = {
-        "rotary_theta": global_theta,
-        "rotary_theta_local": local_theta,
-        "interleave_local": interleave_local,
-        "tmax_index": 0,
-        "rotary_interleave": False,
-    }
-    if partial_rotary_factor > 0.0:
-        rope_config_update["partial_rotary_factor"] = partial_rotary_factor
-    if rotary_dim_global > 0:
-        rope_config_update["rotary_dim_global"] = rotary_dim_global
-
-    patch["decoder"]["rope_config"] = rope_config_update
-    # Also set model-level rope_config so it propagates through _override_values
-    patch["rope_config"] = dict(rope_config_update)
-
-    # --- 4. global_head_dim / global_heads_kv ---
-    if global_head_dim and global_head_dim != head_dim:
-        patch["decoder"]["global_head_dim"] = global_head_dim
-    if num_global_kv_heads and num_global_kv_heads != heads_kv:
-        patch["decoder"]["global_heads_kv"] = num_global_kv_heads
-
-    # --- 5. per-layer input embedding ---
-    hidden_size_per_layer_input = text.get("hidden_size_per_layer_input", 0)
-    vocab_size_per_layer_input = text.get("vocab_size_per_layer_input", 0)
-    if hidden_size_per_layer_input:
-        patch["decoder"]["hidden_size_per_layer_input"] = hidden_size_per_layer_input
-        patch["decoder"]["vocab_size_per_layer_input"] = vocab_size_per_layer_input
-
-    # --- 6. value_norm ---
-    patch["decoder"]["value_norm"] = True
-
-    # --- 7. num_kv_shared_layers + use_double_wide_mlp ---
-    num_kv_shared = text.get("num_kv_shared_layers", 0)
-    if num_kv_shared:
-        patch["decoder"]["num_kv_shared_layers"] = num_kv_shared
-
-    use_double_wide_mlp = text.get("use_double_wide_mlp", False)
-    if use_double_wide_mlp:
-        patch["decoder"]["use_double_wide_mlp"] = True
-
-    return patch
-
-
 MODEL_OVERRIDES["Gemma4ForCausalLM"] = {
     "decoder.embed_tokens_per_layer.weight": "model.embed_tokens_per_layer.weight",
     "decoder.per_layer_model_projection.weight": "model.per_layer_model_projection.weight",
@@ -488,21 +378,92 @@ MODEL_OVERRIDES["Gemma4ForCausalLM"] = {
         ".per_layer_projection.": ".per_layer_projection.",
         ".post_per_layer_input_norm.": ".post_per_layer_input_norm.",
     },
-    "config_from_hf": lambda top, text, vis: recursive_update_dict(
+    # fmt: off
+    "config_from_hf": lambda top, text, vis: (
+        lambda
+            _full_rope=(text.get("rope_parameters") or {}).get("full_attention") or {},
+            _sliding_rope=(text.get("rope_parameters") or {}).get("sliding_attention") or {},
+            _partial_factor=float(
+                ((text.get("rope_parameters") or {}).get("full_attention") or {}).get(
+                    "partial_rotary_factor"
+                ) or 0
+            ),
+            _head_dim=text.get("head_dim"),
+            _global_head_dim=text.get("global_head_dim") or text.get("head_dim"),
+            _heads_kv=text.get("num_key_value_heads"),
+            _global_kv_heads=(
+                text.get("num_global_key_value_heads") or text.get("num_key_value_heads")
+            ),
+            _layer_types=(
+                lambda lt: (
+                    lt[:-1] + ["full_attention"] if lt and lt[-1] != "full_attention" else lt
+                )
+            )(
+                text.get("layer_types") or [
+                    "sliding_attention" if bool((i + 1) % 6) else "full_attention"
+                    for i in range(text.get("num_hidden_layers", 0))
+                ]
+            ):
         {
             "share_decoder_embeddings": True,
             "ffn_layernorm": True,
             "embeddings": {"normalize": True},
+            # model-level rope_config propagates to decoder via _override_values
+            "rope_config": {
+                "rotary_theta": int(_full_rope.get("rope_theta", 1_000_000)),
+                "rotary_theta_local": int(_sliding_rope.get("rope_theta", 10_000)),
+                "interleave_local": (
+                    len(_layer_types) // max(1, sum(1 for lt in _layer_types if lt == "full_attention"))
+                    if _layer_types else 6
+                ),
+                "tmax_index": 0,
+                "rotary_interleave": False,
+                **({
+                    "partial_rotary_factor": _partial_factor,
+                    "rotary_dim_global": int(_partial_factor * (_global_head_dim or 0)),
+                } if _partial_factor else {}),
+            },
             "decoder": {
                 "query_norm": True,
                 "key_norm": True,
                 "attn_scaling": 1.0,
                 "max_position_embeddings": 131072,
+                "value_norm": True,
+                "layer_types": _layer_types,
+                "rope_config": {
+                    "rotary_theta": int(_full_rope.get("rope_theta", 1_000_000)),
+                    "rotary_theta_local": int(_sliding_rope.get("rope_theta", 10_000)),
+                    "interleave_local": (
+                        len(_layer_types) // max(1, sum(1 for lt in _layer_types if lt == "full_attention"))
+                        if _layer_types else 6
+                    ),
+                    "tmax_index": 0,
+                    "rotary_interleave": False,
+                    **({
+                        "partial_rotary_factor": _partial_factor,
+                        "rotary_dim_global": int(_partial_factor * (_global_head_dim or 0)),
+                    } if _partial_factor else {}),
+                },
+                **({
+                    "global_head_dim": _global_head_dim,
+                } if _global_head_dim and _global_head_dim != _head_dim else {}),
+                **({
+                    "global_heads_kv": _global_kv_heads,
+                } if _global_kv_heads and _global_kv_heads != _heads_kv else {}),
+                **({
+                    "hidden_size_per_layer_input": text.get("hidden_size_per_layer_input"),
+                    "vocab_size_per_layer_input": text.get("vocab_size_per_layer_input", 0),
+                } if text.get("hidden_size_per_layer_input") else {}),
+                **({
+                    "num_kv_shared_layers": text.get("num_kv_shared_layers"),
+                } if text.get("num_kv_shared_layers") else {}),
+                **({
+                    "use_double_wide_mlp": True,
+                } if text.get("use_double_wide_mlp") else {}),
             },
-        },
-        _build_gemma4_decoder_patch(text),
-        {},
-    ),
+        }
+    )(),
+    # fmt: on
 }
 
 MODEL_OVERRIDES["Gemma3ForConditionalGeneration"] = {
@@ -589,64 +550,6 @@ MODEL_OVERRIDES["Gemma3ForConditionalGeneration"] = {
 # IMPORTANT: Gemma4 uses Gemma4ClippableLinear (wraps nn.Linear as self.linear)
 # for ALL vision attention and MLP projections, adding ".linear." to every path.
 # The text decoder uses standard nn.Linear, so BASE_KEY_MAP decoder suffixes apply.
-def _gemma4_multimodal_config_from_hf(top, text, vis):
-    """Config for Gemma4ForConditionalGeneration (text + vision encoder + adapter)."""
-    _v_image_size = vis.get("image_size") if vis else None
-    _v_patch_size = (vis.get("patch_size", 16) if vis else 16) or 16
-    _v_pos_emb_size = vis.get("position_embedding_size", 0) if vis else 0
-    if _v_image_size is not None and _v_patch_size > 0:
-        n_positions = (_v_image_size // _v_patch_size) ** 2
-    else:
-        n_positions = _v_pos_emb_size
-    effective_image_size = _v_image_size or (_v_patch_size * 128)
-
-    cfg = {
-        "head_dim": text.get("head_dim", 256),
-        "heads_kv": text.get("num_key_value_heads", 4),
-        "heads": text.get("num_attention_heads", 8),
-        "share_decoder_embeddings": True,
-        "embeddings": {"normalize": True},
-        "adapter": "gemma4",
-        "decoder": {
-            "ffn_layernorm": True,
-            "query_norm": True,
-            "key_norm": True,
-            "attn_scaling": 1.0,
-            "max_position_embeddings": 131072,
-        },
-        "encoder": {
-            "attn_scaling": 1.0,
-            "mlp_activation_fn": "gated-gelu-tanh",
-            "position_encoding_type": PositionEncodingType.Rotary,
-            "rope_config": {
-                "rotary_theta": vis.get("rope_parameters", {}).get("rope_theta", 100.0) if vis else 100.0,
-                "rotary_interleave": False,
-                "multidimensional_rope": True,
-            },
-            "layer_norm": "rms",
-            "add_ffnbias": False,
-            "add_final_linear_bias": False,
-            "add_qkvbias": False,
-            "query_norm": True,
-            "key_norm": True,
-            "layernorm_pre": False,
-            "layernorm_post": False,
-            "patch_conv_bias": False,
-            "ffn_layernorm": True,
-            "pooling_kernel_size": 3,
-            "n_positions": n_positions,
-            "image_size": effective_image_size,
-            "mm_tokens_per_image": top.get("mm_tokens_per_image", 280),
-            "image_token_id": top.get("image_token_id", 258880),
-            "value_norm": True,
-            "norm_eps": vis.get("rms_norm_eps", 1e-6) if vis else 1e-6,
-            "position_embedding_size": _v_pos_emb_size or None,
-            "standardize": vis.get("standardize", False) if vis else False,
-        },
-    }
-    return recursive_update_dict(cfg, _build_gemma4_decoder_patch(text), {})
-
-
 MODEL_OVERRIDES["Gemma4ForConditionalGeneration"] = {
     # --- decoder (Gemma4TextModel inside Gemma4Model.language_model) ---
     "decoder_layer_prefix": "model.language_model.layers.",
@@ -703,7 +606,131 @@ MODEL_OVERRIDES["Gemma4ForConditionalGeneration"] = {
     "adapter.w_in.weight": "model.embed_vision.embedding_projection.weight",
     # adapter.norm.weight has no source: Gemma4MultimodalEmbedder uses
     # Gemma4RMSNorm(with_scale=False) for pre-projection norm — no learnable weight.
-    "config_from_hf": _gemma4_multimodal_config_from_hf,
+    # fmt: off
+    "config_from_hf": lambda top, text, vis: (
+        lambda
+            _v_image_size=vis.get("image_size") if vis else None,
+            _v_patch_size=(vis.get("patch_size", 16) if vis else 16) or 16,
+            _v_pos_emb_size=vis.get("position_embedding_size", 0) if vis else 0,
+            _full_rope=(text.get("rope_parameters") or {}).get("full_attention") or {},
+            _sliding_rope=(text.get("rope_parameters") or {}).get("sliding_attention") or {},
+            _partial_factor=float(
+                ((text.get("rope_parameters") or {}).get("full_attention") or {}).get(
+                    "partial_rotary_factor"
+                ) or 0
+            ),
+            _head_dim=text.get("head_dim"),
+            _global_head_dim=text.get("global_head_dim") or text.get("head_dim"),
+            _heads_kv=text.get("num_key_value_heads"),
+            _global_kv_heads=(
+                text.get("num_global_key_value_heads") or text.get("num_key_value_heads")
+            ),
+            _layer_types=(
+                lambda lt: (
+                    lt[:-1] + ["full_attention"] if lt and lt[-1] != "full_attention" else lt
+                )
+            )(
+                text.get("layer_types") or [
+                    "sliding_attention" if bool((i + 1) % 6) else "full_attention"
+                    for i in range(text.get("num_hidden_layers", 0))
+                ]
+            ):
+        {
+            "head_dim": text.get("head_dim", 256),
+            "heads_kv": text.get("num_key_value_heads", 4),
+            "heads": text.get("num_attention_heads", 8),
+            "share_decoder_embeddings": True,
+            "embeddings": {"normalize": True},
+            "adapter": "gemma4",
+            # model-level rope_config propagates to decoder via _override_values
+            "rope_config": {
+                "rotary_theta": int(_full_rope.get("rope_theta", 1_000_000)),
+                "rotary_theta_local": int(_sliding_rope.get("rope_theta", 10_000)),
+                "interleave_local": (
+                    len(_layer_types) // max(1, sum(1 for lt in _layer_types if lt == "full_attention"))
+                    if _layer_types else 6
+                ),
+                "tmax_index": 0,
+                "rotary_interleave": False,
+                **({
+                    "partial_rotary_factor": _partial_factor,
+                    "rotary_dim_global": int(_partial_factor * (_global_head_dim or 0)),
+                } if _partial_factor else {}),
+            },
+            "decoder": {
+                "ffn_layernorm": True,
+                "query_norm": True,
+                "key_norm": True,
+                "attn_scaling": 1.0,
+                "max_position_embeddings": 131072,
+                "value_norm": True,
+                "layer_types": _layer_types,
+                "rope_config": {
+                    "rotary_theta": int(_full_rope.get("rope_theta", 1_000_000)),
+                    "rotary_theta_local": int(_sliding_rope.get("rope_theta", 10_000)),
+                    "interleave_local": (
+                        len(_layer_types) // max(1, sum(1 for lt in _layer_types if lt == "full_attention"))
+                        if _layer_types else 6
+                    ),
+                    "tmax_index": 0,
+                    "rotary_interleave": False,
+                    **({
+                        "partial_rotary_factor": _partial_factor,
+                        "rotary_dim_global": int(_partial_factor * (_global_head_dim or 0)),
+                    } if _partial_factor else {}),
+                },
+                **({
+                    "global_head_dim": _global_head_dim,
+                } if _global_head_dim and _global_head_dim != _head_dim else {}),
+                **({
+                    "global_heads_kv": _global_kv_heads,
+                } if _global_kv_heads and _global_kv_heads != _heads_kv else {}),
+                **({
+                    "hidden_size_per_layer_input": text.get("hidden_size_per_layer_input"),
+                    "vocab_size_per_layer_input": text.get("vocab_size_per_layer_input", 0),
+                } if text.get("hidden_size_per_layer_input") else {}),
+                **({
+                    "num_kv_shared_layers": text.get("num_kv_shared_layers"),
+                } if text.get("num_kv_shared_layers") else {}),
+                **({
+                    "use_double_wide_mlp": True,
+                } if text.get("use_double_wide_mlp") else {}),
+            },
+            "encoder": {
+                "attn_scaling": 1.0,
+                "mlp_activation_fn": "gated-gelu-tanh",
+                "position_encoding_type": PositionEncodingType.Rotary,
+                "rope_config": {
+                    "rotary_theta": (vis.get("rope_parameters") or {}).get("rope_theta", 100.0) if vis else 100.0,
+                    "rotary_interleave": False,
+                    "multidimensional_rope": True,
+                },
+                "layer_norm": "rms",
+                "add_ffnbias": False,
+                "add_final_linear_bias": False,
+                "add_qkvbias": False,
+                "query_norm": True,
+                "key_norm": True,
+                "layernorm_pre": False,
+                "layernorm_post": False,
+                "patch_conv_bias": False,
+                "ffn_layernorm": True,
+                "pooling_kernel_size": 3,
+                "n_positions": (
+                    (_v_image_size // _v_patch_size) ** 2
+                    if _v_image_size is not None else _v_pos_emb_size
+                ),
+                "image_size": _v_image_size or (_v_patch_size * 128),
+                "mm_tokens_per_image": top.get("mm_tokens_per_image", 280),
+                "image_token_id": top.get("image_token_id", 258880),
+                "value_norm": True,
+                "norm_eps": vis.get("rms_norm_eps", 1e-6) if vis else 1e-6,
+                "position_embedding_size": _v_pos_emb_size or None,
+                "standardize": vis.get("standardize", False) if vis else False,
+            },
+        }
+    )(),
+    # fmt: on
 }
 
 MODEL_OVERRIDES["M2M100ForConditionalGeneration"] = {
