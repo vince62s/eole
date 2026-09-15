@@ -1320,9 +1320,9 @@ class DecoderModel(BaseModel):
                 # (1,1,L,L) & ~(B,1,1,L) → (B,1,L,L): attend where causal & not padding key
                 mtp_attn_mask = causal[None, None] & ~pad_m[:, None, None, :]
 
-                # RoPE position embeddings for sequence positions [start, start+actual_len)
+                # RoPE position embeddings for sequence positions [0, actual_len)
                 if _rope is not None:
-                    pos_ids = start + torch.arange(actual_len, device=src.device)
+                    pos_ids = torch.arange(actual_len, device=src.device)
                     mtp_pos_emb = _rope.cos_sin[pos_ids]  # (actual_len, head_dim)
                 else:
                     mtp_pos_emb = None
