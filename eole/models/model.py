@@ -1863,9 +1863,18 @@ class VisionEncoderDecoderModel(BaseModel):
         if self.add_estimator:
             self.estimator = FeedForward(self.hidden_size)
         # Keep MTP heads on vision-language models as well.  Qwen3.5 VL stores
-        # these weights in its companion safetensors checkpoint.
+        # these weights in its companion safetensors checkpoint, but the
+        # VLM forward pass below does not (yet) implement the corresponding
+        # MTP loss path, so these heads are never trained/used here.
         mtp_heads = kwargs.get("mtp_heads", None)
         self.mtp_heads = mtp_heads if mtp_heads is not None else nn.ModuleList()
+        if len(self.mtp_heads) > 0:
+            logger.warning(
+                "num_mtp_heads > 0 is set for this vision-language model, but MTP "
+                "auxiliary loss is not implemented for VisionEncoderDecoderModel. "
+                "The MTP heads are built/loaded for checkpoint compatibility only "
+                "and will not receive gradient updates during training."
+            )
 
     @classmethod
     def build_blocks(cls, model_config, vocabs, running_config=None):
