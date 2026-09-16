@@ -158,10 +158,11 @@ class TestMTPLoss(unittest.TestCase):
         self.assertAlmostEqual(mtp_loss.item(), 0.0, places=5)
 
 
-def _make_tiny_vocab(pad_idx):
+def _make_tiny_vocab(pad_idx, extra_tokens=0):
     """Build a minimal pyonmttok vocab with DefaultTokens specials."""
+    tokens = Counter({f"tok{i}": 1 for i in range(extra_tokens)})
     vocab = pyonmttok.build_vocab_from_tokens(
-        Counter(),
+        tokens,
         maximum_size=0,
         minimum_frequency=1,
         special_tokens=[
@@ -180,7 +181,7 @@ class TestDecoderModelMTP(unittest.TestCase):
 
     def _build_model_and_vocabs(self, num_mtp_heads=2):
         pad_idx = 1
-        vocab = _make_tiny_vocab(pad_idx)
+        vocab = _make_tiny_vocab(pad_idx, extra_tokens=16)
         vocabs = {
             "tgt": vocab,
             "specials": {
@@ -192,6 +193,7 @@ class TestDecoderModelMTP(unittest.TestCase):
         }
         model_config = TransformerLMModelConfig(
             hidden_size=16,
+            embeddings={"tgt_word_vec_size": 16},
             decoder={
                 "decoder_type": "transformer",
                 "layers": 2,
