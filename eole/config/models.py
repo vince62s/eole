@@ -466,7 +466,8 @@ class TransformerDecoderConfig(TransformerConfig, DecoderConfig):
     )
     mtp_emb_norm: bool = Field(
         default=False,
-        description="Apply an MTP-specific normalization to target embeddings bef combining them with hidden states.",
+        description="Apply an MTP-specific normalization to target embeddings "
+        "before combining them with hidden states.",
     )
 
     @model_validator(mode="after")

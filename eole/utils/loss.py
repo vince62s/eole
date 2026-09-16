@@ -409,7 +409,7 @@ class LossCompute(nn.Module):
         pad_idx = self.criterion.ignore_index
         mtp_loss = torch.tensor(0.0, device=mtp_outputs[0].device, dtype=mtp_outputs[0].dtype)
         raw_loss = 0.0  # unweighted sum across heads
-        num_heads = len(mtp_outputs)
+        num_heads = 0  # heads actually contributing to the loss (some may be skipped below)
         tgt = batch["tgt"]  # (batch, full_tgt_len)
         for k, mtp_out in enumerate(mtp_outputs, start=1):
             # Target for head k: positions [tgt_shift_index + k : ]
@@ -428,6 +428,7 @@ class LossCompute(nn.Module):
             head_loss, _ = self._compute_ce_loss(mtp_out, flat_tgt_k)
             mtp_loss = mtp_loss + head_loss
             raw_loss += head_loss.item()
+            num_heads += 1
         # Per-head average, then scale by lambda for the backward pass.
         # raw_loss (unweighted) is returned separately for statistics so that
         # mtp_xent() is independent of mtp_lambda.
