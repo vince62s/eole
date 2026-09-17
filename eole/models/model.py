@@ -229,6 +229,8 @@ class BaseModel(nn.Module):
         if running_config.freeze_decoder:
             self.decoder.requires_grad_(False)
             self.generator.requires_grad_(False)
+            if getattr(self, "mtp_heads", None) is not None:
+                self.mtp_heads.requires_grad_(False)
 
     def _initialize_weights_and_embeddings(self, running_config):
         """Initialize model weights and load pretrained embeddings."""
@@ -1247,10 +1249,12 @@ class DecoderModel(BaseModel):
     def build_blocks(cls, model_config, vocabs, running_config=None):
         tgt_emb = build_tgt_emb(model_config, vocabs, running_config=running_config)
         decoder = build_decoder(model_config, running_config=running_config)
-        # Build MTP heads when configured
+        # Build MTP heads when configured. MTP heads are only used during
+        # training (see forward()), so skip building them for inference to
+        # avoid needlessly allocating extra parameters (and potential OOM).
         num_mtp_heads = getattr(model_config.decoder, "num_mtp_heads", 0)
         mtp_heads = nn.ModuleList()
-        if num_mtp_heads > 0:
+        if num_mtp_heads > 0 and not isinstance(running_config, InferenceConfig):
             for _ in range(num_mtp_heads):
                 mtp_heads.append(MTPHead(model_config.decoder, running_config=running_config))
         return cls(
@@ -1312,8 +1316,14 @@ class DecoderModel(BaseModel):
                 # Build causal + padding mask: (B, 1, actual_len, actual_len)
                 # True = attend, False = masked.  Key-dimension padding mask
                 # prevents attending to pad positions; causal mask prevents
-                # attending to future positions.
-                pad_m = src[:, start:end].eq(self.pad_idx)  # (B, actual_len)
+                # attending to future positions.  A key position is padding
+                # if either the hidden state it carries (h_detached, sourced
+                # from src[:, :actual_len]) or the shifted embedding combined
+                # with it (src[:, start:end]) came from a pad token, so union
+                # both padding masks (relevant for left-padded batches).
+                hs_pad_m = src[:, :actual_len].eq(self.pad_idx)  # (B, actual_len)
+                emb_pad_m = src[:, start:end].eq(self.pad_idx)  # (B, actual_len)
+                pad_m = hs_pad_m | emb_pad_m
                 causal = torch.tril(
                     torch.ones(actual_len, actual_len, dtype=torch.bool, device=src.device)
                 )  # (actual_len, actual_len)
@@ -1321,7 +1331,7 @@ class DecoderModel(BaseModel):
                 mtp_attn_mask = causal[None, None] & ~pad_m[:, None, None, :]
 
                 # RoPE position embeddings for sequence positions [0, actual_len)
-                if _rope is not None:
+                if _rope is not None and _rope.cos_sin is not None:
                     pos_ids = torch.arange(actual_len, device=src.device)
                     mtp_pos_emb = _rope.cos_sin[pos_ids]  # (actual_len, head_dim)
                 else:
@@ -1340,6 +1350,8 @@ class DecoderModel(BaseModel):
     def update_dropout(self, dropout, attention_dropout):
         self.decoder.update_dropout(dropout, attention_dropout)
         self.tgt_emb.update_dropout(dropout)
+        for head in self.mtp_heads:
+            head.update_dropout(dropout, attention_dropout)
 
 
 class EncoderModel(BaseModel):
