@@ -1249,12 +1249,15 @@ class DecoderModel(BaseModel):
     def build_blocks(cls, model_config, vocabs, running_config=None):
         tgt_emb = build_tgt_emb(model_config, vocabs, running_config=running_config)
         decoder = build_decoder(model_config, running_config=running_config)
-        # Build MTP heads when configured. MTP heads are only used during
-        # training (see forward()), so skip building them for inference to
-        # avoid needlessly allocating extra parameters (and potential OOM).
+        # MTP heads are checkpoint parameters, not training-only scratch
+        # modules.  In particular, an MTP checkpoint must instantiate these
+        # modules while loading for inference; otherwise all MTP weights are
+        # silently left out of the model and inference has no MTP head to use.
+        # Keep them available in eval mode as well, even though the regular
+        # model forward only produces auxiliary outputs during training.
         num_mtp_heads = getattr(model_config.decoder, "num_mtp_heads", 0)
         mtp_heads = nn.ModuleList()
-        if num_mtp_heads > 0 and not isinstance(running_config, InferenceConfig):
+        if num_mtp_heads > 0:
             for _ in range(num_mtp_heads):
                 mtp_heads.append(MTPHead(model_config.decoder, running_config=running_config))
         return cls(

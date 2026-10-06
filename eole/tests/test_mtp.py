@@ -18,6 +18,7 @@ from eole.constants import DefaultTokens
 from eole.modules.mtp import MTPHead
 from eole.config.models import TransformerDecoderConfig, TransformerLMModelConfig
 from eole.models.model import DecoderModel
+from eole.config.inference import InferenceConfig
 from eole.utils.statistics import Statistics
 
 
@@ -236,6 +237,35 @@ class TestDecoderModelMTP(unittest.TestCase):
         src_len = torch.full((B,), T, dtype=torch.long)
         output = model(src, None, src_len)
         self.assertIsNone(output.mtp_outputs)
+
+    def test_builds_mtp_heads_for_inference(self):
+        """Inference must retain MTP modules so converted weights can load."""
+        pad_idx = 1
+        vocab = _make_tiny_vocab(pad_idx, extra_tokens=16)
+        vocabs = {
+            "tgt": vocab,
+            "specials": {
+                "pad_token": DefaultTokens.PAD,
+                "unk_token": DefaultTokens.UNK,
+                "eos_token": DefaultTokens.EOS,
+                "bos_token": DefaultTokens.BOS,
+            },
+        }
+        model_config = TransformerLMModelConfig(
+            hidden_size=16,
+            embeddings={"tgt_word_vec_size": 16},
+            decoder={
+                "decoder_type": "transformer",
+                "layers": 2,
+                "heads": 2,
+                "hidden_size": 16,
+                "transformer_ff": 32,
+                "num_mtp_heads": 2,
+            },
+        )
+        inference_config = InferenceConfig(model_path="model", compute_dtype="fp32")
+        model = DecoderModel.build_blocks(model_config, vocabs, running_config=inference_config)
+        self.assertEqual(len(model.mtp_heads), 2)
 
     def test_update_dropout_propagates_to_mtp_heads(self):
         model, _ = self._build_model_and_vocabs(num_mtp_heads=2)
